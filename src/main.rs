@@ -51,8 +51,9 @@ use windows::Win32::UI::HiDpi::{
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::*;
 use windows::Win32::UI::Shell::{
-    DragAcceptFiles, DragFinish, DragQueryFileW, FOS_FORCEFILESYSTEM, FOS_PICKFOLDERS,
-    FileOpenDialog, HDROP, IFileOpenDialog, SIGDN_FILESYSPATH,
+    DragAcceptFiles, DragFinish, DragQueryFileW, FOS_ALLOWMULTISELECT, FOS_FORCEFILESYSTEM,
+    FOS_OVERWRITEPROMPT, FOS_PICKFOLDERS, FileOpenDialog, FileSaveDialog, HDROP, IFileOpenDialog,
+    IFileSaveDialog, SIGDN_FILESYSPATH,
 };
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{HSTRING, w};
@@ -66,10 +67,10 @@ use queue::Queue;
 use render::{DeviceLock, Flip, Renderer, VideoAdjust, Zoom};
 use session::{Session, TrackKind};
 use subs::Cues;
-use ui::panels::{ASPECT, CROP};
+use ui::panels::{ASPECT, CROP, SettingsTab};
 use ui::{
-    Action, Hit, Layout, Page, PanelAction, PanelData, QueueAction, QueueData, QueueItem, Scene,
-    TrackTab, Ui,
+    Action, Hit, Layout, MenuAction, Page, Panel, PanelAction, PanelData, QueueAction, QueueData,
+    QueueItem, Scene, TrackTab, Ui,
 };
 
 /// The window procedure has no user data pointer here, so it reaches shared state through statics.
@@ -98,6 +99,10 @@ thread_local! {
     static PANEL_ACTIONS: RefCell<Vec<PanelAction>> = const { RefCell::new(Vec::new()) };
     /// Changes from the queue panel, applied by the render loop.
     static QUEUE_ACTIONS: RefCell<Vec<QueueAction>> = const { RefCell::new(Vec::new()) };
+    /// Menus to open (what was clicked, and where) and menu choices, handled by the render
+    /// loop because they need the library and the open file.
+    static MENU_REQUESTS: RefCell<Vec<(Hit, f32, f32)>> = const { RefCell::new(Vec::new()) };
+    static MENU_ACTIONS: RefCell<Vec<MenuAction>> = const { RefCell::new(Vec::new()) };
 }
 
 /// Sleep timer choices in minutes, by index into the panel's list; the last one is "End of file".
@@ -586,8 +591,9 @@ impl App {
             QueueAction::Move(from, to) => self.queue.move_item(from, to),
             QueueAction::Remove(i) => _ = self.queue.remove(i),
             QueueAction::AddFiles => {
-                let files = pick_media_files(hwnd);
-                self.add_to_queue(files);
+                if let Some(files) = pick_media_files(hwnd) {
+                    self.add_to_queue(files);
+                }
             }
             QueueAction::Sort => self.queue.sort_by_name(),
             QueueAction::CycleRepeat => self.queue.cycle_repeat(),
@@ -788,6 +794,12 @@ fn run() -> Result<(), Box<dyn Error>> {
             });
             handle(&mut app, hwnd, hit);
         }
+        for (hit, x, y) in MENU_REQUESTS.with_borrow_mut(std::mem::take) {
+            open_menu(&mut app, hit, (x, y));
+        }
+        for action in MENU_ACTIONS.with_borrow_mut(std::mem::take) {
+            menu_action(&mut app, hwnd, action);
+        }
         DURATION.store(
             app.session.as_ref().map_or(0.0, |s| s.duration).to_bits(),
             Relaxed,
@@ -886,6 +898,7 @@ fn run() -> Result<(), Box<dyn Error>> {
             if app.session.is_none() {
                 ui.show(Page::Library);
             }
+            ui.menu_tick();
             if ui.browse.stale {
                 ui.browse.refresh(&app.library);
                 ui.relayout = true;
@@ -925,7 +938,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                 ui.layout = layout;
                 ui.relayout = false;
                 ui.dirty = true;
-                ui.rehover();
+                ui.sync_menu();
             }
             if ui.settle_seek_preview() {
                 ui.dirty = true;
@@ -1120,6 +1133,246 @@ fn handle(app: &mut App, hwnd: HWND, hit: Hit) {
     UI.with_borrow_mut(|ui| ui.dirty = true);
 }
 
+/// Builds and opens the menu for a click on `hit`.
+fn open_menu(app: &mut App, hit: Hit, at: (f32, f32)) {
+    use ui::menu::{self, Kind};
+    let (kind, items) = match hit {
+        Hit::More => {
+            let recent: Vec<PathBuf> = app
+                .library
+                .entries(&Place::Recent)
+                .into_iter()
+                .filter_map(|e| match e {
+                    Entry::Media { path, .. } => Some(path),
+                    _ => None,
+                })
+                .collect();
+            (Kind::Main, menu::main_menu(&recent, app.session.is_some()))
+        }
+        Hit::Sort => UI.with_borrow(|ui| {
+            let b = &ui.browse;
+            (Kind::Sort, menu::sort_menu(b.sort, b.has_artists()))
+        }),
+        Hit::Video => {
+            let paused = app.shared.paused.load(Relaxed);
+            (Kind::Player, menu::player_menu(&app.panel_data(), paused))
+        }
+        Hit::Entry(i) => {
+            let Some(entry) = UI.with_borrow(|ui| ui.browse.entries.get(i).cloned()) else {
+                return;
+            };
+            let items = match &entry {
+                Entry::Folder {
+                    place: Place::Playlist(name),
+                    ..
+                } => app.library.playlist_items(name),
+                _ => Vec::new(),
+            };
+            match menu::entry_menu(&entry, &app.library.playlists(), &items) {
+                Some(menu) => menu,
+                None => return,
+            }
+        }
+        _ => return,
+    };
+    UI.with_borrow_mut(|ui| ui.open_menu(kind, items, at, hit));
+}
+
+/// Carries out a menu choice.
+fn menu_action(app: &mut App, hwnd: HWND, action: MenuAction) {
+    let show_player = || UI.with_borrow_mut(|ui| ui.show(Page::Player));
+    match action {
+        MenuAction::OpenFiles => {
+            if let Some(files) = pick_media_files(hwnd)
+                && app.play(&files[0], files.clone())
+            {
+                show_player();
+            }
+        }
+        MenuAction::OpenFolder => {
+            if let Some(dir) = pick_folder(hwnd) {
+                let queue = app.library.media_in(&Place::Folder(Section::Videos, dir));
+                if let Some(first) = queue.first().cloned()
+                    && app.play(&first, queue)
+                {
+                    show_player();
+                }
+            }
+        }
+        MenuAction::PlayRecent(path) => {
+            if app.play_file(&path) {
+                show_player();
+            }
+        }
+        MenuAction::Play(path) => {
+            // The page it was on is the queue, as when the entry is clicked.
+            let place = UI.with_borrow(|ui| ui.browse.place.clone());
+            let mut queue = app.library.media_in(&place);
+            if !queue.contains(&path) {
+                queue = vec![path.clone()];
+            }
+            if let Place::Playlist(name) = &place {
+                app.library.record_playlist_play(name);
+            }
+            if app.play(&path, queue) {
+                show_player();
+            }
+        }
+        MenuAction::Settings(tab) => {
+            if app.session.is_some() {
+                UI.with_borrow_mut(|ui| {
+                    ui.show(Page::Player);
+                    ui.panels
+                        .show(Some(Panel::Settings(tab)), Some(Hit::Settings));
+                    ui.relayout = true;
+                });
+            }
+        }
+        MenuAction::Quit => unsafe { _ = DestroyWindow(hwnd) },
+        MenuAction::TogglePause => app.shared.toggle_pause(),
+        MenuAction::Stop => app.stop(),
+        MenuAction::Previous => handle(app, hwnd, Hit::Previous),
+        MenuAction::Next => handle(app, hwnd, Hit::Next),
+        MenuAction::HideUi => UI.with_borrow_mut(Ui::hide_bars),
+        MenuAction::Panel(a) => app.apply(hwnd, a),
+        // Files join the queue, or play when nothing is open.
+        MenuAction::AddToQueue(paths) => {
+            if app.session.is_some() {
+                app.add_to_queue(paths);
+            } else if let Some(first) = paths.first().cloned()
+                && app.play(&first, paths)
+            {
+                show_player();
+            }
+        }
+        MenuAction::AddToPlaylist(name, paths) => {
+            for path in paths {
+                if let Err(e) = app.library.add_to_playlist(&name, &path) {
+                    eprintln!("library: cannot add to {name}: {e}");
+                }
+            }
+            UI.with_borrow_mut(|ui| ui.browse.stale = true);
+        }
+        MenuAction::ShowInExplorer(path) => {
+            use std::os::windows::process::CommandExt;
+            // explorer.exe wants the quotes inside its one argument, so it goes in raw.
+            let select = format!("/select,\"{}\"", path.display());
+            if let Err(e) = std::process::Command::new("explorer.exe")
+                .raw_arg(select)
+                .spawn()
+            {
+                eprintln!("explorer: {e}");
+            }
+        }
+        MenuAction::GoToSource(path) => {
+            if let Some(dir) = path.parent() {
+                let place = Place::Folder(section_of(&path), dir.to_owned());
+                UI.with_borrow_mut(|ui| ui.browse.go(place));
+            }
+        }
+        MenuAction::AddSubtitleTo(path) => add_subtitle_to(app, hwnd, &path),
+        MenuAction::AddFolder(section) => add_folder(app, hwnd, section),
+        MenuAction::Resync => UI.with_borrow_mut(|ui| ui.browse.stale = true),
+        MenuAction::PlayPlaylist(name) => play_playlist(app, &name, false),
+        MenuAction::ShufflePlaylist(name) => play_playlist(app, &name, true),
+        MenuAction::ExportPlaylist(name) => export_playlist(app, hwnd, &name),
+        MenuAction::Sort(mode) => UI.with_borrow_mut(|ui| {
+            ui.browse.set_sort(mode);
+            ui.browse.scroll = 0.0;
+            ui.relayout = true;
+        }),
+        MenuAction::ShowQueue => UI.with_borrow_mut(|ui| {
+            if !ui.queue.open {
+                ui.toggle_queue();
+            }
+        }),
+        MenuAction::ToggleRepeat => app.queue.cycle_repeat(),
+        MenuAction::ToggleShuffle => app.queue.toggle_shuffle(),
+        // dialogs agent: the shortcuts, about, new playlist, properties and rename dialogs, and
+        // the library's watched and favourite marks.
+        MenuAction::ShowShortcuts
+        | MenuAction::ShowAbout
+        | MenuAction::NewPlaylist(_)
+        | MenuAction::Properties(_)
+        | MenuAction::RenamePlaylist(_)
+        | MenuAction::MarkWatched(_)
+        | MenuAction::Favorite(_)
+        | MenuAction::FavoritePlaylist(_) => {}
+    }
+    UI.with_borrow_mut(|ui| ui.dirty = true);
+}
+
+/// Picks a subtitle file for `path` and shows it: on the open file, or on `path` once it plays.
+fn add_subtitle_to(app: &mut App, hwnd: HWND, path: &Path) {
+    let Some(subs) = pick_subtitle_file(hwnd) else {
+        return;
+    };
+    let open = app.session.as_ref().is_some_and(|s| s.path == path);
+    if !open {
+        let place = UI.with_borrow(|ui| ui.browse.place.clone());
+        let mut queue = app.library.media_in(&place);
+        if !queue.iter().any(|p| p == path) {
+            queue = vec![path.to_owned()];
+        }
+        if !app.play(path, queue) {
+            return;
+        }
+        UI.with_borrow_mut(|ui| ui.show(Page::Player));
+    }
+    let i = match app.external.iter().position(|(p, _)| *p == subs) {
+        Some(i) => i,
+        None => {
+            app.external.push((subs, None));
+            app.external.len() - 1
+        }
+    };
+    app.show_external(Some(i));
+}
+
+/// Plays a playlist from its first file, or in a shuffled order.
+fn play_playlist(app: &mut App, name: &str, shuffle: bool) {
+    let mut items = app.library.playlist_items(name);
+    if shuffle {
+        shuffle_in_place(&mut items);
+    }
+    let Some(first) = items.first().cloned() else {
+        return;
+    };
+    app.library.record_playlist_play(name);
+    if app.play(&first, items) {
+        UI.with_borrow_mut(|ui| ui.show(Page::Player));
+    }
+}
+
+/// Fisher-Yates with a xorshift seeded from the clock; good enough for a play order.
+fn shuffle_in_place<T>(items: &mut [T]) {
+    let mut x = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(1, |d| d.as_nanos() as u64)
+        | 1;
+    for i in (1..items.len()).rev() {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        items.swap(i, (x % (i as u64 + 1)) as usize);
+    }
+}
+
+/// Writes a playlist to an M3U file the user picks, with absolute paths so it works anywhere.
+fn export_playlist(app: &App, hwnd: HWND, name: &str) {
+    let Some(file) = pick_save_file(hwnd, &format!("{name}.m3u")) else {
+        return;
+    };
+    let mut text = String::from("#EXTM3U\n");
+    for item in app.library.playlist_items(name) {
+        text.push_str(&item.to_string_lossy());
+        text.push('\n');
+    }
+    if let Err(e) = std::fs::write(&file, text) {
+        eprintln!("playlist: cannot export to {}: {e}", file.display());
+    }
+}
+
 fn add_folder(app: &mut App, hwnd: HWND, section: Section) {
     let section = match section {
         Section::Music => Section::Music,
@@ -1186,12 +1439,11 @@ fn pick_subtitle_file(hwnd: HWND) -> Option<PathBuf> {
     }
 }
 
-/// The system file picker with multiple selection, for adding media to the queue. Empty when
-/// cancelled.
-fn pick_media_files(hwnd: HWND) -> Vec<PathBuf> {
+/// The system file picker for media, several files at once. None when cancelled.
+fn pick_media_files(hwnd: HWND) -> Option<Vec<PathBuf>> {
     use windows::Win32::UI::Shell::Common::COMDLG_FILTERSPEC;
-    use windows::Win32::UI::Shell::FOS_ALLOWMULTISELECT;
-    // The extensions library.rs lists as video and audio.
+    // ponytail: a copy of the extensions library.rs plays; share the list when library.rs
+    // exports it.
     let filters = [
         COMDLG_FILTERSPEC {
             pszName: w!("Media files"),
@@ -1204,29 +1456,58 @@ fn pick_media_files(hwnd: HWND) -> Vec<PathBuf> {
             pszSpec: w!("*.*"),
         },
     ];
-    let pick = || unsafe {
+    unsafe {
         let dialog: IFileOpenDialog =
             CoCreateInstance(&FileOpenDialog, None, CLSCTX_INPROC_SERVER).ok()?;
         dialog.SetFileTypes(&filters).ok()?;
         dialog
-            .SetOptions(dialog.GetOptions().ok()? | FOS_FORCEFILESYSTEM | FOS_ALLOWMULTISELECT)
+            .SetOptions(dialog.GetOptions().ok()? | FOS_ALLOWMULTISELECT | FOS_FORCEFILESYSTEM)
             .ok()?;
         dialog.Show(Some(hwnd)).ok()?; // fails when cancelled
-        let items = dialog.GetResults().ok()?;
-        let mut paths = Vec::new();
-        for i in 0..items.GetCount().ok()? {
-            let Ok(name) = items
+        let results = dialog.GetResults().ok()?;
+        let mut files = Vec::new();
+        for i in 0..results.GetCount().ok()? {
+            let Ok(name) = results
                 .GetItemAt(i)
                 .and_then(|item| item.GetDisplayName(SIGDN_FILESYSPATH))
             else {
                 continue;
             };
-            paths.extend(name.to_string().ok().map(PathBuf::from));
+            if let Ok(path) = name.to_string() {
+                files.push(PathBuf::from(path));
+            }
             CoTaskMemFree(Some(name.0 as _));
         }
-        Some(paths)
-    };
-    pick().unwrap_or_default()
+        (!files.is_empty()).then_some(files)
+    }
+}
+
+/// The system Save As dialog for an M3U file, starting at `name`.
+fn pick_save_file(hwnd: HWND, name: &str) -> Option<PathBuf> {
+    use windows::Win32::UI::Shell::Common::COMDLG_FILTERSPEC;
+    let filters = [COMDLG_FILTERSPEC {
+        pszName: w!("M3U playlist"),
+        pszSpec: w!("*.m3u"),
+    }];
+    unsafe {
+        let dialog: IFileSaveDialog =
+            CoCreateInstance(&FileSaveDialog, None, CLSCTX_INPROC_SERVER).ok()?;
+        dialog.SetFileTypes(&filters).ok()?;
+        dialog.SetDefaultExtension(w!("m3u")).ok()?;
+        dialog.SetFileName(&HSTRING::from(name)).ok()?;
+        dialog
+            .SetOptions(dialog.GetOptions().ok()? | FOS_OVERWRITEPROMPT | FOS_FORCEFILESYSTEM)
+            .ok()?;
+        dialog.Show(Some(hwnd)).ok()?; // fails when cancelled
+        let name = dialog
+            .GetResult()
+            .ok()?
+            .GetDisplayName(SIGDN_FILESYSPATH)
+            .ok()?;
+        let path = name.to_string().ok().map(PathBuf::from);
+        CoTaskMemFree(Some(name.0 as _));
+        path
+    }
 }
 
 /// The system folder picker. Modal: the window keeps repainting, playback keeps going.
@@ -1462,6 +1743,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             let action = UI.with_borrow_mut(|ui| ui.on_up(x, y));
             act(hwnd, shared, action);
         }
+        WM_RBUTTONUP => {
+            let (x, y) = mouse_position(lparam);
+            let (x, y) = to_dips(hwnd, x, y);
+            let action = UI.with_borrow_mut(|ui| ui.on_right(x, y));
+            act(hwnd, shared, action);
+        }
         WM_MOUSEWHEEL => {
             let notches = f32::from((wparam.0 >> 16) as u16 as i16) / WHEEL_DELTA as f32;
             // The wheel scrolls the popups, the library and the sidebar panel, and sets the volume.
@@ -1470,7 +1757,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             let mut p = windows::Win32::Foundation::POINT { x: sx, y: sy };
             unsafe { _ = ScreenToClient(hwnd, &mut p) };
             let (x, y) = to_dips(hwnd, p.x, p.y);
-            if UI.with_borrow(|ui| ui.over_panel(x, y)) {
+            // An open menu takes the wheel, so nothing scrolls away under it.
+            if UI.with_borrow(|ui| ui.menu.is_open()) {
+                if UI.with_borrow(|ui| ui.over_menu(x, y)) {
+                    UI.with_borrow_mut(|ui| ui.scroll_menu(x, y, -60.0 * notches));
+                }
+            } else if UI.with_borrow(|ui| ui.over_panel(x, y)) {
                 UI.with_borrow_mut(|ui| ui.scroll_panel(x, y, -60.0 * notches));
             } else if UI.with_borrow(|ui| ui.page == Page::Library || ui.over_overlay()) {
                 UI.with_borrow_mut(|ui| ui.scroll(-120.0 * notches));
@@ -1610,11 +1902,6 @@ fn act(hwnd: HWND, shared: &Shared, action: Option<Action>) {
                 ui.browse.scroll = 0.0;
             }
         }),
-        Action::Click(Hit::Sort) => UI.with_borrow_mut(|ui| {
-            ui.browse.descending = !ui.browse.descending;
-            ui.browse.apply();
-            ui.relayout = true;
-        }),
         // The panel is always a list.
         Action::Click(Hit::ViewMode) if UI.with_borrow(|ui| ui.page == Page::Player) => {}
         Action::Click(Hit::ViewMode) => UI.with_borrow_mut(|ui| {
@@ -1647,13 +1934,34 @@ fn act(hwnd: HWND, shared: &Shared, action: Option<Action>) {
         Action::SetVolume(volume) => shared.set_volume(volume),
         Action::Panel(a) => PANEL_ACTIONS.with_borrow_mut(|p| p.push(a)),
         Action::Queue(a) => QUEUE_ACTIONS.with_borrow_mut(|q| q.push(a)),
+        Action::Menu(a) => MENU_ACTIONS.with_borrow_mut(|m| m.push(a)),
+        Action::OpenMenu(hit, x, y) => MENU_REQUESTS.with_borrow_mut(|m| m.push((hit, x, y))),
     }
 }
 
 fn on_key(hwnd: HWND, shared: &Shared, key: VIRTUAL_KEY) {
     let shift = unsafe { GetKeyState(i32::from(VK_SHIFT.0)) } < 0;
+    let ctrl = unsafe { GetKeyState(i32::from(VK_CONTROL.0)) } < 0;
     let step = if shift { 60.0 } else { 10.0 };
     let page = UI.with_borrow(|ui| ui.page);
+    // An open menu takes the keyboard.
+    if UI.with_borrow(|ui| ui.menu.is_open()) {
+        use ui::menu::Key;
+        let key = match key {
+            VK_UP => Some(Key::Up),
+            VK_DOWN => Some(Key::Down),
+            VK_LEFT => Some(Key::Left),
+            VK_RIGHT => Some(Key::Right),
+            VK_RETURN | VK_SPACE => Some(Key::Enter),
+            VK_ESCAPE => Some(Key::Escape),
+            _ => None,
+        };
+        if let Some(key) = key {
+            let action = UI.with_borrow_mut(|ui| ui.menu_key(key));
+            act(hwnd, shared, action);
+        }
+        return;
+    }
     // While searching, keys type; Esc clears the search and Enter keeps it.
     if UI.with_borrow(|ui| ui.browse.searching) {
         UI.with_borrow_mut(|ui| match key {
@@ -1668,7 +1976,25 @@ fn on_key(hwnd: HWND, shared: &Shared, key: VIRTUAL_KEY) {
         });
         return;
     }
+    // The menus' shortcuts.
+    let menu = |action| act(hwnd, shared, Some(Action::Menu(action)));
+    let shortcut = match key {
+        VK_O if ctrl => Some(MenuAction::OpenFiles),
+        VK_F if ctrl => Some(MenuAction::OpenFolder),
+        VK_P if ctrl => Some(MenuAction::Settings(SettingsTab::Playback)),
+        VK_Q if ctrl => Some(MenuAction::Quit),
+        VK_OEM_5 if ctrl && page == Page::Player => Some(MenuAction::HideUi),
+        VK_F1 if shift => Some(MenuAction::ShowAbout),
+        VK_S if page == Page::Player => Some(MenuAction::Stop),
+        _ => None,
+    };
+    if let Some(action) = shortcut {
+        menu(action);
+        return;
+    }
     match key {
+        VK_P => PENDING.with_borrow_mut(|p| p.push(Hit::Previous)),
+        VK_N => PENDING.with_borrow_mut(|p| p.push(Hit::Next)),
         VK_BACK if page == Page::Library => UI.with_borrow_mut(|ui| ui.browse.back()),
         VK_SPACE => shared.toggle_pause(),
         VK_LEFT => shared.seek_by(-step),

@@ -288,7 +288,7 @@ fn plural(n: usize, word: &str) -> String {
 impl Ui {
     /// The playlist button: opens or closes the queue. It shares the right side with the tracks
     /// and settings popups, so opening one closes the other.
-    pub(super) fn toggle_queue(&mut self) {
+    pub fn toggle_queue(&mut self) {
         self.queue.open = !self.queue.open;
         if self.queue.open {
             self.panels.show(None, None);
