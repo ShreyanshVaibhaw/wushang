@@ -66,6 +66,8 @@ pub struct Session {
     pub duration: f64,
     /// Size of the selected video track; None when video is off or the file has none.
     pub video_size: Option<(u32, u32)>,
+    /// Start in seconds and title of each chapter, in file order.
+    chapters: Vec<(f64, String)>,
     shared: Arc<Shared>,
     audio: Arc<audio::Device>,
     hw: Option<HwDevice>,
@@ -153,6 +155,7 @@ impl Session {
         for (list, titles) in tracks.iter_mut().zip(&titles) {
             label_tracks(list, titles);
         }
+        let chapters = read_chapters(&input);
         let best = |kind, medium| {
             let list: &Vec<TrackInfo> = &tracks[kind as usize];
             let best = input.streams().best(medium).map(|s| s.index());
@@ -179,6 +182,7 @@ impl Session {
                 .map_or_else(String::new, |f| f.to_string_lossy().into_owned()),
             duration,
             video_size: None,
+            chapters,
             shared: shared.clone(),
             audio: audio.clone(),
             hw: hw.cloned(),
@@ -428,6 +432,31 @@ impl Session {
     pub fn take_initial_subtitles(&mut self) -> Option<SubtitleStream> {
         self.initial_subtitles.take()
     }
+
+    /// Start in seconds and title of each chapter, read when the file opened.
+    pub fn chapters(&self) -> &[(f64, String)] {
+        &self.chapters
+    }
+}
+
+/// The container's chapters with their "title" tag, else "Chapter N", earliest first.
+fn read_chapters(input: &ff::format::context::Input) -> Vec<(f64, String)> {
+    let mut chapters: Vec<(f64, String)> = input
+        .chapters()
+        .enumerate()
+        .map(|(i, c)| {
+            let start = c.start() as f64 * f64::from(c.time_base());
+            let title = c
+                .metadata()
+                .get("title")
+                .map(str::trim)
+                .filter(|t| !t.is_empty())
+                .map_or_else(|| format!("Chapter {}", i + 1), str::to_owned);
+            (start.max(0.0), title)
+        })
+        .collect();
+    chapters.sort_by(|a, b| a.0.total_cmp(&b.0));
+    chapters
 }
 
 impl Drop for Session {
@@ -727,6 +756,26 @@ mod tests {
         s.select(TrackKind::Video, None).unwrap();
         assert!(s.select(TrackKind::Audio, None).is_err(), "both off");
         assert_eq!(s.selected(TrackKind::Audio), Some(ENGLISH));
+    }
+
+    #[test]
+    fn lists_chapters() {
+        let shared = Arc::new(Shared::new());
+        shared.toggle_mute();
+        let audio = audio::Device::open(shared.clone());
+        // test_tracks.mkv remuxed with three chapters, the middle one without a title.
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/test_chapters.mkv");
+        let s = Session::open(&path, None, &shared, None, &audio).unwrap();
+        let expected = [
+            (0.0, "Opening".to_owned()),
+            (1.5, "Chapter 2".to_owned()),
+            (3.0, "Finale".to_owned()),
+        ];
+        assert_eq!(s.chapters(), expected);
+        within(Duration::from_secs(10), "dropping the session", || drop(s));
+        let s = Session::open(&clip(), None, &shared, None, &audio).unwrap();
+        assert!(s.chapters().is_empty());
+        within(Duration::from_secs(10), "dropping the session", || drop(s));
     }
 
     #[test]

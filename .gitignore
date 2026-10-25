@@ -4,4 +4,5 @@
 /testdata/*
 !/testdata/test_tracks.mkv
 !/testdata/test_subs.mkv
+!/testdata/test_chapters.mkv
 !/testdata/tracks.srt
