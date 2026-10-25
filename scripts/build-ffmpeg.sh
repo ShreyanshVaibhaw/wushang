@@ -1,19 +1,29 @@
 #!/usr/bin/env bash
 # Cross-compiles a slim LGPL FFmpeg for myvlc on Linux/WSL with MinGW-w64.
-# Only the demuxers, parsers and decoders a desktop player needs are built, plus D3D11VA and
-# dav1d for software AV1. Subtitles cover embedded text and picture tracks and the common
-# external files (.srt .ass .ssa .vtt .sub .idx .smi .sup).
+# Only the demuxers, parsers and decoders a desktop player needs are built, plus D3D11VA, dav1d
+# for software AV1, and zlib for Matroska tracks stored compressed. Subtitles cover embedded text
+# and picture tracks and the common external files (.srt .ass .ssa .vtt .sub .idx .smi .sup).
 #
 # Needs: gcc-mingw-w64-x86-64-win32 nasm make pkg-config meson ninja-build, plus gcc and
 # libc6-dev for FFmpeg's build-time host tools.
 # Usage: SRC=/path/to/ffmpeg-9.0.2 DAV1D_SRC=/path/to/dav1d-1.5.4 PREFIX=/path/to/output \
-#        scripts/build-ffmpeg.sh
+#        ZLIB_SRC=/path/to/zlib-1.3.1 scripts/build-ffmpeg.sh
 set -euo pipefail
 
 SRC=${SRC:-/mnt/d/tools/src/ffmpeg-9.0.2}
 DAV1D_SRC=${DAV1D_SRC:-/mnt/d/tools/src/dav1d-1.5.4}
-PREFIX=${PREFIX:-/mnt/d/tools/ffmpeg-9.0.2-myvlc-slim}
+ZLIB_SRC=${ZLIB_SRC:-/mnt/d/tools/src/zlib-1.3.1}
+PREFIX=${PREFIX:-/mnt/d/tools/ffmpeg-9.0.2-myvlc}
+# Static libraries linked into the FFmpeg DLLs: none of them ships as a DLL of its own.
 DAV1D_PREFIX="$PREFIX-deps"
+
+# zlib (zlib licence) inflates Matroska tracks stored with zlib compression, which anime releases
+# often use for their ASS subtitles; without it the matroska demuxer can't read those tracks.
+make -C "$ZLIB_SRC" -f win32/Makefile.gcc clean
+make -C "$ZLIB_SRC" -f win32/Makefile.gcc -j"$(nproc)" PREFIX=x86_64-w64-mingw32- libz.a
+make -C "$ZLIB_SRC" -f win32/Makefile.gcc install PREFIX=x86_64-w64-mingw32- SHARED_MODE=0 \
+  INCLUDE_PATH="$DAV1D_PREFIX/include" LIBRARY_PATH="$DAV1D_PREFIX/lib" \
+  BINARY_PATH="$DAV1D_PREFIX/bin"
 
 # dav1d (BSD-2) decodes AV1 on GPUs that can't. It is built as a static library and linked into
 # avcodec, so no extra DLL ships.
@@ -56,13 +66,14 @@ cd "$SRC"
   --disable-avdevice --disable-avfilter --disable-network \
   --disable-autodetect --enable-w32threads --enable-d3d11va \
   --enable-libdav1d --pkg-config=pkg-config --pkg-config-flags=--static \
+  --enable-zlib --extra-cflags="-I$DAV1D_PREFIX/include" \
   --disable-everything \
   --enable-protocol=file \
   --enable-demuxer="$(join "${demuxers[@]}")" \
   --enable-parser="$(join "${parsers[@]}")" \
   --enable-decoder="$(join "${decoders[@]}")" \
   --enable-hwaccel="$(join "${hwaccels[@]}")" \
-  --extra-ldflags=-static-libgcc \
+  --extra-ldflags="-static-libgcc -L$DAV1D_PREFIX/lib" \
   --ln_s="cp -f" # D: is exFAT, which has no symlinks
 make -j"$(nproc)"
 make install

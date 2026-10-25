@@ -7,3 +7,4 @@
 !/testdata/test_chapters.mkv
 !/testdata/tracks.srt
 /.claude
+!/testdata/test_zlib_subs.mkv

@@ -1,5 +1,5 @@
 # Build inputs for ffmpeg-sys-next: FFmpeg headers/import libs and libclang for bindgen.
 # The FFmpeg here is the slim build from scripts/build-ffmpeg.sh.
 [env]
-FFMPEG_DIR = 'D:\tools\ffmpeg-9.0.2-myvlc-slim-subs'
+FFMPEG_DIR = 'D:\tools\ffmpeg-9.0.2-myvlc'
 LIBCLANG_PATH = 'D:\tools\libclang-18.1.1'

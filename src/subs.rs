@@ -826,6 +826,37 @@ mod tests {
         }
     }
 
+    /// Matroska tracks stored zlib-compressed (mkvmerge's default for subtitles) need FFmpeg
+    /// built with zlib; without it the demuxer reports "Unsupported encoding type".
+    #[test]
+    fn reads_zlib_compressed_matroska_tracks() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/test_zlib_subs.mkv");
+        let mut input = ff::format::input(&path).unwrap();
+        let stream = input.streams().best(ff::media::Type::Subtitle).unwrap();
+        let index = stream.index();
+        let shared = Arc::new(Shared::new());
+        let queue = Arc::new(PacketQueue::default());
+        let (thread, cues) = spawn_embedded(
+            stream.parameters(),
+            f64::from(stream.time_base()),
+            queue.clone(),
+            shared.clone(),
+        );
+        for (s, packet) in input.packets() {
+            if s.index() == index {
+                queue.push(Msg::Packet(packet));
+            }
+        }
+        queue.push(Msg::Eof);
+        wait_for(&cues, 2);
+        let first = &cues.active(1.5)[0];
+        assert!(close(first.start, 1.0) && close(first.end, 3.0), "{first:?}");
+        assert_eq!(text(first), &vec![vec![span("First zlib cue", false, false)]]);
+        assert_eq!(text(&cues.active(4.0)[0]), &vec![vec![span("Second zlib cue", false, false)]]);
+        shared.quit.store(true, Relaxed);
+        thread.join().unwrap();
+    }
+
     #[test]
     fn decodes_embedded_subrip() {
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/test_subs.mkv");

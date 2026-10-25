@@ -426,10 +426,7 @@ pub fn spawn_decoder(
                     chain = Some((Chain::new(format.rate, format.channels), generation));
                     resampler = None;
                 }
-                let mut layout = frame.channel_layout();
-                if layout.is_empty() {
-                    layout = ff::ChannelLayout::default(layout.channels());
-                }
+                let layout = label_layout(&mut frame);
                 let stale = resampler.as_ref().is_none_or(|r| {
                     let i = r.input();
                     i.format != frame.format()
@@ -481,6 +478,20 @@ pub fn spawn_decoder(
     })
 }
 
+/// The frame's channel layout, filling in the default one when the decoder left it unset. PCM in
+/// WAV or Matroska often comes that way, and the frame itself needs the label too: swresample
+/// rejects a frame whose layout differs from the one it was set up with, which silenced every
+/// such file.
+fn label_layout(frame: &mut ff::frame::Audio) -> ff::ChannelLayout {
+    let layout = frame.channel_layout();
+    if !layout.is_empty() {
+        return layout;
+    }
+    let layout = ff::ChannelLayout::default(i32::from(frame.channels()));
+    frame.set_channel_layout(layout);
+    layout
+}
+
 /// Converts one decoded frame to interleaved f32 at the device's rate and channel count.
 fn resample(
     resampler: &mut ff::software::resampling::Context,
@@ -505,6 +516,32 @@ mod tests {
     use ff::format::sample::Type::Planar;
     use std::path::PathBuf;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn plays_pcm_without_a_channel_layout() {
+        // A mono s16 frame labelled only with its channel count, as the WAV and Matroska PCM
+        // decoders hand them out.
+        let format = ff::format::Sample::I16(ff::format::sample::Type::Packed);
+        let mut frame = ff::frame::Audio::new(format, 1000, ff::ChannelLayout::default(1));
+        frame.set_rate(8000);
+        unsafe {
+            let layout = &mut (*frame.as_mut_ptr()).ch_layout;
+            layout.order = ff::ffi::AVChannelOrder::AV_CHANNEL_ORDER_UNSPEC;
+            layout.nb_channels = 1;
+        }
+        assert!(frame.channel_layout().is_empty());
+        let layout = label_layout(&mut frame);
+        let mut resampler = ff::software::resampling::Context::get(
+            format,
+            layout,
+            8000,
+            DEVICE_FORMAT,
+            ff::ChannelLayout::default(2),
+            48_000,
+        )
+        .unwrap();
+        assert!(resample(&mut resampler, &frame, 2, 48_000).is_some());
+    }
 
     #[test]
     fn upsampling_keeps_every_sample() {
