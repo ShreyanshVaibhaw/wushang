@@ -55,6 +55,117 @@ fn count_text(count: usize) -> String {
     format!("{count} {}", if count == 1 { "item" } else { "items" })
 }
 
+/// The design's "Sorting Options", in its order. Title A-Z is the library's own order.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum SortMode {
+    UnwatchedFirst,
+    WatchedFirst,
+    NewestFirst,
+    OldestFirst,
+    #[default]
+    TitleAz,
+    TitleZa,
+    ArtistAz,
+    ArtistZa,
+}
+
+impl SortMode {
+    pub const ALL: [SortMode; 8] = [
+        SortMode::UnwatchedFirst,
+        SortMode::WatchedFirst,
+        SortMode::NewestFirst,
+        SortMode::OldestFirst,
+        SortMode::TitleAz,
+        SortMode::TitleZa,
+        SortMode::ArtistAz,
+        SortMode::ArtistZa,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            SortMode::UnwatchedFirst => "Unwatched First",
+            SortMode::WatchedFirst => "Watched First",
+            SortMode::NewestFirst => "Newest First",
+            SortMode::OldestFirst => "Oldest First",
+            SortMode::TitleAz => "Title A-Z",
+            SortMode::TitleZa => "Title Z-A",
+            SortMode::ArtistAz => "Artist A-Z",
+            SortMode::ArtistZa => "Artist Z-A",
+        }
+    }
+
+    fn uses_time(self) -> bool {
+        matches!(self, SortMode::NewestFirst | SortMode::OldestFirst)
+    }
+}
+
+/// Where an entry's modification time comes from: the file, or the folder on disk.
+fn entry_path(e: &Entry) -> Option<&std::path::Path> {
+    match e {
+        Entry::Media { path, .. } => Some(path),
+        Entry::Folder {
+            place: Place::Folder(_, dir),
+            ..
+        } => Some(dir),
+        _ => None,
+    }
+}
+
+/// Reorders `entries`, which come in the library's natural order. Sorts are stable, so ties
+/// keep that order; folders stay in front of files except when sorting by time.
+fn sort_entries(
+    entries: &mut [Entry],
+    mode: SortMode,
+    time: impl Fn(&Entry) -> Option<std::time::SystemTime>,
+) {
+    use std::cmp::Reverse;
+    // 0 unwatched, 1 started, 2 finished; folders before all of them.
+    let watched = |e: &Entry| match e {
+        Entry::Media { finished: true, .. } => 2,
+        Entry::Media {
+            progress: Some(p), ..
+        } if *p > 0.0 => 1,
+        Entry::Media { .. } => 0,
+        _ => -1,
+    };
+    let artist = |e: &Entry| match e {
+        Entry::Media {
+            subtitle: Some(a), ..
+        } => Some(a.to_lowercase()),
+        _ => None,
+    };
+    let folder_first = |e: &Entry| !matches!(e, Entry::Folder { .. });
+    match mode {
+        SortMode::TitleAz => {}
+        SortMode::TitleZa => entries.reverse(),
+        SortMode::UnwatchedFirst => entries.sort_by_key(watched),
+        SortMode::WatchedFirst => {
+            entries.sort_by_key(|e| match watched(e) {
+                -1 => -1,
+                w => 2 - w,
+            });
+        }
+        // Entries without a time (playlists, music views) go last either way.
+        SortMode::NewestFirst => entries.sort_by_key(|e| {
+            let t = time(e);
+            (t.is_none(), Reverse(t))
+        }),
+        SortMode::OldestFirst => entries.sort_by_key(|e| {
+            let t = time(e);
+            (t.is_none(), t)
+        }),
+        // Files without an artist go last either way.
+        SortMode::ArtistAz => entries.sort_by_key(|e| {
+            let a = artist(e);
+            (folder_first(e), a.is_none(), a)
+        }),
+        SortMode::ArtistZa => entries.sort_by_key(|e| {
+            let a = artist(e);
+            (folder_first(e), a.is_none(), Reverse(a))
+        }),
+    }
+}
+
 /// Where the library page is looking and how it shows it.
 pub struct Browse {
     pub place: Place,
@@ -66,11 +177,15 @@ pub struct Browse {
     pub crumbs: Vec<Crumb>,
     pub scroll: f32,
     pub grid: bool,
-    pub descending: bool,
+    pub sort: SortMode,
     pub search: String,
     pub searching: bool,
     /// The place or the library changed: reload the entries.
     pub stale: bool,
+    /// The entry whose context menu is open; it stays highlighted under the menu.
+    pub context: Option<usize>,
+    /// Modification times for the time sorts, read once per refresh.
+    times: HashMap<PathBuf, Option<std::time::SystemTime>>,
 }
 
 impl Browse {
@@ -84,10 +199,12 @@ impl Browse {
             crumbs: Vec::new(),
             scroll: 0.0,
             grid: true,
-            descending: false,
+            sort: SortMode::default(),
             search: String::new(),
             searching: false,
             stale: true,
+            context: None,
+            times: HashMap::new(),
         }
     }
 
@@ -124,6 +241,8 @@ impl Browse {
         self.all = library.entries(&self.place);
         self.crumbs = library.crumbs(&self.place);
         self.stale = false;
+        self.context = None;
+        self.times.clear();
         self.apply();
     }
 
@@ -142,9 +261,20 @@ impl Browse {
             })
             .cloned()
             .partition(|e| matches!(e, Entry::Action { .. }));
-        // Home is ordered by section; elsewhere "Add" stays first and the rest flips.
-        if self.descending && self.place != Place::Home {
-            rest.reverse();
+        // Home is ordered by section; elsewhere "Add" stays first and the rest is sorted.
+        if self.place != Place::Home {
+            if self.sort.uses_time() {
+                for path in rest.iter().filter_map(entry_path) {
+                    if !self.times.contains_key(path) {
+                        let t = std::fs::metadata(path).and_then(|m| m.modified()).ok();
+                        self.times.insert(path.to_owned(), t);
+                    }
+                }
+            }
+            let times = &self.times;
+            sort_entries(&mut rest, self.sort, |e| {
+                entry_path(e).and_then(|p| times.get(p).copied().flatten())
+            });
         }
         self.entries = actions;
         self.entries.append(&mut rest);
@@ -156,6 +286,24 @@ impl Browse {
             .iter()
             .filter(|e| matches!(e, Entry::Folder { .. } | Entry::Media { .. }))
             .count()
+    }
+
+    pub fn set_sort(&mut self, mode: SortMode) {
+        self.sort = mode;
+        self.apply();
+    }
+
+    /// Whether any file on the page has an artist, for the artist sorts.
+    pub fn has_artists(&self) -> bool {
+        self.all.iter().any(|e| {
+            matches!(
+                e,
+                Entry::Media {
+                    subtitle: Some(_),
+                    ..
+                }
+            )
+        })
     }
 
     /// Whether the header shows "+": adding a folder or creating a playlist.
@@ -846,7 +994,11 @@ impl Painter {
             self.crumbs(rt, s);
             self.text_in(rt, &count_text(b.count()), &r.count, g.count, &r.dim);
             let sort = l.button(Hit::Sort);
-            let sort_icon = if b.descending { &i.sort } else { &r.sort_plain };
+            let sort_icon = if b.sort != SortMode::default() {
+                &i.sort
+            } else {
+                &r.sort_plain
+            };
             self.icon(ctx, sort_icon, sort.l + 3.0, sort.t + 3.5, false);
             let view = l.button(Hit::ViewMode);
             let view_icon = if b.grid { &i.view_grid } else { &i.view_list };
@@ -1022,7 +1174,7 @@ impl Painter {
             let count = count_text(b.count());
             self.text_in(rt, &count, &self.lib.placeholder, g.count, &self.lib.dim);
             let sort = at(Hit::Sort);
-            let sort_icon = if b.descending {
+            let sort_icon = if b.sort != SortMode::default() {
                 &i.sort
             } else {
                 &self.lib.sort_plain
@@ -1081,7 +1233,8 @@ impl Painter {
         unsafe {
             rt.PushAxisAlignedClip(&g.content.d2d(), D2D1_ANTIALIAS_MODE_ALIASED);
             for tile in g.tiles.iter().filter(|t| t.area().intersects(&g.content)) {
-                let hovered = s.hover == Some(Hit::Entry(tile.index));
+                let hovered =
+                    s.hover == Some(Hit::Entry(tile.index)) || s.browse.context == Some(tile.index);
                 let radius = if grid { 8.0 } else { 4.0 };
                 // The layout is rebuilt whenever the entries change; skip rather than trust it.
                 let Some(entry) = s.browse.entries.get(tile.index) else {
@@ -1265,5 +1418,91 @@ impl Painter {
             );
             self.icon(ctx, &self.icons.playlist, f.r - 43.0, f.t + 298.0, false);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::{Duration, SystemTime};
+
+    use super::*;
+
+    fn file(name: &str, progress: Option<f32>, artist: Option<&str>) -> Entry {
+        Entry::Media {
+            label: name.into(),
+            path: PathBuf::from(name),
+            kind: MediaKind::Video,
+            subtitle: artist.map(Into::into),
+            progress,
+            finished: progress.is_some_and(|p| p >= 0.95),
+        }
+    }
+
+    fn dir(name: &str) -> Entry {
+        Entry::Folder {
+            label: name.into(),
+            place: Place::Folder(Section::Videos, PathBuf::from(name)),
+        }
+    }
+
+    fn labels(entries: &[Entry]) -> Vec<&str> {
+        entries.iter().map(Entry::label).collect()
+    }
+
+    fn sorted(mode: SortMode) -> Vec<String> {
+        let mut entries = vec![
+            dir("d"),
+            file("a", Some(1.0), Some("Zed")),
+            file("b", None, None),
+            file("c", Some(0.5), Some("Abba")),
+        ];
+        // Modification times: c newest, then d, a, b; nothing for anything else.
+        let epoch = SystemTime::UNIX_EPOCH;
+        let age = |e: &Entry| {
+            let s = match e.label() {
+                "c" => 40,
+                "d" => 30,
+                "a" => 20,
+                "b" => 10,
+                _ => return None,
+            };
+            Some(epoch + Duration::from_secs(s))
+        };
+        sort_entries(&mut entries, mode, age);
+        labels(&entries).into_iter().map(String::from).collect()
+    }
+
+    #[test]
+    fn sort_modes_order_entries() {
+        assert_eq!(sorted(SortMode::TitleAz), ["d", "a", "b", "c"]);
+        assert_eq!(sorted(SortMode::TitleZa), ["c", "b", "a", "d"]);
+        // Folders stay first; then unwatched, started, finished (or the reverse).
+        assert_eq!(sorted(SortMode::UnwatchedFirst), ["d", "b", "c", "a"]);
+        assert_eq!(sorted(SortMode::WatchedFirst), ["d", "a", "c", "b"]);
+        assert_eq!(sorted(SortMode::NewestFirst), ["c", "d", "a", "b"]);
+        assert_eq!(sorted(SortMode::OldestFirst), ["b", "a", "d", "c"]);
+        // Files without an artist go last both ways.
+        assert_eq!(sorted(SortMode::ArtistAz), ["d", "c", "a", "b"]);
+        assert_eq!(sorted(SortMode::ArtistZa), ["d", "a", "c", "b"]);
+    }
+
+    #[test]
+    fn apply_keeps_actions_first_and_home_unsorted() {
+        let mut b = Browse::new();
+        b.place = Place::Videos;
+        b.all = vec![
+            Entry::Action {
+                label: "Add".into(),
+                action: crate::library::Action::AddFolder(Section::Videos),
+            },
+            dir("x"),
+            dir("y"),
+        ];
+        b.set_sort(SortMode::TitleZa);
+        assert_eq!(labels(&b.entries), ["Add", "y", "x"]);
+        b.place = Place::Home;
+        b.apply();
+        assert_eq!(labels(&b.entries), ["Add", "x", "y"]);
+        assert!(!b.has_artists());
     }
 }

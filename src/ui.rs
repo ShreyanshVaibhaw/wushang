@@ -1,9 +1,11 @@
 //! The interface from Juxtopposed's "VLC Redesign" (Figma community file, CC BY 4.0), drawn with
 //! Direct2D and DirectWrite on top of the video: the player page (title bar, control bar and
-//! hide-UI mode) here, the library page in `browse`, the tracks and settings popups in `panels`.
+//! hide-UI mode) here, the library page in `browse`, the tracks and settings popups in `panels`,
+//! the popup menus in `menu`.
 //! Sizes are DIPs measured from the design's 1920x1080 frames.
 
 mod browse;
+pub mod menu;
 pub mod panels;
 
 use std::collections::HashMap;
@@ -11,6 +13,7 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 pub use browse::Browse;
+pub use menu::MenuAction;
 pub use panels::{Panel, PanelAction, PanelData, TrackTab};
 use windows::Win32::Foundation::E_FAIL;
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
@@ -167,6 +170,8 @@ pub enum Hit {
     Panel,
     /// The tracks or settings popup.
     Popup(panels::Target),
+    /// An open menu, over everything else.
+    Menu(menu::Target),
 }
 
 impl Hit {
@@ -197,6 +202,7 @@ pub struct Layout {
     volume: Rect,
     browse: browse::Geometry,
     panels: panels::Geometry,
+    menu: menu::Geometry,
 }
 
 impl Layout {
@@ -249,6 +255,7 @@ impl Layout {
             volume: Rect::new(w - 292.0, cy - 14.0, w - 204.0, cy + 14.0),
             browse: Default::default(),
             panels: Default::default(),
+            menu: Default::default(),
         }
     }
 
@@ -269,6 +276,9 @@ impl Layout {
     }
 
     pub fn hit(&self, x: f32, y: f32) -> Option<Hit> {
+        if let Some(target) = self.menu.hit(x, y) {
+            return Some(Hit::Menu(target));
+        }
         if self.page == Page::Library {
             return self.browse_hit(x, y);
         }
@@ -313,6 +323,10 @@ pub enum Action {
     SeekTo(f64),
     SetVolume(f32),
     Panel(PanelAction),
+    Menu(MenuAction),
+    /// Opens the menu for what was clicked (the "..." button, the sort button, the video or an
+    /// entry) at (x, y); main.rs builds it, because it needs the library and the open file.
+    OpenMenu(Hit, f32, f32),
 }
 
 /// Pointer state. Lives on the UI thread; the window procedure feeds it and the render loop
@@ -337,6 +351,10 @@ pub struct Ui {
     pub panels: panels::State,
     /// The last slider pressed and when, to spot a double-click that resets it.
     last_slider: Option<(panels::Ctl, Instant)>,
+    /// The open popup menu.
+    pub menu: menu::State,
+    /// Hide UI (Ctrl+\): the bars stay hidden until the mouse moves.
+    hidden: bool,
 }
 
 /// Two presses on a slider this close together reset it.
@@ -359,6 +377,8 @@ impl Ui {
             overlay: false,
             panels: panels::State::default(),
             last_slider: None,
+            menu: menu::State::default(),
+            hidden: false,
         }
     }
 
@@ -366,6 +386,7 @@ impl Ui {
     pub fn show(&mut self, page: Page) {
         if self.page != page {
             self.page = page;
+            self.close_menu();
             self.panels.show(None, None);
             self.hover = None;
             self.relayout = true;
@@ -478,7 +499,11 @@ impl Ui {
     /// Bars stay up while paused, while the pointer is over them or moved recently, and while
     /// dragging; otherwise playback goes to the design's hide-UI mode.
     pub fn bars_visible(&self, paused: bool) -> bool {
+        if self.hidden && !self.menu.is_open() {
+            return false;
+        }
         self.page == Page::Library
+            || self.menu.is_open()
             || self.overlay
             || self.panels.open.is_some()
             || paused
@@ -508,11 +533,21 @@ impl Ui {
         if (x, y) != self.pointer {
             self.pointer = (x, y);
             self.last_activity = Instant::now();
+            self.hidden = false;
         }
         let hover = self.layout.hit(x, y);
         if hover != self.hover {
             self.hover = hover;
             self.dirty = true;
+        }
+        if self.menu.is_open() {
+            let target = match hover {
+                Some(Hit::Menu(t)) => Some(t),
+                _ => None,
+            };
+            if self.menu.hover(target, Instant::now()) {
+                self.sync_menu();
+            }
         }
         match self.drag {
             Some(Hit::Seek) => {
@@ -536,6 +571,12 @@ impl Ui {
 
     pub fn on_down(&mut self, x: f32, y: f32) -> Option<Action> {
         self.on_move(x, y);
+        // A press outside an open menu only closes it.
+        if self.menu.is_open() && !matches!(self.hover, Some(Hit::Menu(_))) {
+            self.close_menu();
+            self.pressed = None;
+            return None;
+        }
         self.pressed = self.hover;
         match self.hover {
             Some(Hit::Seek) => {
@@ -592,6 +633,16 @@ impl Ui {
             None => match hit {
                 Some(Hit::Caption | Hit::Seek | Hit::Volume | Hit::Panel) => None,
                 Some(Hit::Popup(target)) => self.panel_click(target),
+                Some(Hit::Menu(target)) => {
+                    let action = self.menu.click(target);
+                    self.menu_changed();
+                    action.map(Action::Menu)
+                }
+                // Menus open under their button.
+                Some(h @ (Hit::More | Hit::Sort)) => {
+                    let r = self.layout.button(h);
+                    Some(Action::OpenMenu(h, r.l, r.b + 4.0))
+                }
                 Some(h @ (Hit::Audio | Hit::Subtitles | Hit::Settings)) => {
                     // Its own button closes a popup; another button switches to its popup.
                     let open = self.panels.opener != Some(h);
@@ -612,6 +663,91 @@ impl Ui {
                 None => None,
             },
         }
+    }
+
+    /// A right-click: the video and library entries have context menus.
+    pub fn on_right(&mut self, x: f32, y: f32) -> Option<Action> {
+        self.on_move(x, y);
+        if matches!(self.hover, Some(Hit::Menu(_))) {
+            return None;
+        }
+        self.close_menu();
+        match self.layout.hit(x, y)? {
+            hit @ (Hit::Video | Hit::Entry(_)) => Some(Action::OpenMenu(hit, x, y)),
+            _ => None,
+        }
+    }
+
+    /// Opens a menu at (x, y) for `hit`; an entry stays highlighted under its menu.
+    pub fn open_menu(
+        &mut self,
+        kind: menu::Kind,
+        items: Vec<menu::Item>,
+        at: (f32, f32),
+        hit: Hit,
+    ) {
+        self.menu.open(kind, items, at.0, at.1);
+        self.browse.context = match hit {
+            Hit::Entry(i) => Some(i),
+            _ => None,
+        };
+        self.sync_menu();
+    }
+
+    pub fn close_menu(&mut self) {
+        if self.menu.is_open() {
+            self.menu.close();
+            self.menu_changed();
+        }
+    }
+
+    /// Rebuilds the menu's geometry, after the menu, the window or the layout changed.
+    pub fn sync_menu(&mut self) {
+        self.layout.menu = menu::Geometry::new(&self.menu, self.layout.width, self.layout.height);
+        self.dirty = true;
+        self.rehover();
+    }
+
+    fn menu_changed(&mut self) {
+        if !self.menu.is_open() {
+            self.browse.context = None;
+        }
+        self.sync_menu();
+    }
+
+    /// A key for the open menu.
+    pub fn menu_key(&mut self, key: menu::Key) -> Option<Action> {
+        let action = self.menu.key(key);
+        self.menu_changed();
+        if self.menu.reveal(&self.layout.menu) {
+            self.sync_menu();
+        }
+        action.map(Action::Menu)
+    }
+
+    /// Opens or swaps a submenu whose hover delay ran out; the render loop calls it.
+    pub fn menu_tick(&mut self) {
+        if self.menu.tick(Instant::now()) {
+            self.sync_menu();
+        }
+    }
+
+    /// Whether (x, y) is over the open menu.
+    pub fn over_menu(&self, x: f32, y: f32) -> bool {
+        self.layout.menu.contains(x, y)
+    }
+
+    pub fn scroll_menu(&mut self, x: f32, y: f32, dy: f32) {
+        self.menu.scroll(&self.layout.menu, x, y, dy);
+        self.sync_menu();
+    }
+
+    /// Hide UI: the bars, the popup and the sidebar panel go until the mouse moves.
+    pub fn hide_bars(&mut self) {
+        self.hidden = true;
+        self.overlay = false;
+        self.panels.show(None, None);
+        self.relayout = true;
     }
 
     pub fn on_leave(&mut self) {
@@ -902,6 +1038,7 @@ pub struct Painter {
     dwrite: IDWriteFactory6,
     lib: browse::Resources,
     panels: panels::Resources,
+    menu: menu::Resources,
     /// Thumbnails by file; None means the file has no picture.
     thumbs: HashMap<PathBuf, Option<ID2D1Bitmap>>,
     /// Visible files without a thumbnail yet, collected while painting.
@@ -937,6 +1074,7 @@ impl Painter {
             frame: None,
             lib: browse::Resources::new(ctx, &factory, &dwrite, &fonts)?,
             panels: panels::Resources::new(ctx, &dwrite, &fonts)?,
+            menu: menu::Resources::new(ctx, &dwrite, &fonts)?,
             captions: crate::captions::CaptionRenderer::new(ctx, &dwrite, Some(&fonts))?,
             stats_text: {
                 let f = text_format(
@@ -1022,6 +1160,12 @@ impl Painter {
     /// Paints the interface over the video, which the renderer has already drawn into the
     /// video area. Runs between BeginDraw and EndDraw.
     pub fn paint(&mut self, ctx: &ID2D1DeviceContext5, s: &Scene) -> Result<()> {
+        self.paint_page(ctx, s)?;
+        unsafe { self.menu(ctx, s) };
+        Ok(())
+    }
+
+    fn paint_page(&mut self, ctx: &ID2D1DeviceContext5, s: &Scene) -> Result<()> {
         if s.layout.page == Page::Library {
             return self.paint_library(ctx, s);
         }
