@@ -1,0 +1,1347 @@
+//! Media library: root folders, folder browsing, the music index, playlists, recent files and
+//! resume positions. A plain model with no UI or FFmpeg; the sidebar and pages draw its entries.
+//!
+//! State lives in one folder (see [`Library::default_dir`]): `state.txt` holds roots, the recent
+//! list and the counters, and `playlists\<name>.m3u` holds one playlist each.
+
+use std::cmp::Ordering;
+use std::collections::{HashMap, HashSet};
+use std::fmt::Write as _;
+use std::io::ErrorKind;
+use std::os::windows::fs::MetadataExt;
+use std::path::{Path, PathBuf};
+use std::{env, fs, io};
+
+const VIDEO_EXTS: &[&str] = &[
+    "mp4", "m4v", "mkv", "webm", "avi", "mov", "wmv", "flv", "ts", "m2ts", "mts", "mpg", "mpeg",
+    "ogv", "3gp",
+];
+const AUDIO_EXTS: &[&str] = &[
+    "mp3", "m4a", "aac", "flac", "wav", "ogg", "opus", "wma", "alac", "aiff", "ape", "mka",
+];
+/// Recent files kept. Resume positions live in the recent list, so they go with it.
+const MAX_RECENT: usize = 200;
+/// Folder levels searched, the folder itself included, when deciding whether it holds any media.
+const MEDIA_SEARCH_DEPTH: usize = 4;
+/// Folder levels walked below each Music root by [`Library::music_files`].
+const MUSIC_SCAN_DEPTH: usize = 8;
+/// A file between these watched fractions resumes where it stopped; from `FINISHED_AT` on it
+/// counts as finished.
+const RESUME_FROM: f64 = 0.02;
+const FINISHED_AT: f64 = 0.95;
+/// Items in each of Home's "Continue Watching" and "Listen Again".
+const HOME_RECENT: usize = 8;
+const STATE_FILE: &str = "state.txt";
+const STATE_HEADER: &str = "# myvlc library state v1";
+const M3U_HEADER: &str = "#EXTM3U";
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Section {
+    Home,
+    Videos,
+    Music,
+    Network,
+    Playlists,
+    Recent,
+}
+
+impl Section {
+    pub fn label(self) -> &'static str {
+        match self {
+            Section::Home => "Home",
+            Section::Videos => "Videos",
+            Section::Music => "Music",
+            Section::Network => "Network",
+            Section::Playlists => "Playlists",
+            Section::Recent => "Recent",
+        }
+    }
+
+    /// The page the sidebar item opens.
+    pub fn place(self) -> Place {
+        match self {
+            Section::Home => Place::Home,
+            Section::Videos => Place::Videos,
+            Section::Music => Place::Music,
+            Section::Network => Place::Network,
+            Section::Playlists => Place::Playlists,
+            Section::Recent => Place::Recent,
+        }
+    }
+}
+
+#[derive(Clone, PartialEq, Debug)]
+pub enum Place {
+    Home,
+    Videos,
+    Music,
+    Network,
+    Playlists,
+    Recent,
+    /// A folder under a Videos or Music root.
+    Folder(Section, PathBuf),
+    Songs,
+    Albums,
+    Album(String),
+    Artists,
+    Artist(String),
+    Genres,
+    Genre(String),
+    Playlist(String),
+}
+
+impl Place {
+    pub fn section(&self) -> Section {
+        match self {
+            Place::Home => Section::Home,
+            Place::Videos => Section::Videos,
+            Place::Music
+            | Place::Songs
+            | Place::Albums
+            | Place::Album(_)
+            | Place::Artists
+            | Place::Artist(_)
+            | Place::Genres
+            | Place::Genre(_) => Section::Music,
+            Place::Network => Section::Network,
+            Place::Playlists | Place::Playlist(_) => Section::Playlists,
+            Place::Recent => Section::Recent,
+            Place::Folder(section, _) => *section,
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum MediaKind {
+    Video,
+    Audio,
+}
+
+#[derive(Clone, PartialEq, Debug)]
+pub enum Action {
+    AddFolder(Section),
+    CreatePlaylist,
+    AddNetworkStream,
+    Podcasts,
+    Radio,
+}
+
+#[derive(Clone, PartialEq, Debug)]
+pub enum Entry {
+    /// Home-page section title; `more` is where its ">" chevron leads.
+    Header {
+        label: String,
+        more: Option<Place>,
+    },
+    Folder {
+        label: String,
+        place: Place,
+    },
+    Media {
+        label: String,
+        path: PathBuf,
+        kind: MediaKind,
+        subtitle: Option<String>,
+        /// Watched fraction, 0..1, when the file has been played.
+        progress: Option<f32>,
+        /// Watched 95% or more.
+        finished: bool,
+    },
+    Action {
+        label: String,
+        action: Action,
+    },
+}
+
+impl Entry {
+    pub fn label(&self) -> &str {
+        match self {
+            Entry::Header { label, .. }
+            | Entry::Folder { label, .. }
+            | Entry::Media { label, .. }
+            | Entry::Action { label, .. } => label,
+        }
+    }
+}
+
+#[derive(Clone, PartialEq, Debug)]
+pub struct Crumb {
+    pub label: String,
+    pub place: Place,
+}
+
+/// Tag info for one audio track, filled in by a scanner elsewhere.
+#[derive(Clone, PartialEq, Debug, Default)]
+pub struct Track {
+    pub path: PathBuf,
+    pub title: Option<String>,
+    pub artist: Option<String>,
+    pub album: Option<String>,
+    pub genre: Option<String>,
+    pub duration: f64,
+}
+
+/// A recently played file and where it stopped, in seconds.
+#[derive(Clone, PartialEq, Debug)]
+struct Recent {
+    path: PathBuf,
+    position: f64,
+    duration: f64,
+}
+
+impl Recent {
+    fn fraction(&self) -> Option<f64> {
+        (self.duration > 0.0).then(|| (self.position / self.duration).clamp(0.0, 1.0))
+    }
+}
+
+pub struct Library {
+    dir: PathBuf,
+    video_roots: Vec<PathBuf>,
+    music_roots: Vec<PathBuf>,
+    /// Most recent first.
+    recent: Vec<Recent>,
+    visits: HashMap<PathBuf, u32>,
+    plays: HashMap<PathBuf, u32>,
+    playlist_plays: HashMap<String, u32>,
+    /// The music index from the last scan, in path order, and a path lookup into it.
+    // ponytail: in memory only, so Albums/Artists/Genres stay empty until the first scan of each
+    // run finishes; save it next to state.txt if that wait shows.
+    tracks: Vec<Track>,
+    track_at: HashMap<PathBuf, usize>,
+}
+
+impl Library {
+    /// %APPDATA%\myvlc, or the MYVLC_HOME environment variable when set (tests and dev runs use it).
+    pub fn default_dir() -> PathBuf {
+        match env::var_os("MYVLC_HOME") {
+            Some(home) if !home.is_empty() => PathBuf::from(home),
+            _ => PathBuf::from(env::var_os("APPDATA").unwrap_or_default()).join("myvlc"),
+        }
+    }
+
+    /// Loads state from `dir` (missing files mean empty state). On first run (no state file),
+    /// seeds Videos and Music with the user's Videos and Music folders, unless MYVLC_HOME is set.
+    pub fn load(dir: &Path) -> Library {
+        Self::open(dir, env::var_os("MYVLC_HOME").is_none())
+    }
+
+    fn open(dir: &Path, seed: bool) -> Library {
+        let mut lib = Library {
+            dir: dir.to_path_buf(),
+            video_roots: Vec::new(),
+            music_roots: Vec::new(),
+            recent: Vec::new(),
+            visits: HashMap::new(),
+            plays: HashMap::new(),
+            playlist_plays: HashMap::new(),
+            tracks: Vec::new(),
+            track_at: HashMap::new(),
+        };
+        match fs::read(dir.join(STATE_FILE)) {
+            Ok(bytes) => lib.parse(&String::from_utf8_lossy(&bytes)),
+            Err(e) if seed && e.kind() == ErrorKind::NotFound => lib.seed_roots(),
+            Err(_) => {}
+        }
+        lib
+    }
+
+    fn seed_roots(&mut self) {
+        // ponytail: misses Videos and Music folders redirected to OneDrive or another drive;
+        // SHGetKnownFolderPath(FOLDERID_Videos / FOLDERID_Music) finds those.
+        let Some(home) = env::var_os("USERPROFILE").map(PathBuf::from) else {
+            return;
+        };
+        for (section, name) in [(Section::Videos, "Videos"), (Section::Music, "Music")] {
+            let dir = home.join(name);
+            if dir.is_dir() {
+                self.add_root(section, dir);
+            }
+        }
+    }
+
+    /// Reads state.txt: one record per line, tab-separated, with the record type first.
+    /// Unknown, malformed and comment lines are skipped.
+    fn parse(&mut self, text: &str) {
+        let count = |n: &str| n.parse::<u32>().ok();
+        let seconds = |s: &str| s.parse::<f64>().ok().filter(|s| s.is_finite() && *s >= 0.0);
+        for line in text.lines() {
+            let fields: Vec<&str> = line.split('\t').collect();
+            match fields[..] {
+                ["root", "videos", p] if !p.is_empty() => self.add_root(Section::Videos, p.into()),
+                ["root", "music", p] if !p.is_empty() => self.add_root(Section::Music, p.into()),
+                ["recent", p, pos, dur] if !p.is_empty() => {
+                    let (Some(position), Some(duration)) = (seconds(pos), seconds(dur)) else {
+                        continue;
+                    };
+                    let path = PathBuf::from(p);
+                    if self.recent.len() < MAX_RECENT && !self.recent.iter().any(|r| r.path == path)
+                    {
+                        self.recent.push(Recent {
+                            path,
+                            position,
+                            duration,
+                        });
+                    }
+                }
+                ["visit", p, n] if !p.is_empty() => {
+                    if let Some(n) = count(n) {
+                        self.visits.insert(p.into(), n);
+                    }
+                }
+                ["plays", p, n] if !p.is_empty() => {
+                    if let Some(n) = count(n) {
+                        self.plays.insert(p.into(), n);
+                    }
+                }
+                ["playlist", name, n] if check_name(name).is_ok() => {
+                    if let Some(n) = count(n) {
+                        self.playlist_plays.insert(name.into(), n);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Writes state.txt through a temporary file, so a crash mid-write keeps the old state.
+    /// Paths that are not valid Unicode are left out.
+    pub fn save(&self) -> io::Result<()> {
+        let mut out = format!("{STATE_HEADER}\n");
+        for (kind, roots) in [("videos", &self.video_roots), ("music", &self.music_roots)] {
+            for p in roots.iter().filter_map(|p| p.to_str()) {
+                writeln!(out, "root\t{kind}\t{p}").unwrap();
+            }
+        }
+        for r in &self.recent {
+            if let Some(p) = r.path.to_str() {
+                writeln!(out, "recent\t{p}\t{}\t{}", r.position, r.duration).unwrap();
+            }
+        }
+        for (kind, counts) in [("visit", &self.visits), ("plays", &self.plays)] {
+            for (p, n) in counts {
+                if let Some(p) = p.to_str() {
+                    writeln!(out, "{kind}\t{p}\t{n}").unwrap();
+                }
+            }
+        }
+        for (name, n) in &self.playlist_plays {
+            writeln!(out, "playlist\t{name}\t{n}").unwrap();
+        }
+        fs::create_dir_all(&self.dir)?;
+        let tmp = self.dir.join("state.txt.tmp");
+        fs::write(&tmp, out)?;
+        fs::rename(tmp, self.dir.join(STATE_FILE))
+    }
+
+    fn root_list(&self, section: Section) -> &[PathBuf] {
+        match section {
+            Section::Videos => &self.video_roots,
+            Section::Music => &self.music_roots,
+            _ => &[],
+        }
+    }
+
+    #[cfg(test)]
+    pub fn roots(&self, section: Section) -> Vec<PathBuf> {
+        self.root_list(section).to_vec()
+    }
+
+    /// Adds a Videos or Music root; other sections and duplicates are ignored.
+    pub fn add_root(&mut self, section: Section, path: PathBuf) {
+        let path = abs(&path);
+        let roots = match section {
+            Section::Videos => &mut self.video_roots,
+            Section::Music => &mut self.music_roots,
+            _ => return,
+        };
+        if !roots.contains(&path) {
+            roots.push(path);
+        }
+    }
+
+    /// What a page shows, in display order.
+    pub fn entries(&self, place: &Place) -> Vec<Entry> {
+        let mut entries = self.raw_entries(place);
+        let watched: HashMap<&Path, f64> = self
+            .recent
+            .iter()
+            .filter_map(|r| Some((r.path.as_path(), r.fraction()?)))
+            .collect();
+        for entry in &mut entries {
+            if let Entry::Media {
+                path,
+                progress,
+                finished,
+                ..
+            } = entry
+                && let Some(&f) = watched.get(path.as_path())
+            {
+                *progress = Some(f as f32);
+                *finished = f >= FINISHED_AT;
+            }
+        }
+        entries
+    }
+
+    /// Entries without watch progress, which [`Library::entries`] fills in.
+    fn raw_entries(&self, place: &Place) -> Vec<Entry> {
+        match place {
+            Place::Home => self.home(),
+            Place::Videos | Place::Music => {
+                let section = place.section();
+                let mut out = vec![action("Add", Action::AddFolder(section))];
+                for root in self.root_list(section) {
+                    out.push(folder(&name_of(root), Place::Folder(section, root.clone())));
+                }
+                if section == Section::Music {
+                    for (label, view) in music_views() {
+                        out.push(folder(label, view));
+                    }
+                }
+                out
+            }
+            Place::Network => vec![
+                action("Add Network Stream", Action::AddNetworkStream),
+                action("Podcasts", Action::Podcasts),
+                action("Radio", Action::Radio),
+            ],
+            Place::Playlists => {
+                let mut out = vec![action("Create playlist", Action::CreatePlaylist)];
+                for name in self.playlists() {
+                    out.push(folder(&name, Place::Playlist(name.clone())));
+                }
+                out
+            }
+            Place::Recent => self
+                .recent
+                .iter()
+                .map(|r| self.file_media(&r.path))
+                .collect(),
+            Place::Folder(section, dir) => {
+                let (dirs, files) = list_dir(dir);
+                let dirs = dirs
+                    .into_iter()
+                    .filter(|(_, d)| has_media(d, MEDIA_SEARCH_DEPTH))
+                    .map(|(name, d)| folder(&name, Place::Folder(*section, d)));
+                let files = files
+                    .iter()
+                    .filter(|(_, p)| media_kind(p).is_some())
+                    .map(|(_, p)| self.file_media(p));
+                dirs.chain(files).collect()
+            }
+            Place::Songs => {
+                let mut out: Vec<Entry> = if self.tracks.is_empty() {
+                    let files = self.music_files();
+                    files.iter().map(|p| media(p, stem_of(p), None)).collect()
+                } else {
+                    self.tracks.iter().map(track_media).collect()
+                };
+                out.sort_by(|a, b| natural_cmp(a.label(), b.label()));
+                out
+            }
+            Place::Albums | Place::Artists | Place::Genres => {
+                let mut values: Vec<&str> =
+                    self.tracks.iter().filter_map(|t| tag(t, place)).collect();
+                values.sort_by(|a, b| natural_cmp(a, b));
+                values.dedup();
+                values
+                    .into_iter()
+                    .map(|v| {
+                        let child = match place {
+                            Place::Albums => Place::Album(v.into()),
+                            Place::Artists => Place::Artist(v.into()),
+                            _ => Place::Genre(v.into()),
+                        };
+                        folder(v, child)
+                    })
+                    .collect()
+            }
+            Place::Album(value) | Place::Artist(value) | Place::Genre(value) => self
+                .tracks
+                .iter()
+                .filter(|t| tag(t, place) == Some(value.as_str()))
+                .map(track_media)
+                .collect(),
+            Place::Playlist(name) => {
+                let items = self.playlist_items(name);
+                items.iter().map(|p| self.file_media(p)).collect()
+            }
+        }
+    }
+
+    fn home(&self) -> Vec<Entry> {
+        let mut out = Vec::new();
+        let mut section = |label: &str, more: Place, entries: Vec<Entry>| {
+            if !entries.is_empty() {
+                out.push(Entry::Header {
+                    label: label.into(),
+                    more: Some(more),
+                });
+                out.extend(entries);
+            }
+        };
+        let of_kind = |kind| {
+            let recent = self.recent.iter();
+            recent.filter(move |r| media_kind(&r.path) == Some(kind))
+        };
+
+        let watching = of_kind(MediaKind::Video)
+            .filter(|r| {
+                r.fraction()
+                    .is_some_and(|f| (RESUME_FROM..FINISHED_AT).contains(&f))
+            })
+            .take(HOME_RECENT)
+            .map(|r| self.file_media(&r.path))
+            .collect();
+        section("Continue Watching", Place::Recent, watching);
+
+        let listened = of_kind(MediaKind::Audio)
+            .take(HOME_RECENT)
+            .map(|r| match self.track(&r.path) {
+                Some(t) => track_media(t),
+                None => media(&r.path, stem_of(&r.path), None),
+            })
+            .collect();
+        section("Listen Again", Place::Recent, listened);
+
+        let folders = top(self.visits.iter().map(|(p, n)| (p, *n)))
+            .into_iter()
+            .filter_map(|p| {
+                let section = self.section_of(p)?;
+                p.is_dir()
+                    .then(|| folder(&name_of(p), Place::Folder(section, p.clone())))
+            })
+            .take(4)
+            .collect();
+        section("Frequently Visited Folders", Place::Videos, folders);
+
+        let names = self.playlists();
+        let counts = names
+            .iter()
+            .filter_map(|n| Some((n, *self.playlist_plays.get(n)?)));
+        let playlists = top(counts)
+            .into_iter()
+            .take(3)
+            .map(|n| folder(n, Place::Playlist(n.clone())))
+            .collect();
+        section("Frequently Visited Playlists", Place::Playlists, playlists);
+
+        let mut by_artist: HashMap<&str, u32> = HashMap::new();
+        for (path, n) in &self.plays {
+            if let Some(artist) = self.track(path).and_then(|t| t.artist.as_deref()) {
+                *by_artist.entry(artist).or_default() += n;
+            }
+        }
+        let artists = top(by_artist)
+            .into_iter()
+            .take(4)
+            .map(|a| folder(a, Place::Artist(a.into())))
+            .collect();
+        section("Frequently Listened Artists", Place::Artists, artists);
+
+        out
+    }
+
+    /// The breadcrumb trail to `place`, starting with its section.
+    pub fn crumbs(&self, place: &Place) -> Vec<Crumb> {
+        let section = place.section();
+        let mut out = vec![crumb(section.label(), section.place())];
+        match place {
+            Place::Folder(section, path) => {
+                let root = self
+                    .root_list(*section)
+                    .iter()
+                    .filter(|r| path.starts_with(r))
+                    .max_by_key(|r| r.components().count());
+                let Some(root) = root else {
+                    out.push(crumb(&name_of(path), place.clone()));
+                    return out;
+                };
+                let mut at = root.clone();
+                out.push(crumb(&name_of(root), Place::Folder(*section, at.clone())));
+                for part in path.strip_prefix(root).unwrap_or(Path::new("")) {
+                    at.push(part);
+                    out.push(crumb(
+                        &part.to_string_lossy(),
+                        Place::Folder(*section, at.clone()),
+                    ));
+                }
+            }
+            Place::Songs | Place::Albums | Place::Artists | Place::Genres => {
+                out.extend(
+                    music_views()
+                        .into_iter()
+                        .filter(|(_, v)| v == place)
+                        .map(|(l, v)| crumb(l, v)),
+                );
+            }
+            Place::Album(x) | Place::Artist(x) | Place::Genre(x) => {
+                let (label, view) = match place {
+                    Place::Album(_) => ("Albums", Place::Albums),
+                    Place::Artist(_) => ("Artists", Place::Artists),
+                    _ => ("Genres", Place::Genres),
+                };
+                out.push(crumb(label, view));
+                out.push(crumb(x, place.clone()));
+            }
+            Place::Playlist(name) => out.push(crumb(name, place.clone())),
+            _ => {}
+        }
+        out
+    }
+
+    /// The playable files of a place in display order (the play queue for next and previous).
+    pub fn media_in(&self, place: &Place) -> Vec<PathBuf> {
+        let entries = self.raw_entries(place).into_iter();
+        entries
+            .filter_map(|e| match e {
+                Entry::Media { path, .. } => Some(path),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Moves `path` to the top of the recent list with its position, both in seconds.
+    /// A play counts when a file becomes the most recent one, so calling this every few seconds
+    /// during one playback counts once.
+    pub fn record_position(&mut self, path: &Path, position: f64, duration: f64) {
+        let path = abs(path);
+        let finite = |s: f64| if s.is_finite() { s.max(0.0) } else { 0.0 };
+        if self.recent.first().is_none_or(|r| r.path != path) {
+            *self.plays.entry(path.clone()).or_default() += 1;
+        }
+        self.recent.retain(|r| r.path != path);
+        let (position, duration) = (finite(position), finite(duration));
+        self.recent.insert(
+            0,
+            Recent {
+                path,
+                position,
+                duration,
+            },
+        );
+        self.recent.truncate(MAX_RECENT);
+    }
+
+    /// Where to resume `path`: only when 2% to 95% of it has been watched.
+    pub fn resume_position(&self, path: &Path) -> Option<f64> {
+        let path = abs(path);
+        let r = self.recent.iter().find(|r| r.path == path)?;
+        let f = r.fraction()?;
+        (RESUME_FROM..FINISHED_AT)
+            .contains(&f)
+            .then_some(r.position)
+    }
+
+    pub fn visit_folder(&mut self, path: &Path) {
+        *self.visits.entry(abs(path)).or_default() += 1;
+    }
+
+    fn playlist_dir(&self) -> PathBuf {
+        self.dir.join("playlists")
+    }
+
+    fn playlist_file(&self, name: &str) -> io::Result<PathBuf> {
+        check_name(name)?;
+        Ok(self.playlist_dir().join(format!("{name}.m3u")))
+    }
+
+    /// Playlist names, sorted.
+    pub fn playlists(&self) -> Vec<String> {
+        let entries = fs::read_dir(self.playlist_dir())
+            .into_iter()
+            .flatten()
+            .flatten();
+        let mut names: Vec<String> = entries
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|x| x.eq_ignore_ascii_case("m3u")))
+            .map(|p| stem_of(&p))
+            .collect();
+        names.sort_by(|a, b| natural_cmp(a, b));
+        names
+    }
+
+    /// Creates an empty playlist; fails if the name is invalid or taken.
+    pub fn create_playlist(&mut self, name: &str) -> io::Result<()> {
+        let file = self.playlist_file(name)?;
+        fs::create_dir_all(self.playlist_dir())?;
+        let mut f = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(file)?;
+        io::Write::write_all(&mut f, format!("{M3U_HEADER}\n").as_bytes())
+    }
+
+    /// Appends `path` to a playlist, creating the playlist if needed.
+    pub fn add_to_playlist(&mut self, name: &str, path: &Path) -> io::Result<()> {
+        let file = self.playlist_file(name)?;
+        let path = abs(path);
+        let line = path
+            .to_str()
+            .ok_or_else(|| io::Error::new(ErrorKind::InvalidInput, "path is not valid Unicode"))?;
+        let mut text = match fs::read_to_string(&file) {
+            Ok(text) => text,
+            Err(e) if e.kind() == ErrorKind::NotFound => String::new(),
+            Err(e) => return Err(e),
+        };
+        if text.is_empty() {
+            text = format!("{M3U_HEADER}\n");
+        } else if !text.ends_with('\n') {
+            text.push('\n');
+        }
+        writeln!(text, "{line}").unwrap();
+        fs::create_dir_all(self.playlist_dir())?;
+        fs::write(file, text)
+    }
+
+    /// The files of a playlist in order. Relative lines resolve against the playlists folder.
+    // ponytail: URL and file:// lines come out as bogus paths; parse them when network streams land.
+    pub fn playlist_items(&self, name: &str) -> Vec<PathBuf> {
+        let Ok(file) = self.playlist_file(name) else {
+            return Vec::new();
+        };
+        let Ok(bytes) = fs::read(file) else {
+            return Vec::new();
+        };
+        let dir = self.playlist_dir();
+        String::from_utf8_lossy(&bytes)
+            .lines()
+            .map(|l| l.trim_start_matches('\u{feff}').trim())
+            .filter(|l| !l.is_empty() && !l.starts_with('#'))
+            .map(|l| dir.join(l))
+            .collect()
+    }
+
+    pub fn record_playlist_play(&mut self, name: &str) {
+        if check_name(name).is_ok() {
+            *self.playlist_plays.entry(name.into()).or_default() += 1;
+        }
+    }
+
+    /// Replaces the music index with the result of a scan. Blank tags count as missing.
+    pub fn set_tracks(&mut self, mut tracks: Vec<Track>) {
+        for t in &mut tracks {
+            for tag in [&mut t.title, &mut t.artist, &mut t.album, &mut t.genre] {
+                *tag = tag
+                    .take()
+                    .map(|s| s.trim().to_owned())
+                    .filter(|s| !s.is_empty());
+            }
+        }
+        tracks.sort_by(|a, b| natural_cmp(&a.path.to_string_lossy(), &b.path.to_string_lossy()));
+        self.track_at = tracks
+            .iter()
+            .enumerate()
+            .map(|(i, t)| (t.path.clone(), i))
+            .collect();
+        self.tracks = tracks;
+    }
+
+    /// Every audio file under the Music roots, for the scanner to probe.
+    pub fn music_files(&self) -> Vec<PathBuf> {
+        let mut seen = HashSet::new();
+        let mut out = Vec::new();
+        for root in &self.music_roots {
+            walk(root, MUSIC_SCAN_DEPTH, &mut |p| {
+                if media_kind(&p) == Some(MediaKind::Audio) && seen.insert(p.clone()) {
+                    out.push(p);
+                }
+            });
+        }
+        out
+    }
+
+    fn track(&self, path: &Path) -> Option<&Track> {
+        self.track_at.get(path).map(|&i| &self.tracks[i])
+    }
+
+    /// A file shown by name, with its artist when the music index knows it.
+    fn file_media(&self, path: &Path) -> Entry {
+        let artist = self.track(path).and_then(|t| t.artist.clone());
+        media(path, name_of(path), artist)
+    }
+
+    /// The root section a folder belongs to.
+    fn section_of(&self, path: &Path) -> Option<Section> {
+        [Section::Videos, Section::Music]
+            .into_iter()
+            .find(|&s| self.root_list(s).iter().any(|r| path.starts_with(r)))
+    }
+}
+
+/// Video or audio, by extension, ignoring case.
+pub fn media_kind(path: &Path) -> Option<MediaKind> {
+    let ext = path.extension()?.to_str()?.to_ascii_lowercase();
+    if VIDEO_EXTS.contains(&ext.as_str()) {
+        Some(MediaKind::Video)
+    } else if AUDIO_EXTS.contains(&ext.as_str()) {
+        Some(MediaKind::Audio)
+    } else {
+        None
+    }
+}
+
+fn music_views() -> [(&'static str, Place); 4] {
+    [
+        ("Songs", Place::Songs),
+        ("Albums", Place::Albums),
+        ("Artists", Place::Artists),
+        ("Genres", Place::Genres),
+    ]
+}
+
+/// The tag a music view groups by.
+fn tag<'a>(t: &'a Track, view: &Place) -> Option<&'a str> {
+    match view {
+        Place::Albums | Place::Album(_) => t.album.as_deref(),
+        Place::Artists | Place::Artist(_) => t.artist.as_deref(),
+        Place::Genres | Place::Genre(_) => t.genre.as_deref(),
+        _ => None,
+    }
+}
+
+fn folder(label: &str, place: Place) -> Entry {
+    Entry::Folder {
+        label: label.into(),
+        place,
+    }
+}
+
+fn action(label: &str, action: Action) -> Entry {
+    Entry::Action {
+        label: label.into(),
+        action,
+    }
+}
+
+fn crumb(label: &str, place: Place) -> Crumb {
+    Crumb {
+        label: label.into(),
+        place,
+    }
+}
+
+fn media(path: &Path, label: String, subtitle: Option<String>) -> Entry {
+    Entry::Media {
+        label,
+        path: path.to_path_buf(),
+        kind: media_kind(path).unwrap_or(MediaKind::Video),
+        subtitle,
+        progress: None,
+        finished: false,
+    }
+}
+
+fn track_media(t: &Track) -> Entry {
+    let title = t.title.clone().unwrap_or_else(|| stem_of(&t.path));
+    media(&t.path, title, t.artist.clone())
+}
+
+/// The file or folder name, or the whole path for a drive root like `D:\`.
+fn name_of(path: &Path) -> String {
+    path.file_name().map_or_else(
+        || path.display().to_string(),
+        |n| n.to_string_lossy().into_owned(),
+    )
+}
+
+fn stem_of(path: &Path) -> String {
+    path.file_stem()
+        .map_or_else(|| name_of(path), |n| n.to_string_lossy().into_owned())
+}
+
+/// Absolute form of `path`, so lookups match however the file was opened.
+fn abs(path: &Path) -> PathBuf {
+    std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+/// Keys with a nonzero count, highest count first, ties in key order.
+fn top<K: Ord>(counts: impl IntoIterator<Item = (K, u32)>) -> Vec<K> {
+    let mut v: Vec<(K, u32)> = counts.into_iter().filter(|c| c.1 > 0).collect();
+    v.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    v.into_iter().map(|c| c.0).collect()
+}
+
+/// Rejects names that can't be a file name on Windows.
+fn check_name(name: &str) -> io::Result<()> {
+    let device = name.split('.').next().unwrap_or("").to_ascii_uppercase();
+    let reserved = matches!(device.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || (device.len() == 4
+            && (device.starts_with("COM") || device.starts_with("LPT"))
+            && device.ends_with(|c: char| c.is_ascii_digit()));
+    let bad = name.trim().is_empty()
+        || name.ends_with(['.', ' '])
+        || name
+            .chars()
+            .any(|c| c.is_control() || r#"<>:"/\|?*"#.contains(c))
+        || reserved;
+    if bad {
+        Err(io::Error::new(
+            ErrorKind::InvalidInput,
+            format!("invalid playlist name {name:?}"),
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+type Named = Vec<(String, PathBuf)>;
+
+/// The visible subfolders and files of `dir`, each sorted by name in natural order.
+fn list_dir(dir: &Path) -> (Named, Named) {
+    const FILE_ATTRIBUTE_HIDDEN: u32 = 0x2;
+    let (mut dirs, mut files) = (Vec::new(), Vec::new());
+    for entry in fs::read_dir(dir).into_iter().flatten().flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        // The hidden attribute also covers $RECYCLE.BIN and System Volume Information on drive roots.
+        let hidden = entry
+            .metadata()
+            .is_ok_and(|m| m.file_attributes() & FILE_ATTRIBUTE_HIDDEN != 0);
+        if hidden || name.starts_with('.') {
+            continue;
+        }
+        let path = entry.path();
+        // Follow symlinks and junctions to folders; the depth caps keep loops finite.
+        let is_dir = entry
+            .file_type()
+            .is_ok_and(|t| t.is_dir() || t.is_symlink() && path.is_dir());
+        if is_dir {
+            dirs.push((name, path))
+        } else {
+            files.push((name, path))
+        }
+    }
+    dirs.sort_by(|a, b| natural_cmp(&a.0, &b.0));
+    files.sort_by(|a, b| natural_cmp(&a.0, &b.0));
+    (dirs, files)
+}
+
+/// Whether `dir` or its subfolders, `depth` levels in all, hold any media file.
+fn has_media(dir: &Path, depth: usize) -> bool {
+    let (dirs, files) = list_dir(dir);
+    files.iter().any(|(_, p)| media_kind(p).is_some())
+        || depth > 1 && dirs.iter().any(|(_, d)| has_media(d, depth - 1))
+}
+
+/// Calls `found` for every visible file in `dir` and up to `depth` levels below it.
+fn walk(dir: &Path, depth: usize, found: &mut impl FnMut(PathBuf)) {
+    let (dirs, files) = list_dir(dir);
+    for (_, p) in files {
+        found(p);
+    }
+    if depth > 0 {
+        for (_, d) in dirs {
+            walk(&d, depth - 1, found);
+        }
+    }
+}
+
+/// Case-insensitive order with digit runs compared as numbers, so "E2" sorts before "E10".
+fn natural_cmp(a: &str, b: &str) -> Ordering {
+    let (mut x, mut y) = (a.chars().peekable(), b.chars().peekable());
+    let digits = |it: &mut std::iter::Peekable<std::str::Chars>| {
+        let mut s = String::new();
+        while let Some(c) = it.next_if(char::is_ascii_digit) {
+            s.push(c);
+        }
+        s
+    };
+    loop {
+        let ord = match (x.peek().copied(), y.peek().copied()) {
+            (None, None) => break,
+            (None, Some(_)) => Ordering::Less,
+            (Some(_), None) => Ordering::Greater,
+            (Some(c), Some(d)) if c.is_ascii_digit() && d.is_ascii_digit() => {
+                let (m, n) = (digits(&mut x), digits(&mut y));
+                let (m, n) = (m.trim_start_matches('0'), n.trim_start_matches('0'));
+                m.len().cmp(&n.len()).then_with(|| m.cmp(n))
+            }
+            (Some(c), Some(d)) => {
+                x.next();
+                y.next();
+                c.to_lowercase().cmp(d.to_lowercase())
+            }
+        };
+        if ord != Ordering::Equal {
+            return ord;
+        }
+    }
+    // Equal apart from case or leading zeros: fall back to a plain compare so the order is stable.
+    a.cmp(b)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+
+    /// A fresh folder under the system temp folder, removed on drop.
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new() -> TempDir {
+            static NEXT: AtomicUsize = AtomicUsize::new(0);
+            let n = NEXT.fetch_add(1, Relaxed);
+            let dir = env::temp_dir().join(format!("myvlc-lib-test-{}-{n}", std::process::id()));
+            let _ = fs::remove_dir_all(&dir);
+            fs::create_dir_all(&dir).unwrap();
+            TempDir(dir)
+        }
+
+        /// Creates an empty file and its parent folders.
+        fn touch(&self, rel: &str) -> PathBuf {
+            let path = self.0.join(rel);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, b"").unwrap();
+            path
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// The entries' labels joined by "|", which keeps the expected lists on one line.
+    fn labels(entries: &[Entry]) -> String {
+        entries
+            .iter()
+            .map(Entry::label)
+            .collect::<Vec<_>>()
+            .join("|")
+    }
+
+    #[test]
+    fn natural_order() {
+        let mut v = vec!["E10", "e2", "E1", "Season 10", "season 9", "a", "B", "E02"];
+        v.sort_by(|a, b| natural_cmp(a, b));
+        assert_eq!(
+            v,
+            ["a", "B", "E1", "E02", "e2", "E10", "season 9", "Season 10"]
+        );
+    }
+
+    #[test]
+    fn kinds_by_extension() {
+        assert_eq!(media_kind(Path::new(r"C:\a\b.MKV")), Some(MediaKind::Video));
+        assert_eq!(media_kind(Path::new("song.Flac")), Some(MediaKind::Audio));
+        assert_eq!(media_kind(Path::new("notes.txt")), None);
+        assert_eq!(media_kind(Path::new("noext")), None);
+    }
+
+    #[test]
+    fn folder_entries_sorted_and_empty_folders_skipped() {
+        let tmp = TempDir::new();
+        let shows = tmp.0.join("Shows");
+        for f in [
+            "Shows/E10.mp4",
+            "Shows/E2.mp4",
+            "Shows/e1.mkv",
+            "Shows/readme.txt",
+            "Shows/.secret.mp4",
+            "Shows/Season 10/a.mp4",
+            "Shows/Season 2/a.mp4",
+            "Shows/season 1/a.mp4",
+            "Shows/Empty/notes.txt",
+            "Shows/.hidden/x.mp4",
+            "Shows/Deep/a/b/c/d.mp3",
+            "Shows/TooDeep/a/b/c/d/e.mp3",
+        ] {
+            tmp.touch(f);
+        }
+        let mut lib = Library::open(&tmp.0.join("state"), false);
+        lib.add_root(Section::Videos, shows.clone());
+
+        let place = Place::Folder(Section::Videos, shows.clone());
+        let entries = lib.entries(&place);
+        assert_eq!(
+            labels(&entries),
+            "Deep|season 1|Season 2|Season 10|e1.mkv|E2.mp4|E10.mp4"
+        );
+        assert_eq!(
+            entries[1],
+            folder(
+                "season 1",
+                Place::Folder(Section::Videos, shows.join("season 1"))
+            )
+        );
+        assert_eq!(
+            lib.media_in(&place),
+            ["e1.mkv", "E2.mp4", "E10.mp4"].map(|f| shows.join(f))
+        );
+
+        let page = lib.entries(&Place::Videos);
+        assert_eq!(page[0], action("Add", Action::AddFolder(Section::Videos)));
+        assert_eq!(page[1], folder("Shows", place));
+    }
+
+    #[test]
+    fn crumbs_for_nested_folder() {
+        let tmp = TempDir::new();
+        let mut lib = Library::open(&tmp.0, false);
+        let root = PathBuf::from(r"C:\v\Shows");
+        lib.add_root(Section::Videos, root.clone());
+        let at = |p: &str| Place::Folder(Section::Videos, root.join(p));
+
+        let crumbs = lib.crumbs(&at(r"The Wand\S01"));
+        let expected = [
+            crumb("Videos", Place::Videos),
+            crumb("Shows", at("")),
+            crumb("The Wand", at("The Wand")),
+            crumb("S01", at(r"The Wand\S01")),
+        ];
+        assert_eq!(crumbs, expected);
+        assert_eq!(lib.crumbs(&Place::Home), [crumb("Home", Place::Home)]);
+        let album = Place::Album("Arrival".into());
+        assert_eq!(
+            lib.crumbs(&album),
+            [
+                crumb("Music", Place::Music),
+                crumb("Albums", Place::Albums),
+                crumb("Arrival", album.clone())
+            ]
+        );
+    }
+
+    #[test]
+    fn state_roundtrip() {
+        let tmp = TempDir::new();
+        let videos = PathBuf::from(r"D:\Mÿ Vídeos\ドラマ");
+        let film = PathBuf::from(r"D:\Mÿ Vídeos\a film.mkv");
+        let song = PathBuf::from(r"E:\Music\b song.mp3");
+        let mut a = Library::open(&tmp.0, false);
+        a.add_root(Section::Videos, videos.clone());
+        a.add_root(Section::Videos, videos.clone());
+        a.add_root(Section::Music, PathBuf::from(r"E:\Music"));
+        a.record_position(&film, 600.5, 5400.25);
+        a.record_position(&song, 30.0, 200.0);
+        a.visit_folder(&videos);
+        a.visit_folder(&videos);
+        a.record_playlist_play("Road Trip");
+        a.save().unwrap();
+
+        // Damage the file the way a crash or a hand edit might.
+        let state = tmp.0.join(STATE_FILE);
+        let mut text = fs::read_to_string(&state).unwrap();
+        text.push_str("recent\tonly a path\nvisit\tC:\\x\tmany\n\t\t\nbogus\nroot\tvideos\t\n");
+        fs::write(&state, text).unwrap();
+
+        let b = Library::open(&tmp.0, false);
+        assert_eq!(b.roots(Section::Videos), [videos]);
+        assert_eq!(b.roots(Section::Music), [PathBuf::from(r"E:\Music")]);
+        assert_eq!(b.recent, a.recent);
+        assert_eq!(b.media_in(&Place::Recent), [song.clone(), film.clone()]);
+        assert_eq!(b.resume_position(&film), Some(600.5));
+        assert_eq!(b.resume_position(&song), Some(30.0));
+        assert_eq!(b.visits, a.visits);
+        assert_eq!(b.plays, a.plays);
+        assert_eq!(b.playlist_plays, a.playlist_plays);
+    }
+
+    #[test]
+    fn resume_only_between_2_and_95_percent() {
+        let tmp = TempDir::new();
+        let mut lib = Library::open(&tmp.0, false);
+        let f = Path::new(r"C:\v\a.mp4");
+        lib.record_position(f, 1.0, 100.0);
+        assert_eq!(lib.resume_position(f), None);
+        lib.record_position(f, 50.0, 100.0);
+        assert_eq!(lib.resume_position(f), Some(50.0));
+        lib.record_position(f, 96.0, 100.0);
+        assert_eq!(lib.resume_position(f), None);
+        assert_eq!(
+            lib.plays[f], 1,
+            "repeated updates of one playback count once"
+        );
+    }
+
+    #[test]
+    fn playlist_roundtrip_and_bad_names() {
+        let tmp = TempDir::new();
+        let mut lib = Library::open(&tmp.0, false);
+        let a = PathBuf::from(r"C:\Music\Ünïcode song.mp3");
+        let b = PathBuf::from(r"D:\v\with space.mkv");
+        lib.create_playlist("Road Trip").unwrap();
+        lib.add_to_playlist("Road Trip", &a).unwrap();
+        lib.add_to_playlist("Road Trip", &b).unwrap();
+        lib.add_to_playlist("Fresh", &b).unwrap();
+
+        assert_eq!(lib.playlists(), ["Fresh", "Road Trip"]);
+        assert_eq!(lib.playlist_items("Road Trip"), [a.clone(), b.clone()]);
+        let text = fs::read_to_string(tmp.0.join(r"playlists\Road Trip.m3u")).unwrap();
+        assert_eq!(text, format!("#EXTM3U\n{}\n{}\n", a.display(), b.display()));
+        assert_eq!(
+            lib.create_playlist("Road Trip").unwrap_err().kind(),
+            ErrorKind::AlreadyExists
+        );
+        assert_eq!(
+            labels(&lib.entries(&Place::Playlist("Road Trip".into()))),
+            "Ünïcode song.mp3|with space.mkv"
+        );
+        assert_eq!(
+            labels(&lib.entries(&Place::Playlists)),
+            "Create playlist|Fresh|Road Trip"
+        );
+
+        let bad_names = ",  ,a/b,a\\b,c:d,why?,<x>,a|b,q\",star*,dot.,CON,com3,tab\there";
+        for bad in bad_names.split(',') {
+            let err = lib.create_playlist(bad).unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::InvalidInput, "{bad:?}");
+            assert!(lib.add_to_playlist(bad, &a).is_err(), "{bad:?}");
+        }
+        assert_eq!(lib.playlists().len(), 2);
+    }
+
+    #[test]
+    fn home_sections_from_recent_data() {
+        let tmp = TempDir::new();
+        let root = tmp.0.join("Videos");
+        tmp.touch(r"Videos\Alpha\x.mp4");
+        tmp.touch(r"Videos\Beta\x.mp4");
+        let mut lib = Library::open(&tmp.0.join("state"), false);
+        lib.add_root(Section::Videos, root.clone());
+        let v = |n: &str| root.join(n);
+        let s = |n: &str| PathBuf::from(format!(r"E:\Music\{n}.mp3"));
+        let t = |n: &str, title: &str, artist: &str| Track {
+            path: s(n),
+            title: Some(title.into()),
+            artist: Some(artist.into()),
+            ..Default::default()
+        };
+        lib.set_tracks(vec![
+            t("1", "Bohemian Rhapsody", "Queen"),
+            t("2", "Dancing Queen", "ABBA"),
+        ]);
+
+        lib.record_position(&v("half.mp4"), 50.0, 100.0);
+        lib.record_position(&v("done.mp4"), 99.0, 100.0);
+        lib.record_position(&v("barely.mp4"), 1.0, 100.0);
+        lib.record_position(&s("1"), 10.0, 200.0);
+        lib.record_position(&s("2"), 10.0, 200.0);
+        lib.record_position(&s("1"), 20.0, 200.0);
+        for dir in ["Alpha", "Alpha", "Beta", "Gone"] {
+            lib.visit_folder(&root.join(dir));
+        }
+        for name in ["Mix", "Chill", "Unplayed"] {
+            lib.create_playlist(name).unwrap();
+        }
+        for name in ["Mix", "Chill", "Mix"] {
+            lib.record_playlist_play(name);
+        }
+
+        let home = lib.entries(&Place::Home);
+        assert_eq!(
+            labels(&home),
+            "Continue Watching|half.mp4|\
+             Listen Again|Bohemian Rhapsody|Dancing Queen|\
+             Frequently Visited Folders|Alpha|Beta|\
+             Frequently Visited Playlists|Mix|Chill|\
+             Frequently Listened Artists|Queen|ABBA"
+        );
+        let more: Vec<Option<Place>> = home
+            .iter()
+            .filter_map(|e| match e {
+                Entry::Header { more, .. } => Some(more.clone()),
+                _ => None,
+            })
+            .collect();
+        let expected = [
+            Place::Recent,
+            Place::Recent,
+            Place::Videos,
+            Place::Playlists,
+            Place::Artists,
+        ];
+        assert_eq!(more, expected.map(Some));
+        let Entry::Media {
+            progress, finished, ..
+        } = &home[1]
+        else {
+            panic!()
+        };
+        assert_eq!((*progress, *finished), (Some(0.5), false));
+        assert_eq!(
+            home[6],
+            folder("Alpha", Place::Folder(Section::Videos, root.join("Alpha")))
+        );
+
+        let recent = lib.entries(&Place::Recent);
+        assert_eq!(labels(&recent), "1.mp3|2.mp3|barely.mp4|done.mp4|half.mp4");
+        let Entry::Media {
+            finished, subtitle, ..
+        } = &recent[3]
+        else {
+            panic!()
+        };
+        assert!(*finished);
+        assert_eq!(*subtitle, None);
+        let Entry::Media { subtitle, .. } = &recent[0] else {
+            panic!()
+        };
+        assert_eq!(subtitle.as_deref(), Some("Queen"));
+
+        // A fresh library has nothing to show.
+        let empty = Library::open(&tmp.0.join("other"), false);
+        assert!(empty.entries(&Place::Home).is_empty());
+    }
+
+    #[test]
+    fn albums_grouped_from_tracks() {
+        let tmp = TempDir::new();
+        let mut lib = Library::open(&tmp.0, false);
+        let t = |path: &str, album: Option<&str>, genre: &str| Track {
+            path: PathBuf::from(path),
+            album: album.map(Into::into),
+            genre: Some(genre.into()),
+            ..Default::default()
+        };
+        lib.set_tracks(vec![
+            t(r"E:\M\Arrival\10 Why.mp3", Some("Arrival"), "Pop"),
+            t(r"E:\M\Arrival\2 Money.mp3", Some("Arrival "), "Pop"),
+            t(
+                r"E:\M\Opera\1 Death.mp3",
+                Some(" A Night at the Opera"),
+                "Rock",
+            ),
+            t(r"E:\M\loose.mp3", None, " "),
+            t(r"E:\M\blank.mp3", Some(""), "Rock"),
+        ]);
+
+        assert_eq!(
+            labels(&lib.entries(&Place::Albums)),
+            "A Night at the Opera|Arrival"
+        );
+        assert_eq!(
+            lib.entries(&Place::Albums)[1],
+            folder("Arrival", Place::Album("Arrival".into()))
+        );
+        let arrival = lib.entries(&Place::Album("Arrival".into()));
+        assert_eq!(labels(&arrival), "2 Money|10 Why");
+        assert_eq!(labels(&lib.entries(&Place::Genres)), "Pop|Rock");
+        assert_eq!(lib.entries(&Place::Genre("Rock".into())).len(), 2);
+        assert_eq!(lib.entries(&Place::Songs).len(), 5);
+    }
+
+    #[test]
+    fn music_files_walk_roots() {
+        let tmp = TempDir::new();
+        for f in [
+            r"M\b.mp3",
+            r"M\a\c.FLAC",
+            r"M\a\v.mp4",
+            r"M\.hidden\d.mp3",
+            r"M\x.txt",
+        ] {
+            tmp.touch(f);
+        }
+        let mut lib = Library::open(&tmp.0.join("state"), false);
+        let m = tmp.0.join("M");
+        lib.add_root(Section::Music, m.clone());
+        lib.add_root(Section::Music, m.join("a"));
+        assert_eq!(lib.music_files(), [m.join("b.mp3"), m.join(r"a\c.FLAC")]);
+        // Before a scan, Songs lists the files by name.
+        assert_eq!(labels(&lib.entries(&Place::Songs)), "b|c");
+    }
+}

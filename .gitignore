@@ -1,0 +1,7 @@
+/target
+/design
+# Test clips come from scripts/make-testdata.sh; only the small fixtures with exact timings are kept.
+/testdata/*
+!/testdata/test_tracks.mkv
+!/testdata/test_subs.mkv
+!/testdata/tracks.srt
