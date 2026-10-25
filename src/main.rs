@@ -1323,18 +1323,8 @@ fn menu_action(app: &mut App, hwnd: HWND, action: MenuAction) {
             UI.with_borrow_mut(|ui| ui.browse.stale = true);
         }
         MenuAction::Favorite(path) => toggle_favorite(app, &path),
-        MenuAction::DeletePlaylist(name) => {
-            if let Err(e) = app.library.delete_playlist(&name) {
-                eprintln!("library: cannot delete {name}: {e}");
-            }
-            // Leave the deleted playlist's page.
-            UI.with_borrow_mut(|ui| {
-                if ui.browse.place == Place::Playlist(name) {
-                    ui.browse.go(Place::Playlists);
-                }
-                ui.browse.stale = true;
-            });
-        }
+        // Deleting asks first; the dialog's Delete comes back as DialogAction::DeletePlaylist.
+        MenuAction::DeletePlaylist(name) => open_dialog(app, Dialog::DeletePlaylist(name)),
         MenuAction::RemoveFromPlaylist(name, path) => {
             let index = app.library.playlist_items(&name).iter().position(|p| *p == path);
             if let Some(i) = index
@@ -1470,6 +1460,18 @@ fn apply_dialog(app: &mut App, hwnd: HWND, action: DialogAction) {
         _ => format!("Can't save the playlist: {e}"),
     };
     match action {
+        DialogAction::DeletePlaylist(name) => {
+            if let Err(e) = app.library.delete_playlist(&name) {
+                eprintln!("library: cannot delete {name}: {e}");
+            }
+            // Leave the deleted playlist's page.
+            UI.with_borrow_mut(|ui| {
+                if ui.browse.place == Place::Playlist(name) {
+                    ui.browse.go(Place::Playlists);
+                }
+                ui.browse.stale = true;
+            });
+        }
         DialogAction::PickFiles => {
             let files = pick_media_files(hwnd);
             UI.with_borrow_mut(|ui| ui.dialog_add_files(files));

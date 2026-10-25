@@ -34,6 +34,8 @@ pub enum Dialog {
     About,
     Shortcuts,
     Properties(PathBuf),
+    /// Asks before deleting the named playlist.
+    DeletePlaylist(String),
 }
 
 /// What the open dialog asks main.rs to do.
@@ -55,6 +57,8 @@ pub enum DialogAction {
         thumbnail: Option<PathBuf>,
     },
     OpenLink(&'static str),
+    /// The user confirmed deleting the playlist.
+    DeletePlaylist(String),
 }
 
 /// What a click lands on.
@@ -348,7 +352,7 @@ impl State {
             Dialog::NewPlaylist { files } => state.add_files(files),
             Dialog::RenamePlaylist(name) => state.field = TextField::new(&name),
             Dialog::Properties(path) => state.rows = properties(&path),
-            Dialog::About | Dialog::Shortcuts => {}
+            Dialog::About | Dialog::Shortcuts | Dialog::DeletePlaylist(_) => {}
         }
         state
     }
@@ -360,6 +364,7 @@ impl State {
             Dialog::About => "About",
             Dialog::Shortcuts => "Keyboard Shortcuts",
             Dialog::Properties(_) => "Properties",
+            Dialog::DeletePlaylist(_) => "Delete Playlist",
         }
     }
 
@@ -791,6 +796,7 @@ impl Painter {
             Dialog::NewPlaylist { .. } | Dialog::RenamePlaylist(_) => W,
             Dialog::Properties(_) => 640.0,
             Dialog::About | Dialog::Shortcuts => 600.0,
+            Dialog::DeletePlaylist(_) => 520.0,
         };
         let mut b = Builder {
             w,
@@ -828,6 +834,17 @@ impl Painter {
                 }
                 let copy = if d.copied { "Copied" } else { "Copy path" };
                 b.footer(y + 24.0, Some((Target::CopyPath, copy)), "Close", true)
+            }
+            Dialog::DeletePlaylist(name) => {
+                b.text(format!("Delete \"{name}\"?"), Style::Heading, PAD, 87.0, w - PAD);
+                b.text(
+                    "The playlist goes away; the files in it stay where they are.",
+                    Style::Help,
+                    PAD,
+                    117.0,
+                    w - PAD,
+                );
+                b.footer(157.0, Some((Target::Cancel, "Cancel")), "Delete", true)
             }
         };
         // Clicks anywhere on the dialog stop at it; the dimmed window around it is Body too.
@@ -1191,6 +1208,13 @@ impl Ui {
                 return None;
             }
             Target::Primary if d.has_field() => d.save()?,
+            Target::Primary if matches!(d.dialog, Dialog::DeletePlaylist(_)) => {
+                let Dialog::DeletePlaylist(name) = d.dialog.clone() else {
+                    unreachable!()
+                };
+                self.close_dialog();
+                DialogAction::DeletePlaylist(name)
+            }
             Target::Primary => {
                 self.close_dialog();
                 return None;
