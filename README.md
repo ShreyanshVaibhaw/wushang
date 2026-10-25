@@ -44,7 +44,17 @@ The player has the redesign's own title bar and control bar.
 Click play/pause, previous (restart, or the previous file within the first 3 seconds), next, the seek bar, the volume wedge (up to 200%, like VLC) and the speaker (mute).
 The title bar has minimize, maximize, fullscreen and close, and dragging it moves the window.
 While playing, the bars hide after 3 seconds without mouse movement and the video fills the window inside a 10 px rounded frame; moving the mouse brings them back.
-The playlist and "…" buttons are drawn but do nothing yet; they arrive in later stages.
+The "…" button is drawn but does nothing yet; it arrives in a later stage.
+
+The playlist button opens the queue panel from the design, in the settings panel's place, with three tabs:
+
+- Queue: the files previous and next step through, with their lengths and the total.
+  The playing file is orange with its progress underneath, and files watched to the end are dimmed.
+  Click a file to play it, drag it to reorder, and use sort (by name), repeat (off, all, one), shuffle, minus (removes the file last clicked) and + (adds files).
+  Repeat One replays the file when it ends, while next and previous still move on; shuffle plays every file once before Repeat All wraps.
+- Bookmarks: positions in the playing file; + adds one where it is, a click seeks there.
+  They live in `bookmarks.txt` next to the library state.
+- Chapters: the file's chapters with their titles; a click seeks there.
 
 The audio and subtitle buttons open the track popup from the design: video, audio and subtitle tracks (with names like "English" from the file's language tags), the output device, and external subtitle files, with + to load one by hand.
 A subtitle file with the same name as the video, next to it or in a "Subs" folder, loads on its own, as in VLC.
@@ -234,6 +244,7 @@ Each of these is marked with a `ponytail:` comment in the code, along with the u
 - Thumbnails stay in memory for the whole run, about 350 KB each.
 - Playlists can't be renamed yet, and Network, Podcasts and Radio do nothing.
 - The folder picker is modal, so the video pauses on screen while it is open (audio keeps playing).
+- A queue row's "…" removes it, until the file context menu arrives.
 
 ## Licence of the build
 

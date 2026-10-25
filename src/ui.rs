@@ -5,6 +5,7 @@
 
 mod browse;
 pub mod panels;
+pub mod queue;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -12,6 +13,7 @@ use std::time::{Duration, Instant};
 
 pub use browse::Browse;
 pub use panels::{Panel, PanelAction, PanelData, TrackTab};
+pub use queue::{QueueAction, QueueData, QueueItem};
 use windows::Win32::Foundation::E_FAIL;
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
 
@@ -167,6 +169,8 @@ pub enum Hit {
     Panel,
     /// The tracks or settings popup.
     Popup(panels::Target),
+    /// The queue panel.
+    Queue(queue::Target),
 }
 
 impl Hit {
@@ -197,6 +201,7 @@ pub struct Layout {
     volume: Rect,
     browse: browse::Geometry,
     panels: panels::Geometry,
+    queue: queue::Geometry,
 }
 
 impl Layout {
@@ -249,6 +254,7 @@ impl Layout {
             volume: Rect::new(w - 292.0, cy - 14.0, w - 204.0, cy + 14.0),
             browse: Default::default(),
             panels: Default::default(),
+            queue: Default::default(),
         }
     }
 
@@ -274,6 +280,9 @@ impl Layout {
         }
         if let Some(target) = self.panels.hit(x, y) {
             return Some(Hit::Popup(target));
+        }
+        if let Some(target) = self.queue.hit(x, y) {
+            return Some(Hit::Queue(target));
         }
         if let Some(hit) = self.overlay_hit(x, y) {
             return hit;
@@ -313,6 +322,7 @@ pub enum Action {
     SeekTo(f64),
     SetVolume(f32),
     Panel(PanelAction),
+    Queue(QueueAction),
 }
 
 /// Pointer state. Lives on the UI thread; the window procedure feeds it and the render loop
@@ -335,6 +345,8 @@ pub struct Ui {
     pub overlay: bool,
     /// The tracks or settings popup.
     pub panels: panels::State,
+    /// The queue panel.
+    pub queue: queue::State,
     /// The last slider pressed and when, to spot a double-click that resets it.
     last_slider: Option<(panels::Ctl, Instant)>,
 }
@@ -358,6 +370,7 @@ impl Ui {
             browse: Browse::new(),
             overlay: false,
             panels: panels::State::default(),
+            queue: queue::State::default(),
             last_slider: None,
         }
     }
@@ -367,6 +380,7 @@ impl Ui {
         if self.page != page {
             self.page = page;
             self.panels.show(None, None);
+            self.queue.open = false;
             self.hover = None;
             self.relayout = true;
             self.wake();
@@ -388,11 +402,17 @@ impl Ui {
     /// Whether (x, y) is over the tracks or settings popup, or its open choice list. The wheel
     /// passes its own position: the pointer may never have moved over the window.
     pub fn over_panel(&self, x: f32, y: f32) -> bool {
-        self.layout.panels.hit(x, y).is_some()
+        self.layout.panels.hit(x, y).is_some() || self.layout.queue.hit(x, y).is_some()
     }
 
     /// Scrolls the popup, or its open choice list when (x, y) is over it, by `dy` DIPs.
     pub fn scroll_panel(&mut self, x: f32, y: f32, dy: f32) {
+        if self.layout.queue.hit(x, y).is_some() {
+            let max = self.layout.queue.max_scroll;
+            self.queue.scroll = (self.queue.scroll + dy).clamp(0.0, max);
+            self.relayout = true;
+            return;
+        }
         let g = &self.layout.panels;
         let p = &mut self.panels;
         if g.over_list(x, y) {
@@ -407,6 +427,10 @@ impl Ui {
     pub fn close_panel(&mut self) -> bool {
         if self.panels.list.take().is_some() {
             self.relayout = true;
+            return true;
+        }
+        if self.queue.open {
+            self.toggle_queue();
             return true;
         }
         if self.panels.open.is_none() {
@@ -481,6 +505,7 @@ impl Ui {
         self.page == Page::Library
             || self.overlay
             || self.panels.open.is_some()
+            || self.queue.open
             || paused
             || self.drag.is_some()
             || self.hover.is_some_and(Hit::in_bars)
@@ -524,7 +549,10 @@ impl Ui {
                 x - self.layout.volume.l,
             ))),
             Some(Hit::Popup(panels::Target::Ctl(ctl))) => self.slide(ctl, x),
-            _ => None,
+            _ => {
+                self.queue_drag(y);
+                None
+            }
         }
     }
 
@@ -537,6 +565,7 @@ impl Ui {
     pub fn on_down(&mut self, x: f32, y: f32) -> Option<Action> {
         self.on_move(x, y);
         self.pressed = self.hover;
+        self.queue_press(y);
         match self.hover {
             Some(Hit::Seek) => {
                 self.drag = Some(Hit::Seek);
@@ -573,12 +602,14 @@ impl Ui {
         let hit = self.layout.hit(x, y);
         let pressed = self.pressed.take();
         self.dirty = true;
+        self.queue.press = None;
         match self.drag.take() {
             Some(Hit::Seek) => {
                 let fraction = self.layout.seek_fraction(x);
                 self.seek_preview = Some((fraction, Instant::now()));
                 Some(Action::SeekTo(fraction))
             }
+            Some(Hit::Queue(queue::Target::Row(from))) => self.queue_drop(from),
             Some(_) => None,
             // An open choice list takes the next click: a choice, or anywhere else to close it.
             None if self.panels.list.is_some()
@@ -592,11 +623,19 @@ impl Ui {
             None => match hit {
                 Some(Hit::Caption | Hit::Seek | Hit::Volume | Hit::Panel) => None,
                 Some(Hit::Popup(target)) => self.panel_click(target),
+                Some(Hit::Queue(target)) => self.queue_click(target),
+                Some(Hit::Playlist) => {
+                    self.toggle_queue();
+                    Some(Action::Click(Hit::Playlist))
+                }
                 Some(h @ (Hit::Audio | Hit::Subtitles | Hit::Settings)) => {
                     // Its own button closes a popup; another button switches to its popup.
                     let open = self.panels.opener != Some(h);
                     let panel = self.panels.for_button(h).filter(|_| open);
                     self.panels.show(panel, panel.map(|_| h));
+                    if panel.is_some() {
+                        self.queue.open = false;
+                    }
                     self.relayout = true;
                     Some(Action::Click(h))
                 }
@@ -605,6 +644,9 @@ impl Ui {
                     if self.panels.open.is_some() {
                         self.panels.show(None, None);
                         self.relayout = true;
+                    }
+                    if self.queue.open {
+                        self.toggle_queue();
                     }
                     Some(Action::Click(Hit::Video))
                 }
@@ -647,6 +689,8 @@ pub struct Scene<'a> {
     pub browse: &'a Browse,
     /// What the tracks and settings popups show.
     pub panel: Option<&'a PanelData>,
+    /// What the queue panel shows, while it is open.
+    pub queue: Option<&'a QueueData>,
     /// Subtitle cues to show now, and how.
     pub cues: &'a [crate::subs::Cue],
     pub caption_style: &'a crate::captions::CaptionStyle,
@@ -902,6 +946,7 @@ pub struct Painter {
     dwrite: IDWriteFactory6,
     lib: browse::Resources,
     panels: panels::Resources,
+    queue: queue::Resources,
     /// Thumbnails by file; None means the file has no picture.
     thumbs: HashMap<PathBuf, Option<ID2D1Bitmap>>,
     /// Visible files without a thumbnail yet, collected while painting.
@@ -937,6 +982,7 @@ impl Painter {
             frame: None,
             lib: browse::Resources::new(ctx, &factory, &dwrite, &fonts)?,
             panels: panels::Resources::new(ctx, &dwrite, &fonts)?,
+            queue: queue::Resources::new(ctx, &dwrite, &fonts)?,
             captions: crate::captions::CaptionRenderer::new(ctx, &dwrite, Some(&fonts))?,
             stats_text: {
                 let f = text_format(
@@ -1076,6 +1122,9 @@ impl Painter {
             }
             if let Some(data) = s.panel {
                 self.panel(rt, ctx, s, data);
+            }
+            if let Some(data) = s.queue {
+                self.queue_panel(rt, ctx, s, data);
             }
         }
         Ok(())
@@ -1283,7 +1332,14 @@ impl Painter {
                         &i.settings
                     },
                 ),
-                (Hit::Playlist, &i.playlist),
+                (
+                    Hit::Playlist,
+                    if l.queue.open {
+                        &self.queue.playlist_on
+                    } else {
+                        &i.playlist
+                    },
+                ),
             ] {
                 self.hover_box(rt, s, hit);
                 self.icon(ctx, svg, l.button(hit).l + 3.0, cy - 12.0, false);

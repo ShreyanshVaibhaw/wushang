@@ -5,10 +5,12 @@
 //!                                                 -> WASAPI callback (drives the clock)
 
 mod audio;
+mod bookmarks;
 mod captions;
 mod dsp;
 mod library;
 mod player;
+mod queue;
 mod render;
 mod session;
 mod subs;
@@ -16,7 +18,7 @@ mod thumbs;
 mod ui;
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering::Relaxed;
@@ -55,15 +57,20 @@ use windows::Win32::UI::Shell::{
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{HSTRING, w};
 
+use bookmarks::Bookmarks;
 use captions::CaptionStyle;
 use dsp::{EQ_PRESETS, StereoMode};
 use library::{Entry, Library, MediaKind, Place, Section, Track};
 use player::{HwDevice, Shared, VideoFrame};
+use queue::Queue;
 use render::{DeviceLock, Flip, Renderer, VideoAdjust, Zoom};
 use session::{Session, TrackKind};
 use subs::Cues;
 use ui::panels::{ASPECT, CROP};
-use ui::{Action, Hit, Layout, Page, PanelAction, PanelData, Scene, TrackTab, Ui};
+use ui::{
+    Action, Hit, Layout, Page, PanelAction, PanelData, QueueAction, QueueData, QueueItem, Scene,
+    TrackTab, Ui,
+};
 
 /// The window procedure has no user data pointer here, so it reaches shared state through statics.
 static SHARED: OnceLock<Arc<Shared>> = OnceLock::new();
@@ -89,6 +96,8 @@ thread_local! {
     static PENDING: RefCell<Vec<Hit>> = const { RefCell::new(Vec::new()) };
     /// Changes from the tracks and settings popups, applied by the render loop.
     static PANEL_ACTIONS: RefCell<Vec<PanelAction>> = const { RefCell::new(Vec::new()) };
+    /// Changes from the queue panel, applied by the render loop.
+    static QUEUE_ACTIONS: RefCell<Vec<QueueAction>> = const { RefCell::new(Vec::new()) };
 }
 
 /// Sleep timer choices in minutes, by index into the panel's list; the last one is "End of file".
@@ -112,8 +121,15 @@ struct App {
     session: Option<Session>,
     /// The frame on screen. It holds a decoder surface, so it goes before its session.
     current: Option<VideoFrame>,
-    /// Files previous and next step through: the place the file was opened from.
-    queue: Vec<PathBuf>,
+    /// Files previous and next step through: the place the file was opened from, then what
+    /// the queue panel changed.
+    queue: Queue,
+    /// Lengths of the queue's files, probed in the background.
+    durations: HashMap<PathBuf, f64>,
+    queue_prober: thumbs::Prober,
+    /// The queue's files watched to the end, dimmed in the panel.
+    watched: HashSet<PathBuf>,
+    bookmarks: Bookmarks,
     recorded: Instant,
     /// Flip, rotation, zoom, crop and colour, from the settings panel's Video tab.
     adjust: VideoAdjust,
@@ -137,16 +153,30 @@ struct App {
 }
 
 impl App {
-    /// Plays `path` from where it was left, with `queue` for previous and next.
+    /// Plays `path` from where it was left, with `queue` for previous and next. Repeat and
+    /// shuffle carry over from the last queue, as in VLC.
     fn play(&mut self, path: &Path, queue: Vec<PathBuf>) -> bool {
+        let (repeat, shuffle) = (self.queue.repeat(), self.queue.shuffle());
+        self.queue = Queue::new(queue, Some(path));
+        self.queue.set_repeat(repeat);
+        self.queue.set_shuffle(shuffle);
+        self.queue_changed();
+        self.open(path)
+    }
+
+    /// Opens `path` from where it was left, keeping the queue as it is.
+    fn open(&mut self, path: &Path) -> bool {
         self.stop();
         let start = self.library.resume_position(path);
         match Session::open(path, start, &self.shared, self.hw.as_ref(), &self.audio) {
             Ok(s) => {
+                if s.duration > 0.0 {
+                    self.durations.insert(path.to_owned(), s.duration);
+                }
                 self.session = Some(s);
-                self.queue = queue;
                 self.start_subtitles();
                 self.record();
+                self.refresh_watched();
                 true
             }
             Err(e) => {
@@ -466,21 +496,114 @@ impl App {
         self.recorded = Instant::now();
     }
 
-    /// The queue entry `delta` away from the open file.
-    fn neighbour(&self, delta: isize) -> Option<PathBuf> {
-        let path = &self.session.as_ref()?.path;
-        let at = self.queue.iter().position(|p| p == path)?;
-        let i = at.checked_add_signed(delta)?;
-        self.queue.get(i).cloned()
+    /// Plays the next (`delta` > 0) or previous file in the queue's order.
+    fn step(&mut self, delta: isize) -> bool {
+        let path = if delta > 0 {
+            self.queue.next()
+        } else {
+            self.queue.previous()
+        };
+        path.is_some_and(|p| self.open(&p))
     }
 
-    fn step(&mut self, delta: isize) -> bool {
-        match self.neighbour(delta) {
-            Some(path) => {
-                let queue = std::mem::take(&mut self.queue);
-                self.play(&path, queue)
+    /// At the end of a file: the same one again under Repeat One, else the next.
+    fn advance(&mut self) -> bool {
+        self.queue.on_end().is_some_and(|p| self.open(&p))
+    }
+
+    /// Appends files to the queue, for the panel's + and the menus' "Add to Queue".
+    pub fn add_to_queue(&mut self, paths: Vec<PathBuf>) {
+        if !paths.is_empty() {
+            self.queue.add(paths);
+            self.queue_changed();
+        }
+    }
+
+    /// Asks for the lengths of files new to the queue, and which of them were watched.
+    fn queue_changed(&mut self) {
+        let unknown = (self.queue.items().iter())
+            .filter(|p| !self.durations.contains_key(*p))
+            .cloned()
+            .collect();
+        self.queue_prober.request_all(unknown);
+        self.refresh_watched();
+    }
+
+    /// Files finished before, from the library's recent list.
+    fn refresh_watched(&mut self) {
+        let finished: HashSet<PathBuf> = (self.library.entries(&Place::Recent).into_iter())
+            .filter_map(|e| match e {
+                Entry::Media {
+                    path,
+                    finished: true,
+                    ..
+                } => Some(path),
+                _ => None,
+            })
+            .collect();
+        // The recent list keeps absolute paths; the queue keeps them as listed.
+        self.watched = (self.queue.items().iter())
+            .filter(|p| std::path::absolute(p).is_ok_and(|a| finished.contains(&a)))
+            .cloned()
+            .collect();
+    }
+
+    /// What the queue panel shows.
+    fn queue_data(&self) -> QueueData {
+        let session = self.session.as_ref();
+        QueueData {
+            items: (self.queue.items().iter())
+                .map(|p| QueueItem {
+                    name: p
+                        .file_name()
+                        .unwrap_or(p.as_os_str())
+                        .to_string_lossy()
+                        .into_owned(),
+                    duration: self.durations.get(p).copied().filter(|d| *d > 0.0),
+                    watched: self.watched.contains(p),
+                })
+                .collect(),
+            current: self.queue.current(),
+            repeat: self.queue.repeat(),
+            shuffle: self.queue.shuffle(),
+            bookmarks: session.map_or_else(Vec::new, |s| {
+                (self.bookmarks.for_file(&s.path).into_iter())
+                    .map(|b| (b.name.clone(), b.seconds))
+                    .collect()
+            }),
+            chapters: session.map_or_else(Vec::new, |s| s.chapters().to_vec()),
+        }
+    }
+
+    /// Applies one change from the queue panel.
+    fn apply_queue(&mut self, hwnd: HWND, action: QueueAction) {
+        match action {
+            QueueAction::Play(i) => {
+                if let Some(path) = self.queue.play_at(i) {
+                    self.open(&path);
+                }
             }
-            None => false,
+            QueueAction::Move(from, to) => self.queue.move_item(from, to),
+            QueueAction::Remove(i) => _ = self.queue.remove(i),
+            QueueAction::AddFiles => {
+                let files = pick_media_files(hwnd);
+                self.add_to_queue(files);
+            }
+            QueueAction::Sort => self.queue.sort_by_name(),
+            QueueAction::CycleRepeat => self.queue.cycle_repeat(),
+            QueueAction::ToggleShuffle => self.queue.toggle_shuffle(),
+            QueueAction::AddBookmark | QueueAction::RemoveBookmark(_) => {
+                let Some(s) = &self.session else { return };
+                if let QueueAction::RemoveBookmark(i) = action {
+                    self.bookmarks.remove(&s.path, i);
+                } else {
+                    self.bookmarks.add(&s.path, s.position().unwrap_or(0.0));
+                }
+                if let Err(e) = self.bookmarks.save() {
+                    eprintln!("bookmarks: cannot save ({e})");
+                }
+            }
+            QueueAction::SeekTo(t) => self.shared.seek_to(t),
         }
     }
 
@@ -545,7 +668,11 @@ fn run() -> Result<(), Box<dyn Error>> {
         library_changed: false,
         session: None,
         current: None,
-        queue: Vec::new(),
+        queue: Queue::default(),
+        durations: HashMap::new(),
+        queue_prober: thumbs::Prober::new(),
+        watched: HashSet::new(),
+        bookmarks: Bookmarks::load(&Library::default_dir()),
         recorded: Instant::now(),
         adjust: VideoAdjust::default(),
         zoom: 0,
@@ -635,6 +762,14 @@ fn run() -> Result<(), Box<dyn Error>> {
             app.apply(hwnd, action);
             // Video adjustments change the picture without a new frame.
             UI.with_borrow_mut(|ui| ui.dirty = true);
+        }
+        for action in QUEUE_ACTIONS.with_borrow_mut(std::mem::take) {
+            app.apply_queue(hwnd, action);
+            UI.with_borrow_mut(|ui| ui.dirty = true);
+        }
+        for (path, info) in app.queue_prober.take_ready() {
+            let duration = info.map_or(0.0, |i| i.duration);
+            app.durations.insert(path, duration);
         }
         if app.sleep_at.is_some_and(|at| Instant::now() >= at) {
             app.sleep_at = None;
@@ -745,6 +880,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         let has_video = app.session.as_ref().is_some_and(|s| s.video_size.is_some());
         let card = app.session.is_some();
         let panel_data = app.panel_data();
+        let queue_data = UI.with_borrow(|ui| ui.queue.open).then(|| app.queue_data());
         let needs_paint = UI.with_borrow_mut(|ui| {
             // Nothing to show on the player page once playback ends or fails.
             if app.session.is_none() {
@@ -763,6 +899,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                         || bars != old.bars
                         || ui.overlay != old.has_overlay()
                         || ui.panel_stale(&panel_data)
+                        || ui.queue_stale(queue_data.as_ref())
                         || (w, h) != (old.width, old.height);
                     changed.then(|| {
                         let mut layout = Layout::new(w, h, bars, fullscreen);
@@ -770,6 +907,9 @@ fn run() -> Result<(), Box<dyn Error>> {
                             renderer.add_overlay(&mut layout, &ui.browse);
                         }
                         layout.add_panel(&ui.panels, &panel_data);
+                        if let Some(q) = &queue_data {
+                            layout.add_queue(&ui.queue, q);
+                        }
                         layout
                     })
                 }
@@ -841,6 +981,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                     has_frame: app.current.is_some(),
                     browse: &ui.browse,
                     panel: Some(&panel_data),
+                    queue: queue_data.as_ref(),
                     cues: &cues,
                     caption_style: &app.caption,
                     stats: stats.as_deref(),
@@ -872,7 +1013,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                 }
                 // Like VLC's playlist: carry on with the next file, or stop at the end (or where
                 // the sleep timer says).
-                if app.sleep == SLEEP_END_OF_FILE || !app.step(1) {
+                if app.sleep == SLEEP_END_OF_FILE || !app.advance() {
                     app.sleep = 0;
                     app.stop();
                 }
@@ -1043,6 +1184,49 @@ fn pick_subtitle_file(hwnd: HWND) -> Option<PathBuf> {
         CoTaskMemFree(Some(name.0 as _));
         path
     }
+}
+
+/// The system file picker with multiple selection, for adding media to the queue. Empty when
+/// cancelled.
+fn pick_media_files(hwnd: HWND) -> Vec<PathBuf> {
+    use windows::Win32::UI::Shell::Common::COMDLG_FILTERSPEC;
+    use windows::Win32::UI::Shell::FOS_ALLOWMULTISELECT;
+    // The extensions library.rs lists as video and audio.
+    let filters = [
+        COMDLG_FILTERSPEC {
+            pszName: w!("Media files"),
+            pszSpec: w!(
+                "*.mp4;*.m4v;*.mkv;*.webm;*.avi;*.mov;*.wmv;*.flv;*.ts;*.m2ts;*.mts;*.mpg;*.mpeg;*.ogv;*.3gp;*.mp3;*.m4a;*.aac;*.flac;*.wav;*.ogg;*.opus;*.wma;*.alac;*.aiff;*.ape;*.mka"
+            ),
+        },
+        COMDLG_FILTERSPEC {
+            pszName: w!("All files"),
+            pszSpec: w!("*.*"),
+        },
+    ];
+    let pick = || unsafe {
+        let dialog: IFileOpenDialog =
+            CoCreateInstance(&FileOpenDialog, None, CLSCTX_INPROC_SERVER).ok()?;
+        dialog.SetFileTypes(&filters).ok()?;
+        dialog
+            .SetOptions(dialog.GetOptions().ok()? | FOS_FORCEFILESYSTEM | FOS_ALLOWMULTISELECT)
+            .ok()?;
+        dialog.Show(Some(hwnd)).ok()?; // fails when cancelled
+        let items = dialog.GetResults().ok()?;
+        let mut paths = Vec::new();
+        for i in 0..items.GetCount().ok()? {
+            let Ok(name) = items
+                .GetItemAt(i)
+                .and_then(|item| item.GetDisplayName(SIGDN_FILESYSPATH))
+            else {
+                continue;
+            };
+            paths.extend(name.to_string().ok().map(PathBuf::from));
+            CoTaskMemFree(Some(name.0 as _));
+        }
+        Some(paths)
+    };
+    pick().unwrap_or_default()
 }
 
 /// The system folder picker. Modal: the window keeps repainting, playback keeps going.
@@ -1462,6 +1646,7 @@ fn act(hwnd: HWND, shared: &Shared, action: Option<Action>) {
         }
         Action::SetVolume(volume) => shared.set_volume(volume),
         Action::Panel(a) => PANEL_ACTIONS.with_borrow_mut(|p| p.push(a)),
+        Action::Queue(a) => QUEUE_ACTIONS.with_borrow_mut(|q| q.push(a)),
     }
 }
 

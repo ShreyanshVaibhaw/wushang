@@ -1300,7 +1300,7 @@ impl Resources {
 }
 
 impl Painter {
-    unsafe fn put(
+    pub(super) unsafe fn put(
         &self,
         rt: &ID2D1RenderTarget,
         text: &str,
@@ -1322,7 +1322,14 @@ impl Painter {
     }
 
     /// Draws a 24-DIP icon scaled to `size`, centred on (cx, cy).
-    unsafe fn glyph(&self, ctx: &ID2D1DeviceContext5, svg: &Svg, cx: f32, cy: f32, size: f32) {
+    pub(super) unsafe fn glyph(
+        &self,
+        ctx: &ID2D1DeviceContext5,
+        svg: &Svg,
+        cx: f32,
+        cy: f32,
+        size: f32,
+    ) {
         let s = size / svg.width;
         let m = Matrix3x2 {
             M11: s,
