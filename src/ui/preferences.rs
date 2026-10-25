@@ -371,7 +371,11 @@ impl Ctl {
             Ctl::Aspect => ASPECT.iter().position(|a| *a == p.aspect),
             // The device list starts with the system default, as the tracks panel's does.
             Ctl::Device if p.device.is_empty() => Some(0),
-            Ctl::Device => devices.iter().skip(1).position(|d| *d == p.device).map(|i| i + 1),
+            Ctl::Device => devices
+                .iter()
+                .skip(1)
+                .position(|d| *d == p.device)
+                .map(|i| i + 1),
             Ctl::StartupVolume => Some(p.startup_volume),
             Ctl::VolumeStep => prefs::VOLUME_STEPS.iter().position(|v| *v == p.volume_step),
             Ctl::EqPreset if p.eq_preset.is_empty() => Some(0),
@@ -1123,7 +1127,9 @@ impl Ui {
     fn prefs_changed(&mut self) -> Option<Action> {
         let st = self.preferences.as_ref()?;
         self.relayout = true;
-        Some(Action::Preferences(PrefsAction::Changed(Box::new(st.prefs.clone()))))
+        Some(Action::Preferences(PrefsAction::Changed(Box::new(
+            st.prefs.clone(),
+        ))))
     }
 
     /// A click in the window: switching, lists and searching happen here, changes go out.
@@ -1460,7 +1466,13 @@ impl Painter {
             clip(Rect::new(SIDEBAR_W, 0.0, w, HEADER), &r.header);
 
             self.prefs_search(rt, ctx, g, st, hover(Target::Search));
-            self.put(rt, g.title, &r.title, Rect::new(LABEL_X, 0.0, w - 60.0, 48.0), &r.title_fg);
+            self.put(
+                rt,
+                g.title,
+                &r.title,
+                Rect::new(LABEL_X, 0.0, w - 60.0, 48.0),
+                &r.title_fg,
+            );
             if hover(Target::Close) {
                 rt.FillRoundedRectangle(&rounded(g.close, 4.0), &r.hover);
             }
@@ -1587,7 +1599,10 @@ impl Painter {
             }
             if st.caret_visible() {
                 let x = (x0 + caret_x).round();
-                rt.FillRectangle(&Rect::new(x, cy - 9.0, x + 1.0, cy + 9.0).d2d(), &r.label_fg);
+                rt.FillRectangle(
+                    &Rect::new(x, cy - 9.0, x + 1.0, cy + 9.0).d2d(),
+                    &r.label_fg,
+                );
             }
             rt.PopAxisAlignedClip();
         }
@@ -1666,7 +1681,12 @@ impl Painter {
                         let sw = Rect::around(b.r - 54.0, cy, 16.0);
                         r.swatch.SetColor(&color(theme::fixed(rgb), 1.0));
                         rt.FillRoundedRectangle(&rounded(sw, 2.0), &r.swatch);
-                        rt.DrawRoundedRectangle(&rounded(sw.inset(0.5), 2.0), &r.tick_fg, 1.0, None);
+                        rt.DrawRoundedRectangle(
+                            &rounded(sw.inset(0.5), 2.0),
+                            &r.tick_fg,
+                            1.0,
+                            None,
+                        );
                     }
                     let chevron = if open {
                         &self.panels.chevron_up
@@ -1706,7 +1726,8 @@ impl Painter {
                             rt.FillRoundedRectangle(&rounded(cell, 4.0), &r.hover);
                         }
                         let (cx, cy) = centre(cell);
-                        r.swatch.SetColor(&color(theme::fixed(theme::ACCENTS[i]), 1.0));
+                        r.swatch
+                            .SetColor(&color(theme::fixed(theme::ACCENTS[i]), 1.0));
                         let sw = Rect::around(cx, cy, SWATCH);
                         rt.FillRoundedRectangle(&rounded(sw, 2.0), &r.swatch);
                     }
@@ -1736,7 +1757,11 @@ impl Painter {
                         let tx = at(i as f32 / (labels - 1) as f32);
                         let tick = Rect::new(tx - 0.5, cy - 3.0, tx + 0.5, cy + 3.0);
                         let lit = tx <= x;
-                        let brush = if lit { &self.panels.tick_on } else { &self.panels.tick };
+                        let brush = if lit {
+                            &self.panels.tick_on
+                        } else {
+                            &self.panels.tick
+                        };
                         rt.FillRectangle(&tick.d2d(), brush);
                     }
                     let thumb = Rect::new(x - 5.0, cy - 12.0, x + 5.0, cy + 12.0);
@@ -1837,10 +1862,17 @@ mod tests {
         assert_eq!(g.scale, 1.0);
         assert_eq!(g.size, (W, H));
         // The frame's measured positions: the first heading, its first rows, the slider row.
-        let heading = g.rows.iter().find(|r| matches!(r.kind, Kind::Heading(_))).unwrap();
+        let heading = g
+            .rows
+            .iter()
+            .find(|r| matches!(r.kind, Kind::Heading(_)))
+            .unwrap();
         assert_eq!(centre(heading.r).1, 88.0);
         let row = |label: &str| {
-            let r = g.rows.iter().find(|r| matches!(r.kind, Kind::Label(t) if t == label));
+            let r = g
+                .rows
+                .iter()
+                .find(|r| matches!(r.kind, Kind::Label(t) if t == label));
             centre(r.unwrap().r).1
         };
         assert_eq!(row("Continue where you left off"), 131.0);
@@ -1859,7 +1891,10 @@ mod tests {
         let g = layout.preferences.as_ref().unwrap();
         assert_eq!(g.scale, 1.0);
         assert_eq!(g.size.1, 720.0 - 32.0);
-        assert!(g.max_scroll > 0.0, "subtitle options scroll in a short frame");
+        assert!(
+            g.max_scroll > 0.0,
+            "subtitle options scroll in a short frame"
+        );
         let last = g.items.last().unwrap().1;
         assert!(last.b <= g.sidebar_box.b, "the sidebar tightens to fit");
 
@@ -1884,11 +1919,16 @@ mod tests {
     fn controls_change_the_settings() {
         let mut ui = Ui::new();
         ui.layout = Layout::new(1920.0, 1080.0, true, false);
-        ui.open_preferences(Prefs::default(), vec!["Default".into(), "USB".into()], Category::Audio);
+        ui.open_preferences(
+            Prefs::default(),
+            vec!["Default".into(), "USB".into()],
+            Category::Audio,
+        );
         ui.layout.add_preferences(ui.preferences.as_ref().unwrap());
         // A list opens, and its row sets the setting.
         assert!(ui.preferences_click(Target::Ctl(Ctl::Device)).is_none());
-        let Some(Action::Preferences(PrefsAction::Changed(p))) = ui.preferences_click(Target::Choice(1))
+        let Some(Action::Preferences(PrefsAction::Changed(p))) =
+            ui.preferences_click(Target::Choice(1))
         else {
             panic!("picking a device changes the settings");
         };
@@ -1926,7 +1966,11 @@ mod tests {
         let blue = at(|k| matches!(k, Kind::Swatches), 5);
         assert_eq!(blue, Target::Pick(Ctl::Accent, 5));
         // The swatches end at the controls' right edge, as the design's strip does.
-        let strip = g.rows.iter().find(|r| matches!(r.kind, Kind::Swatches)).unwrap();
+        let strip = g
+            .rows
+            .iter()
+            .find(|r| matches!(r.kind, Kind::Swatches))
+            .unwrap();
         let last = strip.picks()[8];
         assert_eq!(centre(last).0 + SWATCH / 2.0, CTRL_R - SWATCH_PAD);
         ui.preferences_click(light);

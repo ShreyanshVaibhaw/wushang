@@ -11,8 +11,8 @@ mod dsp;
 mod library;
 mod player;
 mod prefs;
-mod queue;
 mod probe;
+mod queue;
 mod render;
 mod session;
 mod subs;
@@ -57,9 +57,9 @@ use windows::Win32::UI::HiDpi::{
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::*;
 use windows::Win32::UI::Shell::{
-    DragAcceptFiles, DragFinish, DragQueryFileW, FOS_FORCEFILESYSTEM,
-    FOS_OVERWRITEPROMPT, FOS_PICKFOLDERS, FileOpenDialog, FileSaveDialog, HDROP, IFileOpenDialog,
-    IFileSaveDialog, SIGDN_FILESYSPATH,
+    DragAcceptFiles, DragFinish, DragQueryFileW, FOS_FORCEFILESYSTEM, FOS_OVERWRITEPROMPT,
+    FOS_PICKFOLDERS, FileOpenDialog, FileSaveDialog, HDROP, IFileOpenDialog, IFileSaveDialog,
+    SIGDN_FILESYSPATH,
 };
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{HSTRING, w};
@@ -975,7 +975,10 @@ fn run() -> Result<(), Box<dyn Error>> {
             }
             UI.with_borrow_mut(|ui| ui.dirty = true);
         }
-        if app.prefs_changed.is_some_and(|t| t.elapsed() > Duration::from_secs(1)) {
+        if app
+            .prefs_changed
+            .is_some_and(|t| t.elapsed() > Duration::from_secs(1))
+        {
             app.prefs_changed = None;
             if let Err(e) = prefs().save(&Library::default_dir()) {
                 eprintln!("settings: cannot save ({e})");
@@ -1272,7 +1275,8 @@ fn run() -> Result<(), Box<dyn Error>> {
                 // the sleep timer says).
                 if app.sleep == SLEEP_END_OF_FILE || !app.advance() {
                     // The sleep timer stops; the end of the queue may quit, per Settings.
-                    let quit = app.sleep != SLEEP_END_OF_FILE && PREFS.with_borrow(|p| p.at_end == 1);
+                    let quit =
+                        app.sleep != SLEEP_END_OF_FILE && PREFS.with_borrow(|p| p.at_end == 1);
                     app.sleep = 0;
                     app.stop();
                     if quit {
@@ -1556,9 +1560,10 @@ fn menu_action(app: &mut App, hwnd: HWND, action: MenuAction) {
         MenuAction::RenamePlaylist(name) => open_dialog(app, Dialog::RenamePlaylist(name)),
         // Both toggle: a watched file becomes unwatched, a favourite stops being one.
         MenuAction::MarkWatched(path) => {
-            let watched = app.library.entries(&Place::Recent).iter().any(|e| {
-                matches!(e, Entry::Media { path: p, finished: true, .. } if *p == path)
-            });
+            let watched =
+                app.library.entries(&Place::Recent).iter().any(
+                    |e| matches!(e, Entry::Media { path: p, finished: true, .. } if *p == path),
+                );
             app.library.mark_watched(&path, !watched);
             app.library_changed = true;
             UI.with_borrow_mut(|ui| ui.browse.stale = true);
@@ -1567,7 +1572,11 @@ fn menu_action(app: &mut App, hwnd: HWND, action: MenuAction) {
         // Deleting asks first; the dialog's Delete comes back as DialogAction::DeletePlaylist.
         MenuAction::DeletePlaylist(name) => open_dialog(app, Dialog::DeletePlaylist(name)),
         MenuAction::RemoveFromPlaylist(name, path) => {
-            let index = app.library.playlist_items(&name).iter().position(|p| *p == path);
+            let index = app
+                .library
+                .playlist_items(&name)
+                .iter()
+                .position(|p| *p == path);
             if let Some(i) = index
                 && let Err(e) = app.library.remove_from_playlist(&name, i)
             {

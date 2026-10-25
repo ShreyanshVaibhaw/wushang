@@ -26,7 +26,11 @@ pub const AUTO_HIDE: Choices = &[
 ];
 pub const CLICK: Choices = &[("nothing", "Nothing"), ("pause", "Play / Pause")];
 pub const DOUBLE_CLICK: Choices = &[("fullscreen", "Toggle fullscreen"), ("nothing", "Nothing")];
-pub const WHEEL: Choices = &[("volume", "Volume"), ("seek", "Seek"), ("nothing", "Nothing")];
+pub const WHEEL: Choices = &[
+    ("volume", "Volume"),
+    ("seek", "Seek"),
+    ("nothing", "Nothing"),
+];
 pub const RESUME: Choices = &[("always", "Always"), ("never", "Never")];
 pub const REPEAT: Choices = &[("off", "Off"), ("all", "All"), ("one", "One")];
 pub const AT_END: Choices = &[("library", "Go to the library"), ("quit", "Quit myvlc")];
@@ -226,7 +230,10 @@ impl Prefs {
         line("keep_awake", self.keep_awake.to_string());
         line("aspect", self.aspect.clone());
         line("device", self.device.clone());
-        line("startup_volume", key(STARTUP_VOLUME, self.startup_volume).into());
+        line(
+            "startup_volume",
+            key(STARTUP_VOLUME, self.startup_volume).into(),
+        );
         line("volume", self.volume.to_string());
         line("volume_step", self.volume_step.to_string());
         line("eq_preset", self.eq_preset.clone());
@@ -298,7 +305,10 @@ fn parse(text: &str) -> Prefs {
             }
         };
         let colour = |c: &mut u32| {
-            if let Some(n) = v.strip_prefix('#').and_then(|h| u32::from_str_radix(h, 16).ok()) {
+            if let Some(n) = v
+                .strip_prefix('#')
+                .and_then(|h| u32::from_str_radix(h, 16).ok())
+            {
                 *c = n & 0xFF_FFFF;
             }
         };
@@ -322,7 +332,10 @@ fn parse(text: &str) -> Prefs {
             "hide_after" => number(&mut p.hide_after, 1.0, 10.0),
             "save_recent" => flag(&mut p.save_recent),
             "skip" => {
-                let n: Vec<u32> = v.split_whitespace().filter_map(|s| s.parse().ok()).collect();
+                let n: Vec<u32> = v
+                    .split_whitespace()
+                    .filter_map(|s| s.parse().ok())
+                    .collect();
                 if let [a, b, c, d] = n[..]
                     && n.iter().all(|s| (1..=3600).contains(s))
                 {

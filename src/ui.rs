@@ -5,8 +5,8 @@
 //! Sizes are DIPs measured from the design's 1920x1080 frames.
 
 mod browse;
-pub mod menu;
 pub mod dialog;
+pub mod menu;
 pub mod panels;
 pub mod preferences;
 pub mod queue;
@@ -17,8 +17,8 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 pub use browse::Browse;
-pub use menu::MenuAction;
 pub use dialog::{Dialog, DialogAction};
+pub use menu::MenuAction;
 pub use panels::{Panel, PanelAction, PanelData, TrackTab};
 pub use preferences::{Category, PrefsAction};
 pub use queue::{QueueAction, QueueData, QueueItem};

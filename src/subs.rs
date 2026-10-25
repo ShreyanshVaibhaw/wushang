@@ -850,9 +850,18 @@ mod tests {
         queue.push(Msg::Eof);
         wait_for(&cues, 2);
         let first = &cues.active(1.5)[0];
-        assert!(close(first.start, 1.0) && close(first.end, 3.0), "{first:?}");
-        assert_eq!(text(first), &vec![vec![span("First zlib cue", false, false)]]);
-        assert_eq!(text(&cues.active(4.0)[0]), &vec![vec![span("Second zlib cue", false, false)]]);
+        assert!(
+            close(first.start, 1.0) && close(first.end, 3.0),
+            "{first:?}"
+        );
+        assert_eq!(
+            text(first),
+            &vec![vec![span("First zlib cue", false, false)]]
+        );
+        assert_eq!(
+            text(&cues.active(4.0)[0]),
+            &vec![vec![span("Second zlib cue", false, false)]]
+        );
         shared.quit.store(true, Relaxed);
         thread.join().unwrap();
     }

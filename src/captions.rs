@@ -89,13 +89,7 @@ impl CaptionRenderer {
                 fonts: fonts.cloned(),
                 fill: ctx.CreateSolidColorBrush(&color(style.text), None)?,
                 outline: ctx.CreateSolidColorBrush(&color(style.outline), None)?,
-                shadow: ctx.CreateSolidColorBrush(
-                    &D2D1_COLOR_F {
-                        a: 0.6,
-                        ..color(0)
-                    },
-                    None,
-                )?,
+                shadow: ctx.CreateSolidColorBrush(&D2D1_COLOR_F { a: 0.6, ..color(0) }, None)?,
                 format: None,
                 layouts: Vec::new(),
                 bitmaps: Vec::new(),

@@ -122,7 +122,10 @@ const FG_BUTTON_OFF: u32 = 0x606060;
 const SHORTCUTS: [(&str, &str); 19] = [
     ("Space", "Play or pause"),
     ("Left / Right", "Skip back or forward (Settings > Controls)"),
-    ("Alt / Shift / Ctrl + arrows", "Very short, medium or long skip"),
+    (
+        "Alt / Shift / Ctrl + arrows",
+        "Very short, medium or long skip",
+    ),
     ("Up / Down", "Volume up or down"),
     ("Mouse wheel", "Volume in the player, scroll in the library"),
     ("M", "Mute"),
@@ -836,7 +839,13 @@ impl Painter {
                 b.footer(y + 24.0, Some((Target::CopyPath, copy)), "Close", true)
             }
             Dialog::DeletePlaylist(name) => {
-                b.text(format!("Delete \"{name}\"?"), Style::Heading, PAD, 87.0, w - PAD);
+                b.text(
+                    format!("Delete \"{name}\"?"),
+                    Style::Heading,
+                    PAD,
+                    87.0,
+                    w - PAD,
+                );
                 b.text(
                     "The playlist goes away; the files in it stay where they are.",
                     Style::Help,

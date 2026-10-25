@@ -970,7 +970,10 @@ fn file_menu(path: &Path, playlists: &[String], within: Option<&str>) -> Vec<Ite
     ];
     if let Some(name) = within {
         let remove = MenuAction::RemoveFromPlaylist(name.to_owned(), path.to_owned());
-        items.insert(7, Item::new("Remove from Playlist", remove).icon(Icon::Delete));
+        items.insert(
+            7,
+            Item::new("Remove from Playlist", remove).icon(Icon::Delete),
+        );
     }
     items
 }

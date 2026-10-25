@@ -531,10 +531,12 @@ fn in_language(tracks: &[TrackInfo], language: &str) -> Option<usize> {
     }
     let want = language_name(language);
     let matches = |t: &&TrackInfo| {
-        t.language.as_deref().is_some_and(|code| match (language_name(code), want) {
-            (Some(a), Some(b)) => a == b,
-            _ => code.eq_ignore_ascii_case(language),
-        })
+        t.language
+            .as_deref()
+            .is_some_and(|code| match (language_name(code), want) {
+                (Some(a), Some(b)) => a == b,
+                _ => code.eq_ignore_ascii_case(language),
+            })
     };
     let mut found = tracks.iter().filter(matches);
     let first = found.clone().next()?;
@@ -664,7 +666,15 @@ mod tests {
             // Tests play on the real device; keep them silent.
             shared.toggle_mute();
             let audio = audio::Device::open(shared.clone());
-            let session = Session::open(&clip(), None, &TrackChoice::default(), &shared, None, &audio).unwrap();
+            let session = Session::open(
+                &clip(),
+                None,
+                &TrackChoice::default(),
+                &shared,
+                None,
+                &audio,
+            )
+            .unwrap();
             let rendering = Arc::new(AtomicBool::new(true));
             let renderer =
                 spawn_renderer(shared.clone(), session.frames.clone(), rendering.clone());
@@ -820,7 +830,15 @@ mod tests {
         ];
         assert_eq!(s.chapters(), expected);
         within(Duration::from_secs(10), "dropping the session", || drop(s));
-        let s = Session::open(&clip(), None, &TrackChoice::default(), &shared, None, &audio).unwrap();
+        let s = Session::open(
+            &clip(),
+            None,
+            &TrackChoice::default(),
+            &shared,
+            None,
+            &audio,
+        )
+        .unwrap();
         assert!(s.chapters().is_empty());
         within(Duration::from_secs(10), "dropping the session", || drop(s));
     }
@@ -876,9 +894,17 @@ mod tests {
             track(3, Some("jpn"), true),
             track(4, Some("tlh"), false),
         ];
-        assert_eq!(in_language(&tracks, "jpn"), Some(3), "the default of the two");
+        assert_eq!(
+            in_language(&tracks, "jpn"),
+            Some(3),
+            "the default of the two"
+        );
         assert_eq!(in_language(&tracks, "en"), Some(1), "639-1 matches 639-2");
-        assert_eq!(in_language(&tracks, "tlh"), Some(4), "unknown codes match as written");
+        assert_eq!(
+            in_language(&tracks, "tlh"),
+            Some(4),
+            "unknown codes match as written"
+        );
         assert_eq!(in_language(&tracks, "fre"), None);
         assert_eq!(in_language(&tracks, ""), None);
     }
