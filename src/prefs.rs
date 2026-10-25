@@ -18,6 +18,7 @@ const HEADER: &str = "# myvlc settings v1";
 /// A list of choices: (stored key, label).
 pub type Choices = &'static [(&'static str, &'static str)];
 
+pub const THEME: Choices = &[("dark", "Dark"), ("light", "Light"), ("system", "System")];
 pub const AUTO_HIDE: Choices = &[
     ("always", "Always"),
     ("fullscreen", "In fullscreen only"),
@@ -61,6 +62,11 @@ pub const COLORS: [(u32, &str); 8] = [
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Prefs {
+    // General.
+    /// Index into `THEME`.
+    pub theme: usize,
+    /// One of `ui::theme::ACCENTS`, or any colour a hand edit put there.
+    pub accent: u32,
     // Interface.
     pub on_top: bool,
     pub remember_window: bool,
@@ -129,6 +135,8 @@ impl Default for Prefs {
     fn default() -> Self {
         let caption = CaptionStyle::default();
         Prefs {
+            theme: 0,
+            accent: crate::ui::theme::DEFAULT_ACCENT,
             on_top: false,
             remember_window: true,
             window: None,
@@ -191,6 +199,8 @@ impl Prefs {
         let key = |list: Choices, i: usize| list.get(i).map_or("", |c| c.0);
         let mut out = format!("{HEADER}\n");
         let mut line = |k: &str, v: String| _ = writeln!(out, "{k} = {v}");
+        line("theme", key(THEME, self.theme).into());
+        line("accent", format!("#{:06X}", self.accent));
         line("on_top", self.on_top.to_string());
         line("remember_window", self.remember_window.to_string());
         if let Some(([x, y, w, h], max)) = self.window {
@@ -293,6 +303,8 @@ fn parse(text: &str) -> Prefs {
             }
         };
         match k {
+            "theme" => choice(&mut p.theme, THEME),
+            "accent" => colour(&mut p.accent),
             "on_top" => flag(&mut p.on_top),
             "remember_window" => flag(&mut p.remember_window),
             "window" => {
@@ -373,6 +385,8 @@ mod tests {
     #[test]
     fn saves_and_loads_every_setting() {
         let p = Prefs {
+            theme: 2,
+            accent: 0x144297,
             on_top: true,
             window: Some(([-1200, 40, 1600, 900], true)),
             auto_hide: 1,

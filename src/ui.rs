@@ -10,6 +10,7 @@ pub mod dialog;
 pub mod panels;
 pub mod preferences;
 pub mod queue;
+pub mod theme;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -929,7 +930,9 @@ fn clock_text(seconds: f64) -> String {
     format!("{:02}:{:02}:{:02}", s / 3600, s / 60 % 60, s % 60)
 }
 
+/// A design colour in the active theme (see [`theme`]).
 fn color(rgb: u32, alpha: f32) -> D2D1_COLOR_F {
+    let rgb = theme::map(rgb);
     let c = |shift: u32| ((rgb >> shift) & 0xFF) as f32 / 255.0;
     D2D1_COLOR_F {
         r: c(16),
@@ -968,7 +971,12 @@ macro_rules! icons {
         struct Icons { $($name: Svg),* }
         impl Icons {
             fn load(ctx: &ID2D1DeviceContext5) -> Result<Self> {
-                Ok(Icons { $($name: svg(ctx, include_bytes!(concat!("../assets/icons/", $file)))?),* })
+                let mut icons = Icons { $($name: svg(ctx, include_bytes!(concat!("../assets/icons/", $file)))?),* };
+                // VLC's cone stays orange whatever the accent, and the volume meter's green to red
+                // is a level scale, not the accent.
+                icons.logo = svg_as_is(ctx, include_bytes!("../assets/icons/logo.svg"))?;
+                icons.volume_fill = svg_as_is(ctx, include_bytes!("../assets/icons/volume_fill.svg"))?;
+                Ok(icons)
             }
         }
     };
@@ -1042,8 +1050,14 @@ impl ActiveIcons {
     }
 }
 
-/// Parses an icon exported from Figma. The viewport is the root element's width and height.
+/// Parses an icon exported from Figma, in the active theme's colours.
 fn svg(ctx: &ID2D1DeviceContext5, bytes: &[u8]) -> Result<Svg> {
+    let text = std::str::from_utf8(bytes).map_err(|_| Error::from(E_FAIL))?;
+    svg_as_is(ctx, theme::svg(text).as_bytes())
+}
+
+/// Parses an icon exported from Figma. The viewport is the root element's width and height.
+fn svg_as_is(ctx: &ID2D1DeviceContext5, bytes: &[u8]) -> Result<Svg> {
     let text = std::str::from_utf8(bytes).map_err(|_| Error::from(E_FAIL))?;
     let attr = |name: &str| -> f32 {
         let start = text
@@ -1157,6 +1171,7 @@ pub struct Painter {
     captions: crate::captions::CaptionRenderer,
     stats_text: IDWriteTextFormat,
     stats_bg: ID2D1SolidColorBrush,
+    stats_fg: ID2D1SolidColorBrush,
     /// Where the renderer put the picture this frame (after crop, zoom and rotation), in DIPs.
     pub picture: Option<Rect>,
 }
@@ -1204,13 +1219,27 @@ impl Painter {
                 }
                 f
             },
-            stats_bg: unsafe { ctx.CreateSolidColorBrush(&color(0x000000, 0.6), None)? },
+            // Over the video, so the same in every theme.
+            stats_bg: brush(0x000000, 0.6)?,
+            stats_fg: brush(theme::fixed(FG_A2), 1.0)?,
             picture: None,
             factory,
             dwrite,
             thumbs: HashMap::new(),
             wanted: Vec::new(),
         })
+    }
+
+    pub fn factory(&self) -> ID2D1Factory1 {
+        self.factory.clone()
+    }
+
+    /// Takes what a painter made in another theme has that isn't colour: thumbnails, the
+    /// current captions and where the picture is.
+    pub fn carry_over(&mut self, old: &mut Painter) {
+        std::mem::swap(&mut self.thumbs, &mut old.thumbs);
+        std::mem::swap(&mut self.captions, &mut old.captions);
+        self.picture = old.picture;
     }
 
     /// Width of `text` in DIPs when set in `format`.
@@ -1325,7 +1354,7 @@ impl Painter {
                     &utf16,
                     &self.stats_text,
                     &r.inset(10.0).d2d(),
-                    &self.fg,
+                    &self.stats_fg,
                     D2D1_DRAW_TEXT_OPTIONS_CLIP,
                     DWRITE_MEASURING_MODE_NATURAL,
                 );

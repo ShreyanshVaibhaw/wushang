@@ -705,6 +705,7 @@ impl App {
         }
         apply_effects(&self.audio, Some(&old), &new);
         self.caption = new.caption();
+        ui::theme::set(theme_of(&new));
         PREFS.set(new);
         self.prefs_changed = Some(Instant::now());
     }
@@ -768,6 +769,18 @@ fn set_topmost(hwnd: HWND, on: bool) {
 
 /// The settings window opened at `category`, with the output devices as the tracks panel
 /// lists them.
+/// The colours `p` asks for; "System" follows Windows' app mode.
+fn theme_of(p: &Prefs) -> ui::theme::Theme {
+    ui::theme::Theme {
+        light: match p.theme {
+            1 => true,
+            2 => ui::theme::system_light(),
+            _ => false,
+        },
+        accent: p.accent,
+    }
+}
+
 fn open_preferences(app: &App, category: Category) {
     UI.with_borrow_mut(|ui| ui.open_preferences(prefs(), app.devices.clone(), category));
 }
@@ -815,6 +828,7 @@ fn run() -> Result<(), Box<dyn Error>> {
     apply_effects(&audio, None, &settings);
     shared.set_volume(settings.startup_volume());
     library::SHOW_HIDDEN.store(settings.show_hidden, Relaxed);
+    ui::theme::set(theme_of(&settings));
     UI.with_borrow_mut(|ui| {
         ui.auto_hide = settings.auto_hide;
         ui.hide_after = Duration::from_secs_f32(settings.hide_after);
@@ -2193,6 +2207,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             };
         }
         WM_SIZE => RESIZED.store(true, Relaxed),
+        // Windows switched between light and dark apps.
+        WM_SETTINGCHANGE if prefs().theme == 2 => {
+            ui::theme::set(theme_of(&prefs()));
+            UI.with_borrow_mut(|ui| ui.dirty = true);
+        }
         WM_MOUSEMOVE | WM_NCMOUSEMOVE => {
             let (mut x, mut y) = mouse_position(lparam);
             if msg == WM_NCMOUSEMOVE {

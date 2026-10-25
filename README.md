@@ -101,9 +101,13 @@ The window opens the way it was launched, so a shortcut set to "Run: Minimized",
 ### Settings
 
 Ctrl+P or Settings in the "..." menu opens the Settings window from the design's "Settings" frames: categories on the left, their options on the right, and a search box that finds an option in any category.
-Every option it lists does something; the design's categories with nothing behind them yet (General, Network, Recording, Extensions) are dimmed.
+Every option it lists does something; the design's categories with nothing behind them yet (Network, Recording, Extensions) are dimmed.
 Changes apply at once and are kept in `settings.txt` next to the library state.
 
+- General: dark, light or system theme, and the accent colour.
+  The design has one light frame, and myvlc turns every screen light from it, so menus, panels and dialogs follow the same greys.
+  System follows the Windows "app mode" setting and switches when it changes.
+  The accent replaces the design's orange everywhere except the VLC cone and the volume meter.
 - Interface: keep the window above others, remember its size and position, and when and how fast the controls hide.
 - Privacy: whether recently played files are saved, and a button that clears the history.
 - Controls: the four skip lengths, what a click, a double-click and the wheel do on the video, and the keyboard shortcuts.

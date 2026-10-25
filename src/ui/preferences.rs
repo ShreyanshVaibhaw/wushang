@@ -3,9 +3,10 @@
 //! copy of `Prefs`; each change goes out whole as [`PrefsAction::Changed`], and main.rs applies
 //! and saves it.
 //!
-//! Only settings myvlc acts on are listed. General, Network, Recording and Extensions have none
-//! yet and show dimmed, like the panels' disabled rows; the design's (i) marks are left out, as
-//! there is nothing behind them. Sizes are DIPs from the 1046x864 frames. On a short window the
+//! Only settings myvlc acts on are listed. Network, Recording and Extensions have none yet and
+//! show dimmed, like the panels' disabled rows. General has the design's theme and accent rows
+//! but not its interface language, as there is only English. The design's (i) marks are left
+//! out, as there is nothing behind them. Sizes are DIPs from the 1046x864 frames. On a short window the
 //! frame gets shorter first (the options scroll, the sidebar tightens), then scales down.
 
 use std::time::Instant;
@@ -98,6 +99,7 @@ impl Category {
             Category::Subtitles => "Subtitle Defaults",
             Category::Library => "Playlists, Folders & Files",
             Category::Performance => "Performance Settings",
+            Category::General => "Global Settings",
             _ => "Settings",
         }
     }
@@ -106,7 +108,7 @@ impl Category {
     fn enabled(self) -> bool {
         !matches!(
             self,
-            Category::General | Category::Network | Category::Recording | Category::Extensions
+            Category::Network | Category::Recording | Category::Extensions
         )
     }
 
@@ -131,6 +133,8 @@ pub enum PrefsAction {
 /// Every option the window shows.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Ctl {
+    Theme,
+    Accent,
     OnTop,
     RememberWindow,
     AutoHide,
@@ -349,6 +353,8 @@ impl Ctl {
     fn current(self, p: &Prefs, devices: &[String]) -> Option<usize> {
         let colour = |c: u32| prefs::COLORS.iter().position(|(rgb, _)| *rgb == c);
         match self {
+            Ctl::Theme => Some(p.theme),
+            Ctl::Accent => theme::ACCENTS.iter().position(|a| *a == p.accent),
             Ctl::AutoHide => Some(p.auto_hide),
             Ctl::Skip(i) => {
                 let s = p.skip[usize::from(i)];
@@ -384,6 +390,12 @@ impl Ctl {
 
     fn pick(self, p: &mut Prefs, i: usize, devices: &[String]) {
         match self {
+            Ctl::Theme => p.theme = i.min(prefs::THEME.len() - 1),
+            Ctl::Accent => {
+                if let Some(a) = theme::ACCENTS.get(i) {
+                    p.accent = *a;
+                }
+            }
             Ctl::AutoHide => p.auto_hide = i,
             Ctl::Skip(n) => {
                 if let Some(s) = prefs::SKIPS.get(i) {
@@ -481,6 +493,11 @@ const CTRL_L: f32 = 705.0;
 const CTRL_R: f32 = W - 24.0;
 const RADIUS: f32 = 8.0;
 const LIST_ROW: f32 = 36.0;
+const SEGMENT_GAP: f32 = 3.0;
+/// The accent swatches, their selection box and the strip's inset, from "Settings - global".
+const SWATCH: f32 = 20.0;
+const SWATCH_BOX: f32 = 30.0;
+const SWATCH_PAD: f32 = 6.0;
 const LIST_PAD: f32 = 6.0;
 
 // Sampled from the "Settings - playback" frame.
@@ -563,6 +580,8 @@ pub enum Target {
     Ctl(Ctl),
     /// A row of the open choice list.
     Choice(usize),
+    /// One segment or swatch of a row of them.
+    Pick(Ctl, usize),
 }
 
 #[derive(Clone, Debug)]
@@ -577,6 +596,10 @@ enum Kind {
     Slider(usize),
     Ticks(&'static [&'static str]),
     Button(&'static str),
+    /// Side-by-side choices, the selected one lit, as the design's Dark / Light / System.
+    Segments(Choices),
+    /// The accent colours in a strip.
+    Swatches,
     /// "No settings match", centred.
     Empty,
 }
@@ -595,8 +618,42 @@ impl Row {
             && self.ctl.is_some()
             && matches!(
                 self.kind,
-                Kind::Toggle | Kind::Choice | Kind::Slider(_) | Kind::Button(_)
+                Kind::Toggle
+                    | Kind::Choice
+                    | Kind::Slider(_)
+                    | Kind::Button(_)
+                    | Kind::Segments(_)
+                    | Kind::Swatches
             )
+    }
+
+    /// The segments or swatch cells of a row of them, by index.
+    fn picks(&self) -> Vec<Rect> {
+        let b = self.r;
+        match self.kind {
+            Kind::Segments(list) => {
+                let n = list.len() as f32;
+                let w = (b.w() - SEGMENT_GAP * (n - 1.0)) / n;
+                (0..list.len())
+                    .map(|i| {
+                        let l = b.l + (w + SEGMENT_GAP) * i as f32;
+                        Rect::new(l, b.t, l + w, b.b)
+                    })
+                    .collect()
+            }
+            Kind::Swatches => {
+                let n = theme::ACCENTS.len();
+                let pitch = (b.w() - 2.0 * SWATCH_PAD - SWATCH) / (n - 1) as f32;
+                let cy = (b.t + b.b) / 2.0;
+                (0..n)
+                    .map(|i| {
+                        let cx = b.l + SWATCH_PAD + SWATCH / 2.0 + pitch * i as f32;
+                        Rect::around(cx, cy, SWATCH_BOX)
+                    })
+                    .collect()
+            }
+            _ => Vec::new(),
+        }
     }
 
     fn hit_rect(&self) -> Rect {
@@ -670,13 +727,19 @@ impl Geometry {
             return Target::Category(*c);
         }
         if self.content.contains(x, y)
-            && let Some(ctl) = self
+            && let Some(row) = self
                 .rows
                 .iter()
                 .rev()
                 .find(|r| r.clickable() && r.hit_rect().contains(x, y))
-                .and_then(|r| r.ctl)
+            && let Some(ctl) = row.ctl
         {
+            if matches!(row.kind, Kind::Segments(_) | Kind::Swatches) {
+                return match row.picks().iter().position(|r| r.contains(x, y)) {
+                    Some(i) => Target::Pick(ctl, i),
+                    None => Target::Body,
+                };
+            }
             return Target::Ctl(ctl);
         }
         Target::Body
@@ -775,6 +838,20 @@ impl Builder<'_> {
         }
     }
 
+    fn segments(&mut self, label: &'static str, ctl: Ctl, list: Choices) {
+        if let Some(cy) = self.start(label, 23.0, 23.0, false) {
+            let r = Rect::new(CTRL_L, cy - 15.5, CTRL_R, cy + 15.5);
+            self.push(Kind::Segments(list), r, Some(ctl), false);
+        }
+    }
+
+    fn swatches(&mut self, label: &'static str, ctl: Ctl) {
+        if let Some(cy) = self.start(label, 23.0, 23.0, false) {
+            let r = Rect::new(CTRL_L, cy - 16.5, CTRL_R, cy + 16.5);
+            self.push(Kind::Swatches, r, Some(ctl), false);
+        }
+    }
+
     fn button(&mut self, label: &'static str, text: &'static str, ctl: Ctl) {
         if let Some(cy) = self.start(label, 23.0, 23.0, false) {
             let r = Rect::new(CTRL_R - 100.0, cy - 16.5, CTRL_R, cy + 16.5);
@@ -800,6 +877,11 @@ impl Builder<'_> {
         self.category = c;
         let p = self.prefs;
         match c {
+            Category::General => {
+                self.section("Appearance");
+                self.segments("Theme", Ctl::Theme, prefs::THEME);
+                self.swatches("Accent color", Ctl::Accent);
+            }
             Category::Interface => {
                 self.section("Window");
                 self.toggle("Keep window above other windows", Ctl::OnTop);
@@ -881,7 +963,7 @@ impl Builder<'_> {
                 self.section("Decoding");
                 self.choice("Hardware-accelerated decoding", Ctl::HwDecoding);
             }
-            Category::General | Category::Network | Category::Recording | Category::Extensions => {}
+            Category::Network | Category::Recording | Category::Extensions => {}
         }
     }
 }
@@ -1072,6 +1154,10 @@ impl Ui {
                 st.scroll = 0.0;
                 st.search = TextField::default();
                 None
+            }
+            Target::Pick(ctl, i) => {
+                ctl.pick(&mut st.prefs, i, &st.devices);
+                self.prefs_changed()
             }
             Target::Ctl(Ctl::ClearHistory) => Some(Action::Preferences(PrefsAction::ClearHistory)),
             Target::Ctl(Ctl::Shortcuts) => Some(Action::Preferences(PrefsAction::ShowShortcuts)),
@@ -1578,7 +1664,7 @@ impl Painter {
                     self.put(rt, &text, &r.label, tr, &r.label_fg);
                     if let Some(rgb) = swatch {
                         let sw = Rect::around(b.r - 54.0, cy, 16.0);
-                        r.swatch.SetColor(&color(rgb, 1.0));
+                        r.swatch.SetColor(&color(theme::fixed(rgb), 1.0));
                         rt.FillRoundedRectangle(&rounded(sw, 2.0), &r.swatch);
                         rt.DrawRoundedRectangle(&rounded(sw.inset(0.5), 2.0), &r.tick_fg, 1.0, None);
                     }
@@ -1588,6 +1674,42 @@ impl Painter {
                         &self.panels.chevron_down
                     };
                     self.prefs_glyph(ctx, base, chevron, b.r - 27.0, cy, 24.0);
+                }
+                Kind::Segments(list) => {
+                    let ctl = row.ctl;
+                    let current = ctl.and_then(|c| c.current(p, &st.devices));
+                    for (i, seg) in row.picks().into_iter().enumerate() {
+                        let on = current == Some(i);
+                        let (bg, fg) = if on {
+                            (&self.played, &self.accent)
+                        } else {
+                            (&r.field, &r.label_fg)
+                        };
+                        rt.FillRoundedRectangle(&rounded(seg, 6.0), bg);
+                        let picked = ctl.map(|c| Hit::Preferences(Target::Pick(c, i)));
+                        if !on && s.hover == picked {
+                            rt.FillRoundedRectangle(&rounded(seg, 6.0), &r.hover);
+                        }
+                        let text = list.get(i).map_or("", |c| c.1);
+                        self.put(rt, text, &r.centred, seg, fg);
+                    }
+                }
+                Kind::Swatches => {
+                    let ctl = row.ctl;
+                    let current = ctl.and_then(|c| c.current(p, &st.devices));
+                    rt.FillRoundedRectangle(&rounded(b, 6.0), &r.header);
+                    for (i, cell) in row.picks().into_iter().enumerate() {
+                        let picked = ctl.map(|c| Hit::Preferences(Target::Pick(c, i)));
+                        if current == Some(i) {
+                            rt.FillRoundedRectangle(&rounded(cell, 4.0), &self.played);
+                        } else if s.hover == picked {
+                            rt.FillRoundedRectangle(&rounded(cell, 4.0), &r.hover);
+                        }
+                        let (cx, cy) = centre(cell);
+                        r.swatch.SetColor(&color(theme::fixed(theme::ACCENTS[i]), 1.0));
+                        let sw = Rect::around(cx, cy, SWATCH);
+                        rt.FillRoundedRectangle(&rounded(sw, 2.0), &r.swatch);
+                    }
                 }
                 Kind::Button(text) => {
                     rt.FillRoundedRectangle(&rounded(b, 6.0), &r.button);
@@ -1751,7 +1873,7 @@ mod tests {
     fn search_finds_options_in_every_category() {
         let (layout, _) = open(Category::Playback, "color", 1080.0);
         let g = layout.preferences.as_ref().unwrap();
-        assert_eq!(labels(g), ["Text color", "Outline color"]);
+        assert_eq!(labels(g), ["Accent color", "Text color", "Outline color"]);
         assert_eq!(g.title, "Search Results");
         let (layout, _) = open(Category::Playback, "zzz", 1080.0);
         let g = layout.preferences.as_ref().unwrap();
@@ -1780,10 +1902,38 @@ mod tests {
         assert!(p.two_pass);
         // Disabled categories can't be picked.
         let g = ui.layout.preferences.as_ref().unwrap();
-        let (_, general) = g.items[0];
-        let (cx, cy) = centre(general);
+        let (network, item) = g.items[9];
+        assert_eq!(network, Category::Network);
+        let (cx, cy) = centre(item);
         let hit = g.hit(g.origin.0 + cx * g.scale, g.origin.1 + cy * g.scale);
         assert_eq!(hit, Target::Body);
+    }
+
+    #[test]
+    fn theme_and_accent_pick_by_segment_and_swatch() {
+        let mut ui = Ui::new();
+        ui.layout = Layout::new(1920.0, 1080.0, true, false);
+        ui.open_preferences(Prefs::default(), vec!["Default".into()], Category::General);
+        ui.layout.add_preferences(ui.preferences.as_ref().unwrap());
+        let g = ui.layout.preferences.as_ref().unwrap();
+        let at = |kind: fn(&Kind) -> bool, i: usize| {
+            let row = g.rows.iter().find(|r| kind(&r.kind)).unwrap();
+            let (cx, cy) = centre(row.picks()[i]);
+            g.hit(g.origin.0 + cx * g.scale, g.origin.1 + cy * g.scale)
+        };
+        let light = at(|k| matches!(k, Kind::Segments(_)), 1);
+        assert_eq!(light, Target::Pick(Ctl::Theme, 1));
+        let blue = at(|k| matches!(k, Kind::Swatches), 5);
+        assert_eq!(blue, Target::Pick(Ctl::Accent, 5));
+        // The swatches end at the controls' right edge, as the design's strip does.
+        let strip = g.rows.iter().find(|r| matches!(r.kind, Kind::Swatches)).unwrap();
+        let last = strip.picks()[8];
+        assert_eq!(centre(last).0 + SWATCH / 2.0, CTRL_R - SWATCH_PAD);
+        ui.preferences_click(light);
+        let Some(Action::Preferences(PrefsAction::Changed(p))) = ui.preferences_click(blue) else {
+            panic!("a swatch changes the settings");
+        };
+        assert_eq!((p.theme, p.accent), (1, 0x144297));
     }
 
     #[test]

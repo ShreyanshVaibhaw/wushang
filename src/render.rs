@@ -206,6 +206,8 @@ pub struct Renderer {
     painter: Painter,
     d2d: ID2D1DeviceContext5,
     lock: Option<DeviceLock>,
+    /// The colours the painter's resources were made in.
+    theme: crate::ui::theme::Theme,
     size: (u32, u32),
     processor: Option<Processor>,
     upload: Option<Upload>,
@@ -261,6 +263,7 @@ impl Renderer {
                 d2d,
                 painter,
                 lock,
+                theme: crate::ui::theme::current(),
                 size,
                 processor: None,
                 upload: None,
@@ -318,6 +321,13 @@ impl Renderer {
         dpi: f32,
         adjust: &VideoAdjust,
     ) -> Result<()> {
+        let theme = crate::ui::theme::current();
+        if theme != self.theme {
+            let mut fresh = Painter::new(&self.d2d, self.painter.factory())?;
+            fresh.carry_over(&mut self.painter);
+            self.painter = fresh;
+            self.theme = theme;
+        }
         let backbuffer: ID3D11Texture2D = unsafe { self.swapchain.GetBuffer(0)? };
         let area = to_pixels(scene.layout.video.scaled(dpi / 96.0));
         let picture = match frame {

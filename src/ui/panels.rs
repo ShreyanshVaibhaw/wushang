@@ -1532,7 +1532,7 @@ impl Painter {
                     self.put(rt, &value_text(*value), &p.text, tr, fg);
                     if let Some(rgb) = swatch {
                         let sw = Rect::around(r.r - 17.0, cy, 18.0);
-                        p.swatch.SetColor(&color(*rgb, 1.0));
+                        p.swatch.SetColor(&color(theme::fixed(*rgb), 1.0));
                         rt.FillRoundedRectangle(&rounded(sw, 2.0), &p.swatch);
                         rt.DrawRoundedRectangle(&rounded(sw.inset(0.5), 2.0), &p.dim, 1.0, None);
                     }
