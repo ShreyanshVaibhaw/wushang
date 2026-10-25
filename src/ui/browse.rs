@@ -389,7 +389,9 @@ pub(super) fn layout(p: &Painter, width: f32, height: f32, b: &Browse, card: boo
         buttons.push((Hit::AddHere, Rect::around(w - 68.0, HEADER_CY, 32.0)));
     }
     let search_r = w - if add { 101.0 } else { 65.0 };
-    let search = Rect::new(search_r - SEARCH_W, 60.0, search_r, 95.0);
+    // The design's 323 DIPs from 1615 wide; narrower windows give the breadcrumb the room.
+    let search_w = (w * 0.2).clamp(160.0, SEARCH_W);
+    let search = Rect::new(search_r - search_w, 60.0, search_r, 95.0);
     buttons.push((Hit::Search, search));
     buttons.push((
         Hit::ViewMode,
