@@ -308,7 +308,10 @@ impl Browse {
 
     /// Whether the header shows "+": adding a folder or creating a playlist.
     pub fn can_add(&self) -> bool {
-        matches!(self.place, Place::Videos | Place::Music | Place::Playlists)
+        matches!(
+            self.place,
+            Place::Videos | Place::Music | Place::Playlists | Place::Playlist(_)
+        )
     }
 }
 

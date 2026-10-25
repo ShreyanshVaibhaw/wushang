@@ -21,7 +21,7 @@ The library page follows the redesign's library frames.
 The sidebar has Home, Videos, Music, Network, Playlists and Recent, plus "Add item", which adds a folder through the system folder picker.
 On first run Videos and Music start with your Windows Videos and Music folders.
 Folders open in place, with back and forward arrows and a breadcrumb that shortens to "..." when the window is narrow.
-The header shows the item count, sort order (the orange dot means reversed), grid or list view, and a search box that filters the page as you type.
+The header shows the item count, the sort menu (unwatched or watched first, newest or oldest, title or artist; the orange dot means it isn't title A-Z), grid or list view, and a search box that filters the page as you type.
 Thumbnails come from a frame at 10% of each video, and audio files show their embedded cover.
 A bar under a thumbnail shows how much of it you watched, and finished files are dimmed.
 Music also has Songs, Albums, Artists and Genres, built from the files' tags.
@@ -34,7 +34,15 @@ Esc or the folder name in the player's title bar goes back to the library, and t
 In the player, the sidebar button opens the design's overlay panel over the video: a rail of section icons and a compact list of the same library, with history, breadcrumb and sort.
 Clicking a file there plays it with the panel still open; a click on the video or Esc closes it, and the arrow button at its top right opens the full library page.
 Dropping a file on the window plays it, or adds it to the playlist on screen.
-"Create playlist" makes "Playlist 1", "Playlist 2" and so on; playlists are standard M3U files.
+"Create playlist" and the header's + open the New Playlist dialog from the design: a name, an optional thumbnail picture, and files picked or dropped on the window.
+On a playlist's page the header's + adds files to it.
+Playlists are standard M3U files.
+
+Right-click a file, folder or playlist (on the library page or in the player's sidebar panel) for the design's context menus:
+- files: play, mark as watched, favourite, add to the queue or a playlist, show in File Explorer, go to its folder, add a subtitle file, properties, and remove from the playlist when on a playlist's page;
+- folders: add files or a folder, rescan, info;
+- playlists: play, shuffle, favourite, export as M3U, add to the queue, rename (Properties & Metadata), delete.
+Favourites appear first on Home.
 
 Library state (folders, recent files and positions, visit and play counts) lives in `%APPDATA%\myvlc`, or in the folder named by the `MYVLC_HOME` environment variable, which never seeds your own folders and suits tests.
 
@@ -44,7 +52,9 @@ The player has the redesign's own title bar and control bar.
 Click play/pause, previous (restart, or the previous file within the first 3 seconds), next, the seek bar, the volume wedge (up to 200%, like VLC) and the speaker (mute).
 The title bar has minimize, maximize, fullscreen and close, and dragging it moves the window.
 While playing, the bars hide after 3 seconds without mouse movement and the video fills the window inside a 10 px rounded frame; moving the mouse brings them back.
-The "…" button is drawn but does nothing yet; it arrives in a later stage.
+The "…" button opens the main menu from the design: open files, open a folder, recent files, keyboard shortcuts, playback settings and About.
+Right-clicking the video opens the player menu: play, stop, previous, next, hide the controls, and submenus for speed and sleep timer, video tracks and transforms, audio tracks, stereo mode and output device, subtitles, the settings tabs, the queue, and opening media.
+Items for features myvlc doesn't have (network streams, discs, capture devices, converting, recording, profiles, customizing the player) are shown dimmed.
 
 The playlist button opens the queue panel from the design, in the settings panel's place, with three tabs:
 
@@ -75,9 +85,15 @@ Switching tracks and seeking land on the exact moment: the decoders read from th
 | ↑ / ↓, mouse wheel | Volume (the wheel scrolls in the library) |
 | M | Mute |
 | F or double-click the video | Borderless fullscreen |
-| Esc | Leave fullscreen, or go to the library |
+| Esc | Close a menu, panel or dialog, leave fullscreen, or go to the library |
 | Backspace | Back, in the library |
-| Q | Quit |
+| S / P / N | Stop, previous file, next file |
+| Ctrl+O / Ctrl+F | Open files / open a folder |
+| Ctrl+P | Playback settings |
+| Ctrl+\ | Hide the controls until the mouse moves |
+| Ctrl+I | Properties of the file playing, or of the file under the pointer |
+| F1 / Shift+F1 | Keyboard shortcuts / About |
+| Q, Ctrl+Q | Quit |
 
 The window opens the way it was launched, so a shortcut set to "Run: Minimized", or a script that asks for minimized without activation, never takes focus.
 
@@ -242,9 +258,9 @@ Each of these is marked with a `ponytail:` comment in the code, along with the u
 - A video stream that fails its first 60 packets counts as undecodable, and playback goes on with audio only.
 - The music tag index isn't saved, so Albums, Artists and Genres fill in a moment after each start.
 - Thumbnails stay in memory for the whole run, about 350 KB each.
-- Playlists can't be renamed yet, and Network, Podcasts and Radio do nothing.
+- Network, Podcasts and Radio do nothing.
 - The folder picker is modal, so the video pauses on screen while it is open (audio keeps playing).
-- A queue row's "…" removes it, until the file context menu arrives.
+- A queue row's "…" removes it rather than opening a menu.
 
 ## Licence of the build
 

@@ -70,8 +70,7 @@ impl Queue {
         self.current
     }
 
-    // The menus' queue items read these after the merge; until then only the tests do.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn current_path(&self) -> Option<&Path> {
         self.current.map(|i| self.items[i].as_path())
     }
@@ -84,13 +83,13 @@ impl Queue {
         self.shuffle
     }
 
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn is_empty(&self) -> bool {
         self.items.is_empty()
     }
 
     /// Makes the first item at `path` the current one. False when the queue doesn't have it.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn set_current(&mut self, path: &Path) -> bool {
         match self.items.iter().position(|p| p == path) {
             Some(i) => {
@@ -182,7 +181,7 @@ impl Queue {
 
     /// Inserts `paths` right after the current item (at the start when nothing plays), in the
     /// list and in play order, so they play next.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn insert_next(&mut self, paths: impl IntoIterator<Item = PathBuf>) {
         let paths: Vec<PathBuf> = paths.into_iter().collect();
         let k = paths.len();
@@ -271,7 +270,7 @@ impl Queue {
         self.remap(|i| new_of[i]);
     }
 
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn clear(&mut self) {
         self.items.clear();
         self.order.clear();

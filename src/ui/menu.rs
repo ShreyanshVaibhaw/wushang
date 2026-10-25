@@ -91,6 +91,9 @@ pub enum MenuAction {
     ExportPlaylist(String),
     FavoritePlaylist(String),
     RenamePlaylist(String),
+    DeletePlaylist(String),
+    /// Takes a file out of the playlist page it was right-clicked on.
+    RemoveFromPlaylist(String, PathBuf),
     Sort(SortMode),
 }
 
@@ -160,6 +163,7 @@ menu_icons! {
     Resync = "menu_resync.svg",
     Add = "nav_add.svg",
     GoTo = "arrow_right.svg",
+    Delete = "menu_delete.svg",
 }
 
 /// One row of a menu, or a divider line.
@@ -903,14 +907,16 @@ pub fn player_menu(d: &PanelData, paused: bool) -> Vec<Item> {
 }
 
 /// The context menu of a library entry: files, folders and playlists have their own. `playlists`
-/// fills "Add to Playlist"; `items` are a playlist's files.
+/// fills "Add to Playlist"; `items` are a playlist's files; `within` is the playlist page the
+/// entry is on, which adds "Remove from Playlist".
 pub fn entry_menu(
     entry: &Entry,
     playlists: &[String],
     items: &[PathBuf],
+    within: Option<&str>,
 ) -> Option<(Kind, Vec<Item>)> {
     match entry {
-        Entry::Media { path, .. } => Some((Kind::File, file_menu(path, playlists))),
+        Entry::Media { path, .. } => Some((Kind::File, file_menu(path, playlists, within))),
         Entry::Folder {
             place: Place::Playlist(name),
             ..
@@ -920,7 +926,7 @@ pub fn entry_menu(
     }
 }
 
-fn file_menu(path: &Path, playlists: &[String]) -> Vec<Item> {
+fn file_menu(path: &Path, playlists: &[String], within: Option<&str>) -> Vec<Item> {
     let one = || vec![path.to_owned()];
     let mut add: Vec<Item> = playlists
         .iter()
@@ -930,7 +936,7 @@ fn file_menu(path: &Path, playlists: &[String]) -> Vec<Item> {
         add.push(Item::divider());
     }
     add.push(Item::new("New Playlist...", MenuAction::NewPlaylist(one())));
-    vec![
+    let mut items = vec![
         Item::new("Play", MenuAction::Play(path.to_owned())).icon(Icon::Play),
         Item::new("Mark as Watched", MenuAction::MarkWatched(path.to_owned())).icon(Icon::Watched),
         Item::new("Favorite", MenuAction::Favorite(path.to_owned())).icon(Icon::Heart),
@@ -957,7 +963,12 @@ fn file_menu(path: &Path, playlists: &[String]) -> Vec<Item> {
             MenuAction::Properties(path.to_owned()),
         )
         .icon(Icon::Info),
-    ]
+    ];
+    if let Some(name) = within {
+        let remove = MenuAction::RemoveFromPlaylist(name.to_owned(), path.to_owned());
+        items.insert(7, Item::new("Remove from Playlist", remove).icon(Icon::Delete));
+    }
+    items
 }
 
 fn folder_menu(place: &Place) -> Vec<Item> {
@@ -999,6 +1010,8 @@ fn playlist_menu(name: &str, items: &[PathBuf]) -> Vec<Item> {
         Item::off("Add Subtitle Tracks").icon(Icon::Subtitle),
         Item::off("Add Audio Tracks").icon(Icon::Audio),
         Item::new("Properties & Metadata", MenuAction::RenamePlaylist(name())).icon(Icon::Info),
+        Item::divider(),
+        Item::new("Delete Playlist", MenuAction::DeletePlaylist(name())).icon(Icon::Delete),
     ]
 }
 

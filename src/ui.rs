@@ -6,6 +6,7 @@
 
 mod browse;
 pub mod menu;
+pub mod dialog;
 pub mod panels;
 pub mod queue;
 
@@ -15,6 +16,7 @@ use std::time::{Duration, Instant};
 
 pub use browse::Browse;
 pub use menu::MenuAction;
+pub use dialog::{Dialog, DialogAction};
 pub use panels::{Panel, PanelAction, PanelData, TrackTab};
 pub use queue::{QueueAction, QueueData, QueueItem};
 use windows::Win32::Foundation::E_FAIL;
@@ -176,6 +178,8 @@ pub enum Hit {
     Queue(queue::Target),
     /// An open menu, over everything else.
     Menu(menu::Target),
+    /// The open dialog, which takes every click.
+    Dialog(dialog::Target),
 }
 
 impl Hit {
@@ -208,6 +212,7 @@ pub struct Layout {
     panels: panels::Geometry,
     queue: queue::Geometry,
     menu: menu::Geometry,
+    dialog: Option<dialog::Geometry>,
 }
 
 impl Layout {
@@ -262,6 +267,7 @@ impl Layout {
             panels: Default::default(),
             queue: Default::default(),
             menu: Default::default(),
+            dialog: None,
         }
     }
 
@@ -282,6 +288,9 @@ impl Layout {
     }
 
     pub fn hit(&self, x: f32, y: f32) -> Option<Hit> {
+        if let Some(d) = &self.dialog {
+            return Some(Hit::Dialog(d.hit(x, y)));
+        }
         if let Some(target) = self.menu.hit(x, y) {
             return Some(Hit::Menu(target));
         }
@@ -337,6 +346,7 @@ pub enum Action {
     /// Opens the menu for what was clicked (the "..." button, the sort button, the video or an
     /// entry) at (x, y); main.rs builds it, because it needs the library and the open file.
     OpenMenu(Hit, f32, f32),
+    Dialog(DialogAction),
 }
 
 /// Pointer state. Lives on the UI thread; the window procedure feeds it and the render loop
@@ -367,6 +377,8 @@ pub struct Ui {
     pub menu: menu::State,
     /// Hide UI (Ctrl+\): the bars stay hidden until the mouse moves.
     hidden: bool,
+    /// The open dialog, if any.
+    pub dialog: Option<dialog::State>,
 }
 
 /// Two presses on a slider this close together reset it.
@@ -392,6 +404,7 @@ impl Ui {
             last_slider: None,
             menu: menu::State::default(),
             hidden: false,
+            dialog: None,
         }
     }
 
@@ -531,6 +544,7 @@ impl Ui {
             || self.overlay
             || self.panels.open.is_some()
             || self.queue.open
+            || self.dialog.is_some()
             || paused
             || self.drag.is_some()
             || self.hover.is_some_and(Hit::in_bars)
@@ -584,6 +598,7 @@ impl Ui {
                 x - self.layout.volume.l,
             ))),
             Some(Hit::Popup(panels::Target::Ctl(ctl))) => self.slide(ctl, x),
+            Some(Hit::Dialog(_)) => self.dialog_drag(x),
             _ => {
                 self.queue_drag(y);
                 None
@@ -635,6 +650,7 @@ impl Ui {
                 self.drag = Some(hit);
                 self.slide(ctl, x)
             }
+            Some(Hit::Dialog(target)) => self.dialog_down(target, x),
             _ => None,
         }
     }
@@ -664,6 +680,7 @@ impl Ui {
             None => match hit {
                 Some(Hit::Caption | Hit::Seek | Hit::Volume | Hit::Panel) => None,
                 Some(Hit::Popup(target)) => self.panel_click(target),
+                Some(Hit::Dialog(target)) => self.dialog_click(target),
                 Some(Hit::Queue(target)) => self.queue_click(target),
                 Some(Hit::Playlist) => {
                     self.toggle_queue();
@@ -827,6 +844,8 @@ pub struct Scene<'a> {
     pub panel: Option<&'a PanelData>,
     /// What the queue panel shows, while it is open.
     pub queue: Option<&'a QueueData>,
+    /// The open dialog's text, files and caret.
+    pub dialog: Option<&'a dialog::State>,
     /// Subtitle cues to show now, and how.
     pub cues: &'a [crate::subs::Cue],
     pub caption_style: &'a crate::captions::CaptionStyle,
@@ -1084,6 +1103,7 @@ pub struct Painter {
     panels: panels::Resources,
     queue: queue::Resources,
     menu: menu::Resources,
+    dialog: dialog::Resources,
     /// Thumbnails by file; None means the file has no picture.
     thumbs: HashMap<PathBuf, Option<ID2D1Bitmap>>,
     /// Visible files without a thumbnail yet, collected while painting.
@@ -1121,6 +1141,7 @@ impl Painter {
             panels: panels::Resources::new(ctx, &dwrite, &fonts)?,
             queue: queue::Resources::new(ctx, &dwrite, &fonts)?,
             menu: menu::Resources::new(ctx, &dwrite, &fonts)?,
+            dialog: dialog::Resources::new(ctx, &factory, &dwrite, &fonts)?,
             captions: crate::captions::CaptionRenderer::new(ctx, &dwrite, Some(&fonts))?,
             stats_text: {
                 let f = text_format(
@@ -1204,11 +1225,14 @@ impl Painter {
     }
 
     /// Paints the interface over the video, which the renderer has already drawn into the
-    /// video area. Runs between BeginDraw and EndDraw.
+    /// video area, and the open dialog over both. Runs between BeginDraw and EndDraw.
     pub fn paint(&mut self, ctx: &ID2D1DeviceContext5, s: &Scene) -> Result<()> {
         self.paint_page(ctx, s)?;
         unsafe { self.menu(ctx, s) };
-        Ok(())
+        match (&s.layout.dialog, s.dialog) {
+            (Some(g), Some(d)) => self.paint_dialog(ctx, s, g, d),
+            _ => Ok(()),
+        }
     }
 
     fn paint_page(&mut self, ctx: &ID2D1DeviceContext5, s: &Scene) -> Result<()> {

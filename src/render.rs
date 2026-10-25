@@ -296,6 +296,11 @@ impl Renderer {
         self.painter.add_overlay(layout, browse);
     }
 
+    /// Adds the open dialog to a layout.
+    pub fn add_dialog(&self, layout: &mut Layout, dialog: &crate::ui::dialog::State) {
+        self.painter.add_dialog(layout, dialog);
+    }
+
     pub fn add_thumbnail(&mut self, path: PathBuf, picture: Option<(u32, u32, &[u8])>) {
         self.painter.add_thumbnail(&self.d2d, path, picture);
     }
