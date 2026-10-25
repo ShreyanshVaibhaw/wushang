@@ -112,16 +112,18 @@ Change those two paths on another machine.
 
 ### Building the slim FFmpeg
 
-The script cross-compiles dav1d 1.5.4 and FFmpeg 9.0.2 for Windows from Linux or WSL with MinGW-w64.
+The script cross-compiles zlib 1.3.1, dav1d 1.5.4 and FFmpeg 9.0.2 for Windows from Linux or WSL with MinGW-w64.
 It needs these Ubuntu packages: `gcc-mingw-w64-x86-64-win32 nasm make pkg-config meson ninja-build gcc libc6-dev`.
 
 ```bash
 SRC=/mnt/d/tools/src/ffmpeg-9.0.2 DAV1D_SRC=/mnt/d/tools/src/dav1d-1.5.4 \
-  PREFIX=/mnt/d/tools/ffmpeg-9.0.2-myvlc-slim-subs bash scripts/build-ffmpeg.sh
+  ZLIB_SRC=/mnt/d/tools/src/zlib-1.3.1 PREFIX=/mnt/d/tools/ffmpeg-9.0.2-myvlc \
+  bash scripts/build-ffmpeg.sh
 ```
 
 It builds only the file protocol, 33 demuxers, 20 parsers, 50 decoders and the D3D11VA hwaccels, plus libswresample and libswscale.
 The subtitle decoders (SRT, ASS/SSA, WebVTT, MP4 text, MicroDVD, SubViewer, SAMI, DVD, DVB and PGS) and their file demuxers add 78 KB.
+zlib, linked statically into `avformat-63.dll` (43 KB more), lets the Matroska reader open tracks stored zlib-compressed, which mkvmerge does to subtitles by default; without it those files log "Unsupported encoding type" and their subtitles are lost.
 One of the decoders is libdav1d, linked statically into `avcodec-63.dll`, so AV1 plays in software on GPUs without AV1 support.
 Encoders, muxers, filters, devices, networking and the command-line programs are left out.
 x86 assembly stays on, so software decoding is as fast as in a full build.
