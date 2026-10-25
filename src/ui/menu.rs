@@ -54,6 +54,8 @@ pub enum MenuAction {
     PlayRecent(PathBuf),
     /// Opens the settings panel at a tab.
     Settings(SettingsTab),
+    /// Opens the Settings window at a category.
+    Preferences(crate::ui::Category),
     ShowShortcuts,
     ShowAbout,
     Quit,
@@ -686,8 +688,8 @@ impl Geometry {
     }
 }
 
-/// The title bar's "..." menu. `recent` is the newest first; Settings needs an open file.
-pub fn main_menu(recent: &[PathBuf], playing: bool) -> Vec<Item> {
+/// The title bar's "..." menu. `recent` is the newest first.
+pub fn main_menu(recent: &[PathBuf]) -> Vec<Item> {
     let recent = recent
         .iter()
         .take(10)
@@ -716,10 +718,12 @@ pub fn main_menu(recent: &[PathBuf], playing: bool) -> Vec<Item> {
         Item::submenu("Profile (Movies)", Vec::new()).icon(Icon::Profile),
         Item::new("Keyboard Shortcuts", MenuAction::ShowShortcuts).icon(Icon::Keyboard),
         Item::off("Customize Player").icon(Icon::Brush),
-        Item::new("Settings", MenuAction::Settings(SettingsTab::Playback))
-            .icon(Icon::Settings)
-            .key("Ctrl + P")
-            .enabled(playing),
+        Item::new(
+            "Settings",
+            MenuAction::Preferences(crate::ui::Category::Playback),
+        )
+        .icon(Icon::Settings)
+        .key("Ctrl + P"),
         Item::new("About myvlc", MenuAction::ShowAbout)
             .icon(Icon::Info)
             .key("Shift + F1"),
@@ -1251,7 +1255,7 @@ mod tests {
     #[test]
     fn layout_follows_the_design_rows() {
         let mut s = State::default();
-        s.open(Kind::Main, main_menu(&[], true), 51.0, 38.0);
+        s.open(Kind::Main, main_menu(&[]), 51.0, 38.0);
         let g = Geometry::new(&s, 1600.0, 900.0);
         let level = &g.levels[0];
         // 12 rows of 48 and one divider, inside 4 DIPs of padding: the design's 375 x 585.
@@ -1324,9 +1328,9 @@ mod tests {
         assert!(playback.iter().find(|i| i.label == "1.5x").unwrap().checked);
         assert!(!items[4].enabled, "Record");
 
-        // Settings needs an open file; Open Recent needs recent files.
-        let main = main_menu(&[], false);
-        assert!(!main.iter().find(|i| i.label == "Settings").unwrap().enabled);
+        // Settings opens without a file; Open Recent needs recent files.
+        let main = main_menu(&[]);
+        assert!(main.iter().find(|i| i.label == "Settings").unwrap().enabled);
         assert!(
             !main
                 .iter()

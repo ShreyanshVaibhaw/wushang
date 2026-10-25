@@ -6,7 +6,7 @@
 //! Drawn as in the design but disabled (dimmed, no action), because myvlc can't do them yet:
 //! Show Subtitle Timeline on Seekbar, Reverse, Audio Visualizer, HDR, Resolution, Render,
 //! Subtitle Speed, Subtitle Duration Factor, Embedded Sub Format, Subtitle Font, Text and Outline
-//! Color, the Default Preset footer and Open Advanced Settings. The external tracks' pencil and
+//! Color, and the Default Preset footer. Open Advanced Settings opens the Settings window. The external tracks' pencil and
 //! the stereo "Test" button keep their design look but do nothing.
 
 use super::*;
@@ -203,6 +203,8 @@ pub enum Ctl {
     Device(usize),
     RefreshDevices,
     ShowPreferences,
+    /// "Open Advanced Settings": the Settings window at the open tab's category.
+    AdvancedSettings,
     ShowStatistics,
     SleepTimer,
     Speed,
@@ -991,7 +993,8 @@ impl Layout {
                 };
                 b.push(preset, r, None, false, true);
                 let r = b.rect(PAD, y + 89.0, W - PAD, 24.0);
-                b.push(Kind::Link("Open Advanced Settings"), r, None, false, true);
+                let ctl = Some(Ctl::AdvancedSettings);
+                b.push(Kind::Link("Open Advanced Settings"), r, ctl, true, false);
             }
         }
 
@@ -1175,35 +1178,35 @@ pub(super) struct Resources {
     box_bg: ID2D1SolidColorBrush,
     footer_bg: ID2D1SolidColorBrush,
     heading: ID2D1SolidColorBrush,
-    label: ID2D1SolidColorBrush,
-    row: ID2D1SolidColorBrush,
+    pub(super) label: ID2D1SolidColorBrush,
+    pub(super) row: ID2D1SolidColorBrush,
     dim: ID2D1SolidColorBrush,
     knob: ID2D1SolidColorBrush,
     toggle_text_bg: ID2D1SolidColorBrush,
     field_line: ID2D1SolidColorBrush,
     divider: ID2D1SolidColorBrush,
     line: ID2D1SolidColorBrush,
-    thumb: ID2D1SolidColorBrush,
-    tick: ID2D1SolidColorBrush,
-    tick_on: ID2D1SolidColorBrush,
+    pub(super) thumb: ID2D1SolidColorBrush,
+    pub(super) tick: ID2D1SolidColorBrush,
+    pub(super) tick_on: ID2D1SolidColorBrush,
     button_bg: ID2D1SolidColorBrush,
-    list_bg: ID2D1SolidColorBrush,
-    list_line: ID2D1SolidColorBrush,
+    pub(super) list_bg: ID2D1SolidColorBrush,
+    pub(super) list_line: ID2D1SolidColorBrush,
     hover: ID2D1SolidColorBrush,
-    shadow: ID2D1SolidColorBrush,
+    pub(super) shadow: ID2D1SolidColorBrush,
     swatch: ID2D1SolidColorBrush,
     veil: ID2D1SolidColorBrush,
     tab: IDWriteTextFormat,
-    text: IDWriteTextFormat,
+    pub(super) text: IDWriteTextFormat,
     centred: IDWriteTextFormat,
     segment: IDWriteTextFormat,
     heading_font: IDWriteTextFormat,
     small_l: IDWriteTextFormat,
     small_c: IDWriteTextFormat,
     small_r: IDWriteTextFormat,
-    check: Svg,
-    chevron_down: Svg,
-    chevron_up: Svg,
+    pub(super) check: Svg,
+    pub(super) chevron_down: Svg,
+    pub(super) chevron_up: Svg,
     chevron_right: Svg,
     pencil: Svg,
     refresh: Svg,
@@ -1614,7 +1617,8 @@ impl Painter {
                     let x = cx - (w + 26.0) / 2.0;
                     self.glyph(ctx, &p.gear, x + 9.0, cy, 20.0);
                     let tr = Rect::new(x + 26.0, r.t, x + 26.0 + w + 2.0, r.b);
-                    self.put(rt, text, &p.text, tr, &p.dim);
+                    let fg = if hovered { &p.label } else { &p.dim };
+                    self.put(rt, text, &p.text, tr, fg);
                 }
             }
             // Dimmed: the panel's own background over it at 1 - DIM, which looks like the

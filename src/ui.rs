@@ -8,6 +8,7 @@ mod browse;
 pub mod menu;
 pub mod dialog;
 pub mod panels;
+pub mod preferences;
 pub mod queue;
 
 use std::collections::HashMap;
@@ -18,6 +19,7 @@ pub use browse::Browse;
 pub use menu::MenuAction;
 pub use dialog::{Dialog, DialogAction};
 pub use panels::{Panel, PanelAction, PanelData, TrackTab};
+pub use preferences::{Category, PrefsAction};
 pub use queue::{QueueAction, QueueData, QueueItem};
 use windows::Win32::Foundation::E_FAIL;
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
@@ -35,8 +37,6 @@ const CONTROL_BAR: f32 = 54.0;
 /// Gap between the window edge and the rounded video area.
 const FRAME: f32 = 10.0;
 const VIDEO_RADIUS: f32 = 10.0;
-/// While playing, the bars hide after this long without mouse movement.
-const HIDE_AFTER: Duration = Duration::from_secs(3);
 /// After a seek-bar drag, keep showing the dropped position while the seek lands.
 const SEEK_SETTLE: Duration = Duration::from_millis(600);
 
@@ -180,6 +180,8 @@ pub enum Hit {
     Menu(menu::Target),
     /// The open dialog, which takes every click.
     Dialog(dialog::Target),
+    /// The Settings window, which takes every click outside an open dialog.
+    Preferences(preferences::Target),
 }
 
 impl Hit {
@@ -213,6 +215,7 @@ pub struct Layout {
     queue: queue::Geometry,
     menu: menu::Geometry,
     dialog: Option<dialog::Geometry>,
+    preferences: Option<preferences::Geometry>,
 }
 
 impl Layout {
@@ -268,6 +271,7 @@ impl Layout {
             queue: Default::default(),
             menu: Default::default(),
             dialog: None,
+            preferences: None,
         }
     }
 
@@ -290,6 +294,9 @@ impl Layout {
     pub fn hit(&self, x: f32, y: f32) -> Option<Hit> {
         if let Some(d) = &self.dialog {
             return Some(Hit::Dialog(d.hit(x, y)));
+        }
+        if let Some(p) = &self.preferences {
+            return Some(Hit::Preferences(p.hit(x, y)));
         }
         if let Some(target) = self.menu.hit(x, y) {
             return Some(Hit::Menu(target));
@@ -347,6 +354,7 @@ pub enum Action {
     /// entry) at (x, y); main.rs builds it, because it needs the library and the open file.
     OpenMenu(Hit, f32, f32),
     Dialog(DialogAction),
+    Preferences(PrefsAction),
 }
 
 /// Pointer state. Lives on the UI thread; the window procedure feeds it and the render loop
@@ -379,6 +387,13 @@ pub struct Ui {
     hidden: bool,
     /// The open dialog, if any.
     pub dialog: Option<dialog::State>,
+    /// The open Settings window, if any.
+    pub preferences: Option<preferences::State>,
+    last_pref_slider: Option<(preferences::Ctl, Instant)>,
+    /// From Settings: when the bars hide on their own (an index of `prefs::AUTO_HIDE`), and
+    /// after how long without mouse movement.
+    pub auto_hide: usize,
+    pub hide_after: Duration,
 }
 
 /// Two presses on a slider this close together reset it.
@@ -405,6 +420,10 @@ impl Ui {
             menu: menu::State::default(),
             hidden: false,
             dialog: None,
+            preferences: None,
+            last_pref_slider: None,
+            auto_hide: 0,
+            hide_after: Duration::from_secs(3),
         }
     }
 
@@ -505,6 +524,16 @@ impl Ui {
                 p.equalizer = !p.equalizer;
                 None
             }
+            Target::Ctl(Ctl::AdvancedSettings) => {
+                use panels::SettingsTab;
+                let category = match p.open {
+                    Some(Panel::Settings(SettingsTab::Video)) => Category::Video,
+                    Some(Panel::Settings(SettingsTab::Audio)) => Category::Audio,
+                    Some(Panel::Settings(SettingsTab::Subtitles)) => Category::Subtitles,
+                    _ => Category::Playback,
+                };
+                Some(Action::Menu(MenuAction::Preferences(category)))
+            }
             Target::Ctl(Ctl::ShowPreferences) => {
                 let tab = self.layout.panels.preferences_tab();
                 p.show(Some(Panel::Settings(tab)), Some(Hit::Settings));
@@ -534,21 +563,28 @@ impl Ui {
     }
 
     /// Bars stay up while paused, while the pointer is over them or moved recently, and while
-    /// dragging; otherwise playback goes to the design's hide-UI mode.
-    pub fn bars_visible(&self, paused: bool) -> bool {
+    /// dragging; otherwise playback goes to the design's hide-UI mode. Settings can keep them
+    /// up always, or outside fullscreen.
+    pub fn bars_visible(&self, paused: bool, fullscreen: bool) -> bool {
         if self.hidden && !self.menu.is_open() {
             return false;
         }
-        self.page == Page::Library
+        let stay = match self.auto_hide {
+            1 => !fullscreen,
+            2 => true,
+            _ => false,
+        };
+        stay || self.page == Page::Library
             || self.menu.is_open()
             || self.overlay
             || self.panels.open.is_some()
             || self.queue.open
             || self.dialog.is_some()
+            || self.preferences.is_some()
             || paused
             || self.drag.is_some()
             || self.hover.is_some_and(Hit::in_bars)
-            || self.last_activity.elapsed() < HIDE_AFTER
+            || self.last_activity.elapsed() < self.hide_after
     }
 
     /// The seek position to draw instead of the clock while dragging or right after a drop.
@@ -599,6 +635,7 @@ impl Ui {
             ))),
             Some(Hit::Popup(panels::Target::Ctl(ctl))) => self.slide(ctl, x),
             Some(Hit::Dialog(_)) => self.dialog_drag(x),
+            Some(Hit::Preferences(_)) => self.preferences_drag(x),
             _ => {
                 self.queue_drag(y);
                 None
@@ -651,6 +688,7 @@ impl Ui {
                 self.slide(ctl, x)
             }
             Some(Hit::Dialog(target)) => self.dialog_down(target, x),
+            Some(Hit::Preferences(target)) => self.preferences_down(target, x),
             _ => None,
         }
     }
@@ -681,6 +719,7 @@ impl Ui {
                 Some(Hit::Caption | Hit::Seek | Hit::Volume | Hit::Panel) => None,
                 Some(Hit::Popup(target)) => self.panel_click(target),
                 Some(Hit::Dialog(target)) => self.dialog_click(target),
+                Some(Hit::Preferences(target)) => self.preferences_click(target),
                 Some(Hit::Queue(target)) => self.queue_click(target),
                 Some(Hit::Playlist) => {
                     self.toggle_queue();
@@ -707,16 +746,20 @@ impl Ui {
                     self.relayout = true;
                     Some(Action::Click(h))
                 }
-                // A click on the video closes the popup.
+                // A click on the video closes the popup; only a click that closed nothing
+                // goes on (to play or pause, if Settings say so).
                 Some(Hit::Video) => {
+                    let mut closed = false;
                     if self.panels.open.is_some() {
                         self.panels.show(None, None);
                         self.relayout = true;
+                        closed = true;
                     }
                     if self.queue.open {
                         self.toggle_queue();
+                        closed = true;
                     }
-                    Some(Action::Click(Hit::Video))
+                    (!closed).then_some(Action::Click(Hit::Video))
                 }
                 Some(h) => Some(Action::Click(h)),
                 None => None,
@@ -846,6 +889,8 @@ pub struct Scene<'a> {
     pub queue: Option<&'a QueueData>,
     /// The open dialog's text, files and caret.
     pub dialog: Option<&'a dialog::State>,
+    /// The open Settings window's settings and search.
+    pub preferences: Option<&'a preferences::State>,
     /// Subtitle cues to show now, and how.
     pub cues: &'a [crate::subs::Cue],
     pub caption_style: &'a crate::captions::CaptionStyle,
@@ -1104,6 +1149,7 @@ pub struct Painter {
     queue: queue::Resources,
     menu: menu::Resources,
     dialog: dialog::Resources,
+    prefs: preferences::Resources,
     /// Thumbnails by file; None means the file has no picture.
     thumbs: HashMap<PathBuf, Option<ID2D1Bitmap>>,
     /// Visible files without a thumbnail yet, collected while painting.
@@ -1142,6 +1188,7 @@ impl Painter {
             queue: queue::Resources::new(ctx, &dwrite, &fonts)?,
             menu: menu::Resources::new(ctx, &dwrite, &fonts)?,
             dialog: dialog::Resources::new(ctx, &factory, &dwrite, &fonts)?,
+            prefs: preferences::Resources::new(ctx, &dwrite, &fonts)?,
             captions: crate::captions::CaptionRenderer::new(ctx, &dwrite, Some(&fonts))?,
             stats_text: {
                 let f = text_format(
@@ -1229,6 +1276,9 @@ impl Painter {
     pub fn paint(&mut self, ctx: &ID2D1DeviceContext5, s: &Scene) -> Result<()> {
         self.paint_page(ctx, s)?;
         unsafe { self.menu(ctx, s) };
+        if let (Some(g), Some(p)) = (&s.layout.preferences, s.preferences) {
+            self.paint_preferences(ctx, s, g, p);
+        }
         match (&s.layout.dialog, s.dialog) {
             (Some(g), Some(d)) => self.paint_dialog(ctx, s, g, d),
             _ => Ok(()),

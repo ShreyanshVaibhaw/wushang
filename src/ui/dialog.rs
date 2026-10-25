@@ -121,8 +121,8 @@ const FG_BUTTON_OFF: u32 = 0x606060;
 // in step.
 const SHORTCUTS: [(&str, &str); 19] = [
     ("Space", "Play or pause"),
-    ("Left / Right", "Seek 10 seconds back or forward"),
-    ("Shift + Left / Right", "Seek 60 seconds back or forward"),
+    ("Left / Right", "Skip back or forward (Settings > Controls)"),
+    ("Alt / Shift / Ctrl + arrows", "Very short, medium or long skip"),
     ("Up / Down", "Volume up or down"),
     ("Mouse wheel", "Volume in the player, scroll in the library"),
     ("M", "Mute"),
@@ -135,7 +135,7 @@ const SHORTCUTS: [(&str, &str); 19] = [
     ("S / P / N", "Stop, previous file, next file"),
     ("Ctrl + O", "Open files"),
     ("Ctrl + F", "Open a folder"),
-    ("Ctrl + P", "Playback settings"),
+    ("Ctrl + P", "Settings"),
     ("Ctrl + I", "Properties of the file playing or pointed at"),
     ("Ctrl + \\", "Hide the controls until the mouse moves"),
     ("Right-click", "Player and library menus"),

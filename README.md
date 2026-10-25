@@ -75,27 +75,47 @@ The gear opens the settings panel, with four tabs:
 - Audio: track, stereo mode (stereo, mono, left, right, reverse), audio delay, and VLC's 10-band equalizer with its 18 presets and the "2 Pass" option.
 - Subtitles: track, subtitle delay and text size.
 
-Items the design shows that myvlc can't do yet (HDR, resolution, render, reverse, audio visualizer, subtitle font and colours, presets, advanced settings) are drawn dimmed.
+Items the design shows that myvlc can't do yet (HDR, resolution, render, reverse, audio visualizer, subtitle font and colours, presets) are drawn dimmed.
+"Open Advanced Settings" opens the Settings window.
 Switching tracks and seeking land on the exact moment: the decoders read from the keyframe before it and drop what comes earlier.
 
 | Key | Action |
 |---|---|
 | Space | Pause and resume |
-| ← / → | Seek 10 s (hold Shift for 60 s) |
-| ↑ / ↓, mouse wheel | Volume (the wheel scrolls in the library) |
+| ← / → | Skip back or forward: 10 s, Alt 3 s, Shift 1 min, Ctrl 5 min (all set in Settings) |
+| ↑ / ↓, mouse wheel | Volume, 10% a press (the wheel scrolls in the library) |
 | M | Mute |
 | F or double-click the video | Borderless fullscreen |
 | Esc | Close a menu, panel or dialog, leave fullscreen, or go to the library |
 | Backspace | Back, in the library |
 | S / P / N | Stop, previous file, next file |
 | Ctrl+O / Ctrl+F | Open files / open a folder |
-| Ctrl+P | Playback settings |
+| Ctrl+P | Settings |
 | Ctrl+\ | Hide the controls until the mouse moves |
 | Ctrl+I | Properties of the file playing, or of the file under the pointer |
 | F1 / Shift+F1 | Keyboard shortcuts / About |
 | Q, Ctrl+Q | Quit |
 
 The window opens the way it was launched, so a shortcut set to "Run: Minimized", or a script that asks for minimized without activation, never takes focus.
+
+### Settings
+
+Ctrl+P or Settings in the "..." menu opens the Settings window from the design's "Settings" frames: categories on the left, their options on the right, and a search box that finds an option in any category.
+Every option it lists does something; the design's categories with nothing behind them yet (General, Network, Recording, Extensions) are dimmed.
+Changes apply at once and are kept in `settings.txt` next to the library state.
+
+- Interface: keep the window above others, remember its size and position, and when and how fast the controls hide.
+- Privacy: whether recently played files are saved, and a button that clears the history.
+- Controls: the four skip lengths, what a click, a double-click and the wheel do on the video, and the keyboard shortcuts.
+- Playback: resuming where you left off, starting paused, the default speed, the preferred audio language, repeat, shuffle, and quitting at the end of the queue.
+- Video: start in fullscreen, keep the screen awake while a video plays, and the default aspect ratio.
+- Audio: output device, startup volume (or the last one), the Up/Down volume step, the equalizer preset, two-pass and stereo mode.
+- Subtitles: on or off, the preferred language, loading subtitle files on their own, and their size, weight, colour, opacity, outline and shadow.
+- Library: show hidden files and folders.
+- Performance: turn off GPU decoding.
+
+The equalizer, stereo mode, subtitle size, repeat and shuffle chosen in the panels are kept the same way.
+Speed, aspect ratio, tracks and decoding are per-file defaults, so a change there applies from the next file.
 
 ## Build requirements
 
@@ -253,6 +273,7 @@ Each of these is marked with a `ponytail:` comment in the code, along with the u
 - If the GPU can't decode a stream, the software fallback runs on one thread.
 - Audio devices must mix in f32, which every WASAPI shared-mode device seen so far does.
 - The audio callback takes a mutex.
+- Settings keep equalizer presets, not hand-tuned bands, so a custom equalizer starts off next time.
 - Network read errors end playback instead of retrying.
 - Video freezes while you drag the window edge, because Windows runs a modal resize loop.
   Audio keeps playing.

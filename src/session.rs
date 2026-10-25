@@ -56,6 +56,26 @@ struct Decoder {
     thread: JoinHandle<()>,
 }
 
+/// Which tracks a file starts with, from Settings.
+#[derive(Clone, Debug)]
+pub struct TrackChoice {
+    /// ISO 639 codes from `LANGUAGES`; empty keeps the file's own default track.
+    pub audio_language: String,
+    pub sub_language: String,
+    /// Off, no subtitle track starts, not even a forced one.
+    pub subtitles: bool,
+}
+
+impl Default for TrackChoice {
+    fn default() -> Self {
+        TrackChoice {
+            audio_language: String::new(),
+            sub_language: String::new(),
+            subtitles: true,
+        }
+    }
+}
+
 pub struct Session {
     pub path: PathBuf,
     pub frames: Arc<FrameQueue>,
@@ -87,6 +107,7 @@ impl Session {
     pub fn open(
         path: &Path,
         start: Option<f64>,
+        choice: &TrackChoice,
         shared: &Arc<Shared>,
         hw: Option<&HwDevice>,
         audio: &Arc<audio::Device>,
@@ -166,7 +187,16 @@ impl Session {
                 .map(|t| t.stream)
         };
         let video = best(TrackKind::Video, ff::media::Type::Video);
-        let audio_stream = best(TrackKind::Audio, ff::media::Type::Audio);
+        let audio_stream = in_language(&tracks[TrackKind::Audio as usize], &choice.audio_language)
+            .or_else(|| best(TrackKind::Audio, ff::media::Type::Audio));
+        let subtitles = if !choice.subtitles {
+            None
+        } else if choice.sub_language.is_empty() {
+            forced_subtitles
+        } else {
+            in_language(&tracks[TrackKind::Subtitle as usize], &choice.sub_language)
+                .or(forced_subtitles)
+        };
 
         let mut session = Session {
             path: path.to_owned(),
@@ -208,7 +238,7 @@ impl Session {
         if session.video_track.is_none() && session.audio_track.is_none() {
             return Err("no playable video or audio stream".into()); // drop stops the decoder
         }
-        session.initial_subtitles = session.route_subtitles(forced_subtitles);
+        session.initial_subtitles = session.route_subtitles(subtitles);
         if let Some(t) = start.filter(|t| *t > 0.0) {
             shared.seek_to(t);
         }
@@ -494,6 +524,23 @@ fn label_tracks(tracks: &mut [TrackInfo], titles: &[Option<String>]) {
     }
 }
 
+/// The stream of the track in `language` (an ISO 639 code), its default one if several are.
+fn in_language(tracks: &[TrackInfo], language: &str) -> Option<usize> {
+    if language.is_empty() {
+        return None;
+    }
+    let want = language_name(language);
+    let matches = |t: &&TrackInfo| {
+        t.language.as_deref().is_some_and(|code| match (language_name(code), want) {
+            (Some(a), Some(b)) => a == b,
+            _ => code.eq_ignore_ascii_case(language),
+        })
+    };
+    let mut found = tracks.iter().filter(matches);
+    let first = found.clone().next()?;
+    Some(found.find(|t| t.default).unwrap_or(first).stream)
+}
+
 /// The English name of an ISO 639-2 or 639-1 language code, also accepting tags like "en-US".
 fn language_name(code: &str) -> Option<&'static str> {
     let code = code.split(['-', '_']).next()?.to_ascii_lowercase();
@@ -505,7 +552,7 @@ fn language_name(code: &str) -> Option<&'static str> {
 
 /// The most common languages by ISO 639-2 bibliographic and terminology codes, then 639-1.
 /// ponytail: unknown codes show as the code itself; take the full ISO 639 table if that bothers anyone.
-const LANGUAGES: &[(&[&str], &str)] = &[
+pub const LANGUAGES: &[(&[&str], &str)] = &[
     (&["eng", "en"], "English"),
     (&["jpn", "ja"], "Japanese"),
     (&["fre", "fra", "fr"], "French"),
@@ -617,7 +664,7 @@ mod tests {
             // Tests play on the real device; keep them silent.
             shared.toggle_mute();
             let audio = audio::Device::open(shared.clone());
-            let session = Session::open(&clip(), None, &shared, None, &audio).unwrap();
+            let session = Session::open(&clip(), None, &TrackChoice::default(), &shared, None, &audio).unwrap();
             let rendering = Arc::new(AtomicBool::new(true));
             let renderer =
                 spawn_renderer(shared.clone(), session.frames.clone(), rendering.clone());
@@ -765,7 +812,7 @@ mod tests {
         let audio = audio::Device::open(shared.clone());
         // test_tracks.mkv remuxed with three chapters, the middle one without a title.
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/test_chapters.mkv");
-        let s = Session::open(&path, None, &shared, None, &audio).unwrap();
+        let s = Session::open(&path, None, &TrackChoice::default(), &shared, None, &audio).unwrap();
         let expected = [
             (0.0, "Opening".to_owned()),
             (1.5, "Chapter 2".to_owned()),
@@ -773,7 +820,7 @@ mod tests {
         ];
         assert_eq!(s.chapters(), expected);
         within(Duration::from_secs(10), "dropping the session", || drop(s));
-        let s = Session::open(&clip(), None, &shared, None, &audio).unwrap();
+        let s = Session::open(&clip(), None, &TrackChoice::default(), &shared, None, &audio).unwrap();
         assert!(s.chapters().is_empty());
         within(Duration::from_secs(10), "dropping the session", || drop(s));
     }
@@ -812,6 +859,28 @@ mod tests {
         assert_eq!(language_name("JPN"), Some("Japanese"));
         assert_eq!(language_name("zh_TW"), Some("Chinese"));
         assert_eq!(language_name("xx"), None);
+    }
+
+    #[test]
+    fn preferred_language_picks_its_default_track() {
+        let track = |stream, language: Option<&str>, default| TrackInfo {
+            stream,
+            label: String::new(),
+            language: language.map(str::to_owned),
+            codec: "aac".into(),
+            default,
+        };
+        let tracks = [
+            track(1, Some("eng"), true),
+            track(2, Some("ja"), false),
+            track(3, Some("jpn"), true),
+            track(4, Some("tlh"), false),
+        ];
+        assert_eq!(in_language(&tracks, "jpn"), Some(3), "the default of the two");
+        assert_eq!(in_language(&tracks, "en"), Some(1), "639-1 matches 639-2");
+        assert_eq!(in_language(&tracks, "tlh"), Some(4), "unknown codes match as written");
+        assert_eq!(in_language(&tracks, "fre"), None);
+        assert_eq!(in_language(&tracks, ""), None);
     }
 
     #[test]

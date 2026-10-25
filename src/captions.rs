@@ -6,7 +6,7 @@ use windows::Win32::Graphics::Direct2D::*;
 use windows::Win32::Graphics::DirectWrite::*;
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
 use windows::core::{HSTRING, Result, w};
-use windows_numerics::Vector2;
+use windows_numerics::{Matrix3x2, Vector2};
 
 use crate::subs::{Cue, CueContent, Span};
 
@@ -23,6 +23,11 @@ pub struct CaptionStyle {
     pub outline_width: f32,
     /// Gap between the bottom of the picture and the last line, as a fraction of its height.
     pub bottom_margin_ratio: f32,
+    pub bold: bool,
+    /// Of the whole caption, outline included, 0..1.
+    pub opacity: f32,
+    /// A soft dark copy down and to the right, under the outline.
+    pub shadow: bool,
 }
 
 impl Default for CaptionStyle {
@@ -35,6 +40,9 @@ impl Default for CaptionStyle {
             outline: 0x0C0C0C,
             outline_width: 2.0,
             bottom_margin_ratio: 0.06,
+            bold: false,
+            opacity: 1.0,
+            shadow: false,
         }
     }
 }
@@ -51,8 +59,9 @@ pub struct CaptionRenderer {
     fonts: Option<IDWriteFontCollection2>,
     fill: ID2D1SolidColorBrush,
     outline: ID2D1SolidColorBrush,
-    /// The text format for the current family and size.
-    format: Option<(String, f32, IDWriteTextFormat)>,
+    shadow: ID2D1SolidColorBrush,
+    /// The text format for the current family, size and weight.
+    format: Option<(String, f32, bool, IDWriteTextFormat)>,
     layouts: Vec<CachedLayout>,
     /// Bitmap cues by start time, with each rect's position on the canvas.
     bitmaps: Vec<(u64, Vec<(ID2D1Bitmap, D2D_RECT_F)>)>,
@@ -80,6 +89,13 @@ impl CaptionRenderer {
                 fonts: fonts.cloned(),
                 fill: ctx.CreateSolidColorBrush(&color(style.text), None)?,
                 outline: ctx.CreateSolidColorBrush(&color(style.outline), None)?,
+                shadow: ctx.CreateSolidColorBrush(
+                    &D2D1_COLOR_F {
+                        a: 0.6,
+                        ..color(0)
+                    },
+                    None,
+                )?,
                 format: None,
                 layouts: Vec::new(),
                 bitmaps: Vec::new(),
@@ -149,7 +165,7 @@ impl CaptionRenderer {
 
         let size = (style.size_ratio * height).max(1.0);
         let max_width = WRAP * width;
-        self.ensure_format(&style.font_family, size)?;
+        self.ensure_format(&style.font_family, size, style.bold)?;
         for l in &mut self.layouts {
             l.used = false;
         }
@@ -183,7 +199,32 @@ impl CaptionRenderer {
                 (-d, d),
                 (-d, -d),
             ];
+            // A see-through caption fades as one picture; drawn straight, the outline copies
+            // would show through each other and the fill.
+            let faded = style.opacity < 1.0;
             unsafe {
+                if faded {
+                    let params = D2D1_LAYER_PARAMETERS1 {
+                        contentBounds: D2D_RECT_F {
+                            left,
+                            top,
+                            right,
+                            bottom,
+                        },
+                        maskTransform: Matrix3x2::identity(),
+                        opacity: style.opacity.clamp(0.0, 1.0),
+                        ..Default::default()
+                    };
+                    ctx.PushLayer(&params, None);
+                }
+                if style.shadow {
+                    let off = r + size * 0.05;
+                    let at = Vector2 {
+                        X: x + off,
+                        Y: y + off,
+                    };
+                    rt.DrawTextLayout(at, &layout, &self.shadow, D2D1_DRAW_TEXT_OPTIONS_NONE);
+                }
                 if r > 0.0 {
                     for (dx, dy) in offsets {
                         let at = Vector2 {
@@ -199,6 +240,9 @@ impl CaptionRenderer {
                     &self.fill,
                     D2D1_DRAW_TEXT_OPTIONS_NONE,
                 );
+                if faded {
+                    ctx.PopLayer();
+                }
             }
             line_bottom = y - CUE_GAP * size;
         }
@@ -206,13 +250,13 @@ impl CaptionRenderer {
         Ok(())
     }
 
-    /// Recreates the text format (and drops the layouts built with it) when the family or the
-    /// size changes, which happens on a window resize.
-    fn ensure_format(&mut self, family: &str, size: f32) -> Result<()> {
+    /// Recreates the text format (and drops the layouts built with it) when the family, size or
+    /// weight changes; the size changes on a window resize.
+    fn ensure_format(&mut self, family: &str, size: f32, bold: bool) -> Result<()> {
         if self
             .format
             .as_ref()
-            .is_some_and(|(f, s, _)| f == family && *s == size)
+            .is_some_and(|(f, s, b, _)| f == family && *s == size && *b == bold)
         {
             return Ok(());
         }
@@ -222,7 +266,11 @@ impl CaptionRenderer {
             let format = dwrite.CreateTextFormat(
                 &HSTRING::from(family),
                 self.fonts.as_ref().map(|f| -> &IDWriteFontCollection { f }),
-                DWRITE_FONT_WEIGHT_MEDIUM,
+                if bold {
+                    DWRITE_FONT_WEIGHT_BOLD
+                } else {
+                    DWRITE_FONT_WEIGHT_MEDIUM
+                },
                 DWRITE_FONT_STYLE_NORMAL,
                 DWRITE_FONT_STRETCH_NORMAL,
                 size,
@@ -232,7 +280,7 @@ impl CaptionRenderer {
             format.SetWordWrapping(DWRITE_WORD_WRAPPING_WRAP)?;
             format
         };
-        self.format = Some((family.to_owned(), size, format));
+        self.format = Some((family.to_owned(), size, bold, format));
         self.layouts.clear();
         Ok(())
     }
@@ -247,7 +295,7 @@ impl CaptionRenderer {
             l.used = true;
             return Ok(l.layout.clone());
         }
-        let (_, _, format) = self.format.as_ref().unwrap();
+        let (_, _, _, format) = self.format.as_ref().unwrap();
         // One string with a line break per line; spans become styled ranges, in UTF-16 units.
         let mut text: Vec<u16> = Vec::new();
         let mut styled = Vec::new();

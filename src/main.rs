@@ -10,6 +10,7 @@ mod captions;
 mod dsp;
 mod library;
 mod player;
+mod prefs;
 mod queue;
 mod probe;
 mod render;
@@ -35,15 +36,19 @@ use windows::Win32::Graphics::Dwm::{
     DwmSetWindowAttribute,
 };
 use windows::Win32::Graphics::Gdi::{
-    BLACK_BRUSH, GetMonitorInfoW, GetStockObject, HBRUSH, MONITOR_DEFAULTTONEAREST, MONITORINFO,
-    MonitorFromWindow, ScreenToClient,
+    BLACK_BRUSH, GetMonitorInfoW, GetStockObject, HBRUSH, MONITOR_DEFAULTTONEAREST,
+    MONITOR_DEFAULTTONULL, MONITORINFO, MonitorFromRect, MonitorFromWindow, ScreenToClient,
 };
 use windows::Win32::System::Com::{
     CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx, CoTaskMemFree,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::System::Power::{
+    ES_CONTINUOUS, ES_DISPLAY_REQUIRED, ES_SYSTEM_REQUIRED, SetThreadExecutionState,
+};
 use windows::Win32::System::Threading::{
-    GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_ABOVE_NORMAL,
+    GetCurrentThread, GetStartupInfoW, STARTF_USESHOWWINDOW, STARTUPINFOW, SetThreadPriority,
+    THREAD_PRIORITY_ABOVE_NORMAL,
 };
 use windows::Win32::UI::Controls::{MARGINS, WM_MOUSELEAVE};
 use windows::Win32::UI::HiDpi::{
@@ -64,14 +69,15 @@ use captions::CaptionStyle;
 use dsp::{EQ_PRESETS, StereoMode};
 use library::{Entry, Library, MediaKind, Place, Section, Track};
 use player::{HwDevice, Shared, VideoFrame};
-use queue::Queue;
+use prefs::Prefs;
+use queue::{Queue, Repeat};
 use render::{DeviceLock, Flip, Renderer, VideoAdjust, Zoom};
-use session::{Session, TrackKind};
+use session::{Session, TrackChoice, TrackKind};
 use subs::Cues;
-use ui::panels::{ASPECT, CROP, SettingsTab};
+use ui::panels::{ASPECT, CROP};
 use ui::{
-    Action, Dialog, DialogAction, Hit, Layout, MenuAction, Page, Panel, PanelAction, PanelData,
-    QueueAction, QueueData, QueueItem, Scene, TrackTab, Ui,
+    Action, Category, Dialog, DialogAction, Hit, Layout, MenuAction, Page, Panel, PanelAction,
+    PanelData, PrefsAction, QueueAction, QueueData, QueueItem, Scene, TrackTab, Ui,
 };
 
 /// The window procedure has no user data pointer here, so it reaches shared state through statics.
@@ -108,6 +114,15 @@ thread_local! {
     static DIALOG_ACTIONS: RefCell<Vec<DialogAction>> = const { RefCell::new(Vec::new()) };
     /// Ctrl+I asked for the Properties dialog; the render loop knows which file.
     static WANT_PROPERTIES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// The settings in force. The window procedure reads the keys', wheel's and clicks'; the
+    /// render loop applies the rest.
+    static PREFS: RefCell<Prefs> = RefCell::new(Prefs::default());
+    /// Requests from the Settings window, applied by the render loop.
+    static PREFS_ACTIONS: RefCell<Vec<PrefsAction>> = const { RefCell::new(Vec::new()) };
+}
+
+fn prefs() -> Prefs {
+    PREFS.with_borrow(Clone::clone)
 }
 
 /// Sleep timer choices in minutes, by index into the panel's list; the last one is "End of file".
@@ -124,6 +139,7 @@ fn main() {
 /// What the render loop owns besides the window: the library and the file playing.
 struct App {
     shared: Arc<Shared>,
+    /// The GPU decoder device; Settings can turn its use off for the next file.
     hw: Option<HwDevice>,
     audio: Arc<audio::Device>,
     library: Library,
@@ -160,6 +176,12 @@ struct App {
     sleep: usize,
     sleep_at: Option<Instant>,
     show_statistics: bool,
+    /// The file just opened wants fullscreen ("Start videos in fullscreen"); the render loop
+    /// has the window.
+    enter_fullscreen: bool,
+    /// When the settings changed last without being saved; saved a moment later, so a dragged
+    /// slider doesn't write the file at every step.
+    prefs_changed: Option<Instant>,
 }
 
 impl App {
@@ -177,14 +199,36 @@ impl App {
     /// Opens `path` from where it was left, keeping the queue as it is.
     fn open(&mut self, path: &Path) -> bool {
         self.stop();
-        let start = self.library.resume_position(path);
-        match Session::open(path, start, &self.shared, self.hw.as_ref(), &self.audio) {
+        let p = prefs();
+        let start = if p.resume == 0 {
+            self.library.resume_position(path)
+        } else {
+            None
+        };
+        let choice = TrackChoice {
+            audio_language: p.audio_language.clone(),
+            sub_language: p.sub_language.clone(),
+            subtitles: p.subtitles,
+        };
+        let hw = self.hw.as_ref().filter(|_| p.hw_decoding);
+        match Session::open(path, start, &choice, &self.shared, hw, &self.audio) {
             Ok(s) => {
                 if s.duration > 0.0 {
                     self.durations.insert(path.to_owned(), s.duration);
                 }
+                self.enter_fullscreen = p.start_fullscreen && s.video_size.is_some();
                 self.session = Some(s);
-                self.start_subtitles();
+                // Each file starts at the default speed and aspect ratio, as in VLC.
+                let effects = self.audio.effects();
+                effects.set_speed(p.speed);
+                self.shared.clock.set_speed(effects.speed());
+                self.aspect = ASPECT.iter().position(|a| *a == p.aspect).unwrap_or(0);
+                self.adjust.aspect = ratio(ASPECT.get(self.aspect).copied());
+                // Opening left it playing.
+                if !p.autoplay {
+                    self.shared.toggle_pause();
+                }
+                self.start_subtitles(&p);
                 self.record();
                 self.refresh_watched();
                 true
@@ -217,9 +261,10 @@ impl App {
         self.external_selected = None;
     }
 
-    /// The file's default subtitles: an embedded default+forced track, else a matching subtitle
-    /// file next to it, as VLC loads them automatically.
-    fn start_subtitles(&mut self) {
+    /// The file's starting subtitles: the embedded track the session picked (a default+forced
+    /// one, or one in the preferred language), else a matching subtitle file next to it, as VLC
+    /// loads them automatically. Settings can turn off subtitles, or just the files.
+    fn start_subtitles(&mut self, p: &Prefs) {
         let Some(session) = self.session.as_mut() else {
             return;
         };
@@ -230,7 +275,9 @@ impl App {
             .collect();
         match initial {
             Some(stream) => self.decode_embedded(stream),
-            None if !self.external.is_empty() => self.show_external(Some(0)),
+            None if p.subtitles && p.auto_subs && !self.external.is_empty() => {
+                self.show_external(Some(0))
+            }
             None => {}
         }
     }
@@ -376,6 +423,10 @@ impl App {
                 // The list starts with the system default, which also follows Windows' choice.
                 let name = (i > 0).then(|| self.devices.get(i)).flatten();
                 self.audio.switch_to(name.map(String::as_str));
+                // The choice sticks, as Settings' "Output device".
+                let device = name.cloned().unwrap_or_default();
+                PREFS.with_borrow_mut(|p| p.device = device);
+                self.prefs_changed = Some(Instant::now());
             }
             PanelAction::RefreshDevices => self.devices = audio::output_devices(),
             PanelAction::SetSpeed(v) => {
@@ -495,7 +546,11 @@ impl App {
 
     /// Saves where the open file is, for Continue Watching and resuming.
     fn record(&mut self) {
+        self.recorded = Instant::now();
         let Some(s) = &self.session else { return };
+        if !PREFS.with_borrow(|p| p.save_recent) {
+            return;
+        }
         let position = if s.finished() {
             s.duration
         } else {
@@ -503,7 +558,6 @@ impl App {
         };
         self.library.record_position(&s.path, position, s.duration);
         self.library_changed = true;
-        self.recorded = Instant::now();
     }
 
     /// Plays the next (`delta` > 0) or previous file in the queue's order.
@@ -625,6 +679,97 @@ impl App {
             self.library_changed = false;
         }
     }
+
+    /// Settings from the Settings window. What changed takes effect now, except the per-file
+    /// defaults (speed, aspect ratio, tracks, decoding, fullscreen), which the next file uses.
+    fn apply_prefs(&mut self, hwnd: HWND, new: Prefs) {
+        let old = prefs();
+        if new.on_top != old.on_top {
+            set_topmost(hwnd, new.on_top);
+        }
+        UI.with_borrow_mut(|ui| {
+            ui.auto_hide = new.auto_hide;
+            ui.hide_after = Duration::from_secs_f32(new.hide_after);
+            if new.show_hidden != old.show_hidden {
+                ui.browse.stale = true;
+            }
+        });
+        library::SHOW_HIDDEN.store(new.show_hidden, Relaxed);
+        if (new.repeat, new.shuffle) != (old.repeat, old.shuffle) {
+            self.queue.set_repeat(REPEAT[new.repeat.min(2)]);
+            self.queue.set_shuffle(new.shuffle);
+        }
+        if new.device != old.device {
+            let name = (!new.device.is_empty()).then_some(new.device.as_str());
+            self.audio.switch_to(name);
+        }
+        apply_effects(&self.audio, Some(&old), &new);
+        self.caption = new.caption();
+        PREFS.set(new);
+        self.prefs_changed = Some(Instant::now());
+    }
+
+    /// Changes the panels, queue and menus make to things Settings also holds, so the
+    /// equalizer, stereo mode, subtitle size, repeat and shuffle stick across launches.
+    // ponytail: custom equalizer bands aren't saved, only presets; the equalizer starts off
+    // next time. Save the ten bands if anyone tunes them by hand.
+    fn sync_prefs(&mut self) {
+        let effects = self.audio.effects();
+        let eq = effects.eq();
+        let preset = (eq.enabled.then_some(eq.preset).flatten())
+            .and_then(|i| EQ_PRESETS.get(i))
+            .map_or_else(String::new, |e| e.name.to_owned());
+        let stereo = (StereoMode::ALL.iter())
+            .position(|m| *m == effects.stereo())
+            .unwrap_or(0);
+        let size = self.caption.size_ratio / CaptionStyle::default().size_ratio;
+        let repeat = REPEAT.iter().position(|r| *r == self.queue.repeat());
+        let shuffle = self.queue.shuffle();
+        let changed = PREFS.with_borrow_mut(|p| {
+            let old = p.clone();
+            p.eq_preset = preset;
+            p.two_pass = eq.two_pass;
+            p.stereo = stereo;
+            p.sub_size = (size * 20.0).round() / 20.0;
+            p.repeat = repeat.unwrap_or(0);
+            p.shuffle = shuffle;
+            *p != old
+        });
+        if changed {
+            self.prefs_changed = Some(Instant::now());
+        }
+    }
+}
+
+/// Settings' "Repeat" choices, by `prefs::REPEAT`.
+const REPEAT: [Repeat; 3] = [Repeat::Off, Repeat::All, Repeat::One];
+
+/// The equalizer, its two-pass mode and the stereo mode from settings; with `old`, only what
+/// changed, so a hand-tuned equalizer survives turning two-pass on.
+fn apply_effects(audio: &audio::Device, old: Option<&Prefs>, new: &Prefs) {
+    let effects = audio.effects();
+    if old.is_none_or(|o| o.eq_preset != new.eq_preset) {
+        effects.set_eq(EQ_PRESETS.iter().position(|e| e.name == new.eq_preset));
+    }
+    if old.is_none_or(|o| o.two_pass != new.two_pass) {
+        effects.set_two_pass(new.two_pass);
+    }
+    if old.is_none_or(|o| o.stereo != new.stereo) {
+        effects.set_stereo(StereoMode::ALL[new.stereo.min(StereoMode::ALL.len() - 1)]);
+    }
+}
+
+/// "Keep window above other windows".
+fn set_topmost(hwnd: HWND, on: bool) {
+    let after = if on { HWND_TOPMOST } else { HWND_NOTOPMOST };
+    let flags = SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE;
+    unsafe { _ = SetWindowPos(hwnd, Some(after), 0, 0, 0, 0, flags) };
+}
+
+/// The settings window opened at `category`, with the output devices as the tracks panel
+/// lists them.
+fn open_preferences(app: &App, category: Category) {
+    UI.with_borrow_mut(|ui| ui.open_preferences(prefs(), app.devices.clone(), category));
 }
 
 fn section_of(path: &Path) -> Section {
@@ -663,6 +808,18 @@ fn run() -> Result<(), Box<dyn Error>> {
     _ = SHARED.set(shared.clone());
     // WASAPI takes seconds to open on some machines, so start now, while the window comes up.
     let audio = audio::Device::open(shared.clone());
+    let settings = Prefs::load(&Library::default_dir());
+    if !settings.device.is_empty() {
+        audio.switch_to(Some(&settings.device));
+    }
+    apply_effects(&audio, None, &settings);
+    shared.set_volume(settings.startup_volume());
+    library::SHOW_HIDDEN.store(settings.show_hidden, Relaxed);
+    UI.with_borrow_mut(|ui| {
+        ui.auto_hide = settings.auto_hide;
+        ui.hide_after = Duration::from_secs_f32(settings.hide_after);
+    });
+    PREFS.set(settings.clone());
 
     let device = render::create_device()?;
     let hw = if software {
@@ -692,18 +849,23 @@ fn run() -> Result<(), Box<dyn Error>> {
         external: Vec::new(),
         external_selected: None,
         sub_delay: 0.0,
-        caption: CaptionStyle::default(),
+        caption: settings.caption(),
         devices: audio::output_devices(),
         sleep: 0,
         sleep_at: None,
         show_statistics: false,
+        enter_fullscreen: false,
+        prefs_changed: None,
     };
+    app.queue.set_repeat(REPEAT[settings.repeat.min(2)]);
+    app.queue.set_shuffle(settings.shuffle);
     if let Some(path) = &path {
         let opened = if play_and_exit {
             // Measurement runs play exactly this file from the start.
             app.session = Some(Session::open(
                 path,
                 None,
+                &TrackChoice::default(),
                 &shared,
                 app.hw.as_ref(),
                 &app.audio,
@@ -727,12 +889,21 @@ fn run() -> Result<(), Box<dyn Error>> {
     });
     let size = app.session.as_ref().and_then(|s| s.video_size);
     let hwnd = create_window(&window_title, size.unwrap_or((1600, 900)))?;
+    let maximized = restore_placement(hwnd, &settings);
+    if settings.on_top {
+        set_topmost(hwnd, true);
+    }
     let lock = app.hw.as_ref().and_then(|h| DeviceLock::from_hw(h.d3d11()));
     let mut renderer = Renderer::new(hwnd, client_size(hwnd), device, lock)?;
     // Show the window the way the launcher asked (a "Run: Minimized" shortcut, or a script that
     // starts us minimized without focus). The swap chain already exists, so a window that starts
     // minimized still gets full-size buffers.
-    unsafe { _ = ShowWindow(hwnd, SW_SHOWDEFAULT) };
+    let show = if maximized && !launched_minimized() {
+        SW_SHOWMAXIMIZED
+    } else {
+        SW_SHOWDEFAULT
+    };
+    unsafe { _ = ShowWindow(hwnd, show) };
     unsafe { DragAcceptFiles(hwnd, true) };
     // libdav1d keeps every core busy in bursts, and at normal priority this render loop then woke
     // up 40 ms late and skipped frames. VLC runs its video output thread above normal for the
@@ -752,6 +923,8 @@ fn run() -> Result<(), Box<dyn Error>> {
 
     let (mut shown, mut dropped) = (0u64, 0u64);
     let mut last_position = 0.0;
+    // Whether Windows is asked to keep the screen on.
+    let mut awake = false;
     while pump_messages() && !shared.quit.load(Relaxed) {
         if let Some(path) = OPEN.lock().unwrap().take() {
             // Dropped on an open playlist, a file joins it; anywhere else it plays.
@@ -770,8 +943,32 @@ fn run() -> Result<(), Box<dyn Error>> {
         }
         for action in PANEL_ACTIONS.with_borrow_mut(std::mem::take) {
             app.apply(hwnd, action);
+            app.sync_prefs();
             // Video adjustments change the picture without a new frame.
             UI.with_borrow_mut(|ui| ui.dirty = true);
+        }
+        for action in PREFS_ACTIONS.with_borrow_mut(std::mem::take) {
+            match action {
+                PrefsAction::Changed(p) => app.apply_prefs(hwnd, *p),
+                PrefsAction::ClearHistory => {
+                    app.library.clear_history();
+                    app.library_changed = true;
+                    UI.with_borrow_mut(|ui| ui.browse.stale = true);
+                }
+                PrefsAction::ShowShortcuts => {
+                    UI.with_borrow_mut(|ui| ui.open_dialog(Dialog::Shortcuts))
+                }
+            }
+            UI.with_borrow_mut(|ui| ui.dirty = true);
+        }
+        if app.prefs_changed.is_some_and(|t| t.elapsed() > Duration::from_secs(1)) {
+            app.prefs_changed = None;
+            if let Err(e) = prefs().save(&Library::default_dir()) {
+                eprintln!("settings: cannot save ({e})");
+            }
+        }
+        if std::mem::take(&mut app.enter_fullscreen) && !is_fullscreen() {
+            toggle_fullscreen(hwnd);
         }
         for action in DIALOG_ACTIONS.with_borrow_mut(std::mem::take) {
             apply_dialog(&mut app, hwnd, action);
@@ -781,6 +978,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         }
         for action in QUEUE_ACTIONS.with_borrow_mut(std::mem::take) {
             app.apply_queue(hwnd, action);
+            app.sync_prefs();
             UI.with_borrow_mut(|ui| ui.dirty = true);
         }
         for (path, info) in app.queue_prober.take_ready() {
@@ -809,6 +1007,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         }
         for action in MENU_ACTIONS.with_borrow_mut(std::mem::take) {
             menu_action(&mut app, hwnd, action);
+            app.sync_prefs();
         }
         DURATION.store(
             app.session.as_ref().map_or(0.0, |s| s.duration).to_bits(),
@@ -863,6 +1062,19 @@ fn run() -> Result<(), Box<dyn Error>> {
         let serial = shared.serial.load(Relaxed);
         let fresh = app.current.as_ref().is_none_or(|c| c.serial != serial);
         let paused = shared.paused.load(Relaxed);
+        // "Stop the screensaver during playback": only while a video plays.
+        let want_awake = PREFS.with_borrow(|p| p.keep_awake)
+            && !paused
+            && app.session.as_ref().is_some_and(|s| s.video_size.is_some());
+        if want_awake != awake {
+            awake = want_awake;
+            let flags = if awake {
+                ES_CONTINUOUS | ES_DISPLAY_REQUIRED | ES_SYSTEM_REQUIRED
+            } else {
+                ES_CONTINUOUS
+            };
+            unsafe { SetThreadExecutionState(flags) };
+        }
         // Without audio (or once its device failed), video starts the system clock from the frame on
         // screen, after opening and after every seek.
         if !shared.audio_master.load(Relaxed)
@@ -916,7 +1128,7 @@ fn run() -> Result<(), Box<dyn Error>> {
             let old = &ui.layout;
             let layout = match ui.page {
                 Page::Player => {
-                    let bars = !has_video || ui.bars_visible(paused);
+                    let bars = !has_video || ui.bars_visible(paused, fullscreen);
                     let changed = ui.relayout
                         || old.page != Page::Player
                         || bars != old.bars
@@ -945,6 +1157,9 @@ fn run() -> Result<(), Box<dyn Error>> {
                 }
             };
             if let Some(mut layout) = layout {
+                if let Some(p) = &ui.preferences {
+                    layout.add_preferences(p);
+                }
                 if let Some(d) = &ui.dialog {
                     renderer.add_dialog(&mut layout, d);
                 }
@@ -953,7 +1168,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                 ui.dirty = true;
                 ui.sync_menu();
             }
-            if ui.settle_seek_preview() || ui.dialog_tick() {
+            if ui.settle_seek_preview() || ui.dialog_tick() || ui.preferences_tick() {
                 ui.dirty = true;
             }
             std::mem::take(&mut ui.dirty)
@@ -1009,6 +1224,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                     panel: Some(&panel_data),
                     queue: queue_data.as_ref(),
                     dialog: ui.dialog.as_ref(),
+                    preferences: ui.preferences.as_ref(),
                     cues: &cues,
                     caption_style: &app.caption,
                     stats: stats.as_deref(),
@@ -1041,8 +1257,13 @@ fn run() -> Result<(), Box<dyn Error>> {
                 // Like VLC's playlist: carry on with the next file, or stop at the end (or where
                 // the sleep timer says).
                 if app.sleep == SLEEP_END_OF_FILE || !app.advance() {
+                    // The sleep timer stops; the end of the queue may quit, per Settings.
+                    let quit = app.sleep != SLEEP_END_OF_FILE && PREFS.with_borrow(|p| p.at_end == 1);
                     app.sleep = 0;
                     app.stop();
+                    if quit {
+                        unsafe { _ = DestroyWindow(hwnd) };
+                    }
                 }
                 last_position = 0.0;
                 UI.with_borrow_mut(|ui| {
@@ -1058,7 +1279,12 @@ fn run() -> Result<(), Box<dyn Error>> {
     if !play_and_exit {
         app.stop();
         app.save();
+        PREFS.with_borrow_mut(|p| p.volume = shared.volume());
+        if let Err(e) = prefs().save(&Library::default_dir()) {
+            eprintln!("settings: cannot save ({e})");
+        }
     }
+    unsafe { SetThreadExecutionState(ES_CONTINUOUS) };
     drop(app);
     eprintln!("shown {shown} frames, dropped {dropped}");
     Ok(())
@@ -1162,7 +1388,7 @@ fn open_menu(app: &mut App, hit: Hit, at: (f32, f32)) {
                     _ => None,
                 })
                 .collect();
-            (Kind::Main, menu::main_menu(&recent, app.session.is_some()))
+            (Kind::Main, menu::main_menu(&recent))
         }
         Hit::Sort => UI.with_borrow(|ui| {
             let b = &ui.browse;
@@ -1248,6 +1474,7 @@ fn menu_action(app: &mut App, hwnd: HWND, action: MenuAction) {
                 });
             }
         }
+        MenuAction::Preferences(category) => open_preferences(app, category),
         MenuAction::Quit => unsafe { _ = DestroyWindow(hwnd) },
         MenuAction::TogglePause => app.shared.toggle_pause(),
         MenuAction::Stop => app.stop(),
@@ -1803,6 +2030,64 @@ fn create_window(title: &str, (video_w, video_h): (u32, u32)) -> windows::core::
     }
 }
 
+/// Puts the window where it was when myvlc last closed, if Settings remember it and that spot
+/// is still on a screen. Returns whether it was maximized.
+fn restore_placement(hwnd: HWND, p: &Prefs) -> bool {
+    let Some(([x, y, w, h], maximized)) = p.window.filter(|_| p.remember_window) else {
+        return false;
+    };
+    let rect = RECT {
+        left: x,
+        top: y,
+        right: x + w,
+        bottom: y + h,
+    };
+    if unsafe { MonitorFromRect(&rect, MONITOR_DEFAULTTONULL) }.is_invalid() {
+        return false;
+    }
+    let placement = WINDOWPLACEMENT {
+        length: size_of::<WINDOWPLACEMENT>() as u32,
+        showCmd: SW_HIDE.0 as u32,
+        rcNormalPosition: rect,
+        ..Default::default()
+    };
+    unsafe { _ = SetWindowPlacement(hwnd, &placement) };
+    maximized
+}
+
+/// Keeps the window's restored rect and maximized state for next time, as it closes.
+fn remember_placement(hwnd: HWND) {
+    // In fullscreen, the placement to come back to is the one saved on the way in.
+    let saved = WINDOWED.lock().unwrap().as_ref().map(|(_, p)| *p);
+    let placement = saved.or_else(|| {
+        let mut p = WINDOWPLACEMENT {
+            length: size_of::<WINDOWPLACEMENT>() as u32,
+            ..Default::default()
+        };
+        unsafe { GetWindowPlacement(hwnd, &mut p) }.ok().map(|()| p)
+    });
+    if let Some(p) = placement {
+        let r = p.rcNormalPosition;
+        let maximized = p.showCmd == SW_SHOWMAXIMIZED.0 as u32
+            || (p.showCmd == SW_SHOWMINIMIZED.0 as u32 && p.flags.contains(WPF_RESTORETOMAXIMIZED));
+        let rect = [r.left, r.top, r.right - r.left, r.bottom - r.top];
+        PREFS.with_borrow_mut(|prefs| prefs.window = Some((rect, maximized)));
+    }
+}
+
+/// Whether the launcher asked for a minimized window (a "Run: Minimized" shortcut, or a script
+/// that starts us without focus).
+fn launched_minimized() -> bool {
+    let mut info = STARTUPINFOW {
+        cb: size_of::<STARTUPINFOW>() as u32,
+        ..Default::default()
+    };
+    unsafe { GetStartupInfoW(&mut info) };
+    let minimized = [SW_MINIMIZE, SW_SHOWMINIMIZED, SW_SHOWMINNOACTIVE];
+    info.dwFlags.contains(STARTF_USESHOWWINDOW)
+        && minimized.iter().any(|s| s.0 as u16 == info.wShowWindow)
+}
+
 /// Handles pending window messages. Returns false once the window is gone.
 fn pump_messages() -> bool {
     let mut msg = MSG::default();
@@ -1926,7 +2211,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             let (x, y) = mouse_position(lparam);
             let (x, y) = to_dips(hwnd, x, y);
             let on_video = UI.with_borrow(|ui| ui.layout.hit(x, y)) == Some(Hit::Video);
-            if msg == WM_LBUTTONDBLCLK && on_video {
+            let (click, double) = PREFS.with_borrow(|p| (p.click, p.double_click));
+            if msg == WM_LBUTTONDBLCLK && on_video && double == 0 {
+                // The first click of the two paused or played; put that back.
+                if click == 1 {
+                    shared.toggle_pause();
+                }
                 toggle_fullscreen(hwnd);
             } else {
                 unsafe { SetCapture(hwnd) };
@@ -1957,6 +2247,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             let (x, y) = to_dips(hwnd, p.x, p.y);
             if UI.with_borrow(|ui| ui.dialog.is_some()) {
                 UI.with_borrow_mut(|ui| ui.scroll_dialog(notches));
+            } else if UI.with_borrow(|ui| ui.preferences.is_some()) {
+                UI.with_borrow_mut(|ui| ui.scroll_preferences(x, y, notches));
             } else if UI.with_borrow(|ui| ui.menu.is_open()) {
                 // An open menu takes the wheel, so nothing scrolls away under it.
                 if UI.with_borrow(|ui| ui.over_menu(x, y)) {
@@ -1967,11 +2259,19 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             } else if UI.with_borrow(|ui| ui.page == Page::Library || ui.over_overlay()) {
                 UI.with_borrow_mut(|ui| ui.scroll(-120.0 * notches));
             } else {
-                act(
-                    hwnd,
-                    shared,
-                    Some(Action::SetVolume(shared.volume() + 0.05 * notches)),
-                );
+                // Over the video: volume, seeking or nothing, per Settings.
+                let (wheel, reverse, skip) =
+                    PREFS.with_borrow(|p| (p.wheel, p.reverse_wheel, p.skip[1]));
+                let notches = if reverse { -notches } else { notches };
+                match wheel {
+                    0 => act(
+                        hwnd,
+                        shared,
+                        Some(Action::SetVolume(shared.volume() + 0.05 * notches)),
+                    ),
+                    1 => shared.seek_by(f64::from(notches) * f64::from(skip)),
+                    _ => {}
+                }
             }
         }
         WM_DROPFILES => {
@@ -2018,8 +2318,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         WM_CHAR => {
             // Typing goes to the library's search box while it has focus.
             let c = wparam.0 as u32;
-            // An open dialog takes typing before the search box.
-            if UI.with_borrow_mut(|ui| ui.dialog_char(c)) {
+            // An open dialog takes typing before the search box, then the Settings window.
+            if UI.with_borrow_mut(|ui| ui.dialog_char(c) || ui.preferences_char(c)) {
                 return LRESULT(0);
             }
             UI.with_borrow_mut(|ui| {
@@ -2044,9 +2344,26 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 ui.dirty = true;
             });
         }
+        // Alt + Left/Right is the very short skip; other Alt keys (Alt+F4, the window menu)
+        // stay Windows'.
+        WM_SYSKEYDOWN
+            if matches!(VIRTUAL_KEY(wparam.0 as u16), VK_LEFT | VK_RIGHT)
+                && UI.with_borrow(|ui| {
+                    ui.dialog.is_none() && ui.preferences.is_none() && !ui.menu.is_open()
+                }) =>
+        {
+            let skip = f64::from(PREFS.with_borrow(|p| p.skip[0]));
+            let back = VIRTUAL_KEY(wparam.0 as u16) == VK_LEFT;
+            shared.seek_by(if back { -skip } else { skip });
+            UI.with_borrow_mut(|ui| {
+                ui.wake();
+                ui.dirty = true;
+            });
+        }
         // The swap chain covers the whole client area; erasing first only causes flicker.
         WM_ERASEBKGND => return LRESULT(1),
         WM_DESTROY => {
+            remember_placement(hwnd);
             shared.quit.store(true, Relaxed);
             unsafe { PostQuitMessage(0) };
         }
@@ -2119,13 +2436,20 @@ fn act(hwnd: HWND, shared: &Shared, action: Option<Action>) {
             ui.overlay = false;
             ui.show(Page::Library);
         }),
-        // A click on the video closes the panel.
-        Action::Click(Hit::Video) => UI.with_borrow_mut(|ui| {
-            if ui.overlay {
-                ui.overlay = false;
-                ui.browse.scroll = 0.0;
+        // A click on the video closes the panel, or else plays or pauses if Settings say so.
+        Action::Click(Hit::Video) => {
+            let closed = UI.with_borrow_mut(|ui| {
+                let open = ui.overlay;
+                if open {
+                    ui.overlay = false;
+                    ui.browse.scroll = 0.0;
+                }
+                open
+            });
+            if !closed && PREFS.with_borrow(|p| p.click == 1) {
+                shared.toggle_pause();
             }
-        }),
+        }
         // The panel is always a list.
         Action::Click(Hit::ViewMode) if UI.with_borrow(|ui| ui.page == Page::Player) => {}
         Action::Click(Hit::ViewMode) => UI.with_borrow_mut(|ui| {
@@ -2161,19 +2485,29 @@ fn act(hwnd: HWND, shared: &Shared, action: Option<Action>) {
         Action::Menu(a) => MENU_ACTIONS.with_borrow_mut(|m| m.push(a)),
         Action::OpenMenu(hit, x, y) => MENU_REQUESTS.with_borrow_mut(|m| m.push((hit, x, y))),
         Action::Dialog(a) => DIALOG_ACTIONS.with_borrow_mut(|p| p.push(a)),
+        Action::Preferences(a) => PREFS_ACTIONS.with_borrow_mut(|p| p.push(a)),
     }
 }
 
 fn on_key(hwnd: HWND, shared: &Shared, key: VIRTUAL_KEY) {
     let shift = unsafe { GetKeyState(i32::from(VK_SHIFT.0)) } < 0;
     let ctrl = unsafe { GetKeyState(i32::from(VK_CONTROL.0)) } < 0;
-    let step = if shift { 60.0 } else { 10.0 };
+    let (skip, volume_step) = PREFS.with_borrow(|p| (p.skip, p.volume_step));
+    let step = f64::from(match (ctrl, shift) {
+        (true, _) => skip[3],
+        (false, true) => skip[2],
+        (false, false) => skip[1],
+    });
+    let volume_step = volume_step as f32 / 100.0;
     let page = UI.with_borrow(|ui| ui.page);
-    // An open dialog takes every key.
+    // An open dialog takes every key, then the Settings window.
     if UI.with_borrow(|ui| ui.dialog.is_some()) {
-        let ctrl = unsafe { GetKeyState(i32::from(VK_CONTROL.0)) } < 0;
         let action = UI.with_borrow_mut(|ui| ui.dialog_key(key, shift, ctrl));
         act(hwnd, shared, action);
+        return;
+    }
+    if UI.with_borrow(|ui| ui.preferences.is_some()) {
+        UI.with_borrow_mut(|ui| ui.preferences_key(key, shift, ctrl));
         return;
     }
     // An open menu takes the keyboard.
@@ -2213,7 +2547,7 @@ fn on_key(hwnd: HWND, shared: &Shared, key: VIRTUAL_KEY) {
     let shortcut = match key {
         VK_O if ctrl => Some(MenuAction::OpenFiles),
         VK_F if ctrl => Some(MenuAction::OpenFolder),
-        VK_P if ctrl => Some(MenuAction::Settings(SettingsTab::Playback)),
+        VK_P if ctrl => Some(MenuAction::Preferences(Category::Playback)),
         VK_Q if ctrl => Some(MenuAction::Quit),
         VK_OEM_5 if ctrl && page == Page::Player => Some(MenuAction::HideUi),
         VK_F1 if shift => Some(MenuAction::ShowAbout),
@@ -2231,8 +2565,8 @@ fn on_key(hwnd: HWND, shared: &Shared, key: VIRTUAL_KEY) {
         VK_SPACE => shared.toggle_pause(),
         VK_LEFT => shared.seek_by(-step),
         VK_RIGHT => shared.seek_by(step),
-        VK_UP => shared.set_volume(shared.volume() + 0.1),
-        VK_DOWN => shared.set_volume(shared.volume() - 0.1),
+        VK_UP => shared.set_volume(shared.volume() + volume_step),
+        VK_DOWN => shared.set_volume(shared.volume() - volume_step),
         VK_M => shared.toggle_mute(),
         VK_F => toggle_fullscreen(hwnd),
         VK_ESCAPE if UI.with_borrow_mut(Ui::close_panel) => {}

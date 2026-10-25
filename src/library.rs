@@ -11,6 +11,8 @@ use std::fmt::Write as _;
 use std::io::ErrorKind;
 use std::os::windows::fs::MetadataExt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering::Relaxed;
 use std::{env, fs, io};
 
 pub const VIDEO_EXTS: &[&str] = &[
@@ -670,6 +672,14 @@ impl Library {
             .then_some(r.position)
     }
 
+    /// Settings' "Clear history": forgets what was played, where, and how often.
+    pub fn clear_history(&mut self) {
+        self.recent.clear();
+        self.plays.clear();
+        self.visits.clear();
+        self.playlist_plays.clear();
+    }
+
     pub fn visit_folder(&mut self, path: &Path) {
         *self.visits.entry(abs(path)).or_default() += 1;
     }
@@ -1072,6 +1082,9 @@ pub fn check_name(name: &str) -> io::Result<()> {
 
 type Named = Vec<(String, PathBuf)>;
 
+/// Settings' "Show hidden files": folder listings include hidden and dot files.
+pub static SHOW_HIDDEN: AtomicBool = AtomicBool::new(false);
+
 /// The visible subfolders and files of `dir`, each sorted by name in natural order.
 fn list_dir(dir: &Path) -> (Named, Named) {
     const FILE_ATTRIBUTE_HIDDEN: u32 = 0x2;
@@ -1082,7 +1095,7 @@ fn list_dir(dir: &Path) -> (Named, Named) {
         let hidden = entry
             .metadata()
             .is_ok_and(|m| m.file_attributes() & FILE_ATTRIBUTE_HIDDEN != 0);
-        if hidden || name.starts_with('.') {
+        if (hidden || name.starts_with('.')) && !SHOW_HIDDEN.load(Relaxed) {
             continue;
         }
         let path = entry.path();
