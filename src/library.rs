@@ -2,7 +2,8 @@
 //! resume positions. A plain model with no UI or FFmpeg; the sidebar and pages draw its entries.
 //!
 //! State lives in one folder (see [`Library::default_dir`]): `state.txt` holds roots, the recent
-//! list and the counters, and `playlists\<name>.m3u` holds one playlist each.
+//! list, the counters, playlist thumbnails and favourites, and `playlists\<name>.m3u` holds one
+//! playlist each.
 
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
@@ -12,11 +13,11 @@ use std::os::windows::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::{env, fs, io};
 
-const VIDEO_EXTS: &[&str] = &[
+pub const VIDEO_EXTS: &[&str] = &[
     "mp4", "m4v", "mkv", "webm", "avi", "mov", "wmv", "flv", "ts", "m2ts", "mts", "mpg", "mpeg",
     "ogv", "3gp",
 ];
-const AUDIO_EXTS: &[&str] = &[
+pub const AUDIO_EXTS: &[&str] = &[
     "mp3", "m4a", "aac", "flac", "wav", "ogg", "opus", "wma", "alac", "aiff", "ape", "mka",
 ];
 /// Recent files kept. Resume positions live in the recent list, so they go with it.
@@ -204,6 +205,10 @@ pub struct Library {
     visits: HashMap<PathBuf, u32>,
     plays: HashMap<PathBuf, u32>,
     playlist_plays: HashMap<String, u32>,
+    /// The picture each playlist shows, by playlist name.
+    thumbnails: HashMap<String, PathBuf>,
+    /// Favourite files, folders and playlist files, in the order they were added.
+    favorites: Vec<PathBuf>,
     /// The music index from the last scan, in path order, and a path lookup into it.
     // ponytail: in memory only, so Albums/Artists/Genres stay empty until the first scan of each
     // run finishes; save it next to state.txt if that wait shows.
@@ -235,6 +240,8 @@ impl Library {
             visits: HashMap::new(),
             plays: HashMap::new(),
             playlist_plays: HashMap::new(),
+            thumbnails: HashMap::new(),
+            favorites: Vec::new(),
             tracks: Vec::new(),
             track_at: HashMap::new(),
         };
@@ -299,6 +306,15 @@ impl Library {
                         self.playlist_plays.insert(name.into(), n);
                     }
                 }
+                ["thumb", name, p] if check_name(name).is_ok() && !p.is_empty() => {
+                    self.thumbnails.insert(name.into(), p.into());
+                }
+                ["favorite", p] if !p.is_empty() => {
+                    let p = PathBuf::from(p);
+                    if !self.favorites.contains(&p) {
+                        self.favorites.push(p);
+                    }
+                }
                 _ => {}
             }
         }
@@ -327,6 +343,14 @@ impl Library {
         }
         for (name, n) in &self.playlist_plays {
             writeln!(out, "playlist\t{name}\t{n}").unwrap();
+        }
+        for (name, p) in &self.thumbnails {
+            if let Some(p) = p.to_str() {
+                writeln!(out, "thumb\t{name}\t{p}").unwrap();
+            }
+        }
+        for p in self.favorites.iter().filter_map(|p| p.to_str()) {
+            writeln!(out, "favorite\t{p}").unwrap();
         }
         fs::create_dir_all(&self.dir)?;
         let tmp = self.dir.join("state.txt.tmp");
@@ -472,6 +496,18 @@ impl Library {
 
     fn home(&self) -> Vec<Entry> {
         let mut out = Vec::new();
+        let favorites: Vec<Entry> = self
+            .favorites
+            .iter()
+            .filter_map(|p| self.favorite_entry(p))
+            .collect();
+        if !favorites.is_empty() {
+            out.push(Entry::Header {
+                label: "Favorites".into(),
+                more: None,
+            });
+            out.extend(favorites);
+        }
         let mut section = |label: &str, more: Place, entries: Vec<Entry>| {
             if !entries.is_empty() {
                 out.push(Entry::Header {
@@ -719,6 +755,166 @@ impl Library {
         }
     }
 
+    /// The playlist's .m3u file, which also stands for the playlist in the favourites.
+    // The right-click menus call this; they arrive in a parallel branch.
+    #[allow(dead_code)]
+    pub fn playlist_path(&self, name: &str) -> Option<PathBuf> {
+        self.playlist_file(name).ok().map(|p| abs(&p))
+    }
+
+    /// Renames a playlist with its play count, thumbnail and favourite. Fails if either name is
+    /// invalid or `new` is taken; a change of case only is allowed.
+    pub fn rename_playlist(&mut self, old: &str, new: &str) -> io::Result<()> {
+        let from = self.playlist_file(old)?;
+        let to = self.playlist_file(new)?;
+        if old == new {
+            return Ok(());
+        }
+        // Windows file names ignore case, so "mix" -> "Mix" finds itself at the target.
+        if to.exists() && old.to_lowercase() != new.to_lowercase() {
+            return Err(io::Error::new(
+                ErrorKind::AlreadyExists,
+                format!("a playlist called {new:?} already exists"),
+            ));
+        }
+        let (old_path, new_path) = (abs(&from), abs(&to));
+        fs::rename(from, to)?;
+        if let Some(n) = self.playlist_plays.remove(old) {
+            self.playlist_plays.insert(new.into(), n);
+        }
+        if let Some(p) = self.thumbnails.remove(old) {
+            self.thumbnails.insert(new.into(), p);
+        }
+        for p in &mut self.favorites {
+            if *p == old_path {
+                p.clone_from(&new_path);
+            }
+        }
+        Ok(())
+    }
+
+    /// Deletes a playlist file and what the library keeps about it.
+    // The right-click menus call this; they arrive in a parallel branch.
+    #[allow(dead_code)]
+    pub fn delete_playlist(&mut self, name: &str) -> io::Result<()> {
+        let file = self.playlist_file(name)?;
+        let path = abs(&file);
+        fs::remove_file(file)?;
+        self.playlist_plays.remove(name);
+        self.thumbnails.remove(name);
+        self.favorites.retain(|p| *p != path);
+        Ok(())
+    }
+
+    /// Removes item `index` (as [`Library::playlist_items`] counts) and its `#EXTINF` line,
+    /// keeping every other line of the file as it was.
+    // The right-click menus call this; they arrive in a parallel branch.
+    #[allow(dead_code)]
+    pub fn remove_from_playlist(&mut self, name: &str, index: usize) -> io::Result<()> {
+        let file = self.playlist_file(name)?;
+        let text = String::from_utf8_lossy(&fs::read(&file)?).into_owned();
+        let lines: Vec<&str> = text.lines().collect();
+        let is_item = |l: &str| {
+            let l = l.trim_start_matches('\u{feff}').trim();
+            !l.is_empty() && !l.starts_with('#')
+        };
+        let at = (0..lines.len())
+            .filter(|&i| is_item(lines[i]))
+            .nth(index)
+            .ok_or_else(|| {
+                io::Error::new(
+                    ErrorKind::InvalidInput,
+                    format!("{name} has no item {index}"),
+                )
+            })?;
+        let mut start = at;
+        while start > 0 && lines[start - 1].trim().starts_with("#EXTINF") {
+            start -= 1;
+        }
+        let mut out = String::new();
+        for line in lines[..start].iter().chain(&lines[at + 1..]) {
+            writeln!(out, "{line}").unwrap();
+        }
+        fs::write(file, out)
+    }
+
+    pub fn playlist_thumbnail(&self, name: &str) -> Option<&Path> {
+        self.thumbnails.get(name).map(PathBuf::as_path)
+    }
+
+    /// Sets or, with None, clears the picture a playlist shows.
+    pub fn set_playlist_thumbnail(&mut self, name: &str, image: Option<&Path>) {
+        match image {
+            Some(p) if check_name(name).is_ok() => _ = self.thumbnails.insert(name.into(), abs(p)),
+            _ => _ = self.thumbnails.remove(name),
+        }
+    }
+
+    /// Marks a file as watched to the end, or clears where it stopped. Marking a file never
+    /// played adds it to the end of the recent list, without counting a play.
+    // The right-click menus call this; they arrive in a parallel branch.
+    #[allow(dead_code)]
+    pub fn mark_watched(&mut self, path: &Path, watched: bool) {
+        let path = abs(path);
+        match self.recent.iter_mut().find(|r| r.path == path) {
+            Some(r) if watched => {
+                // An unknown length still needs a fraction of 1.
+                if r.duration <= 0.0 {
+                    r.duration = 1.0;
+                }
+                r.position = r.duration;
+            }
+            Some(r) => r.position = 0.0,
+            None if watched => {
+                if self.recent.len() >= MAX_RECENT {
+                    self.recent.pop();
+                }
+                self.recent.push(Recent {
+                    path,
+                    position: 1.0,
+                    duration: 1.0,
+                });
+            }
+            None => {}
+        }
+    }
+
+    /// Adds `path` (a file, folder or playlist file) to the favourites, or takes it out.
+    // The right-click menus call this; they arrive in a parallel branch.
+    #[allow(dead_code)]
+    pub fn set_favorite(&mut self, path: &Path, favorite: bool) {
+        let path = abs(path);
+        let known = self.favorites.contains(&path);
+        if favorite && !known {
+            self.favorites.push(path);
+        } else if !favorite {
+            self.favorites.retain(|p| *p != path);
+        }
+    }
+
+    // The right-click menus call this; they arrive in a parallel branch.
+    #[allow(dead_code)]
+    pub fn is_favorite(&self, path: &Path) -> bool {
+        self.favorites.contains(&abs(path))
+    }
+
+    /// How a favourite shows on Home: a playlist, a media file or a folder. Playlists and folders
+    /// that are gone are left out.
+    fn favorite_entry(&self, path: &Path) -> Option<Entry> {
+        if path.parent() == Some(abs(&self.playlist_dir()).as_path()) {
+            let name = stem_of(path);
+            return path
+                .is_file()
+                .then(|| folder(&name, Place::Playlist(name.clone())));
+        }
+        if media_kind(path).is_some() {
+            return Some(self.file_media(path));
+        }
+        let section = self.section_of(path).unwrap_or(Section::Videos);
+        path.is_dir()
+            .then(|| folder(&name_of(path), Place::Folder(section, path.to_owned())))
+    }
+
     /// Replaces the music index with the result of a scan. Blank tags count as missing.
     pub fn set_tracks(&mut self, mut tracks: Vec<Track>) {
         for t in &mut tracks {
@@ -863,8 +1059,8 @@ fn top<K: Ord>(counts: impl IntoIterator<Item = (K, u32)>) -> Vec<K> {
     v.into_iter().map(|c| c.0).collect()
 }
 
-/// Rejects names that can't be a file name on Windows.
-fn check_name(name: &str) -> io::Result<()> {
+/// Rejects playlist names that can't be a file name on Windows.
+pub fn check_name(name: &str) -> io::Result<()> {
     let device = name.split('.').next().unwrap_or("").to_ascii_uppercase();
     let reserved = matches!(device.as_str(), "CON" | "PRN" | "AUX" | "NUL")
         || (device.len() == 4
@@ -1192,6 +1388,161 @@ mod tests {
             assert!(lib.add_to_playlist(bad, &a).is_err(), "{bad:?}");
         }
         assert_eq!(lib.playlists().len(), 2);
+    }
+
+    #[test]
+    fn rename_and_delete_playlists() {
+        let tmp = TempDir::new();
+        let mut lib = Library::open(&tmp.0, false);
+        let song = PathBuf::from(r"C:\Music\a.mp3");
+        let cover = PathBuf::from(r"C:\Pictures\cover.png");
+        lib.add_to_playlist("Mix", &song).unwrap();
+        lib.create_playlist("Other").unwrap();
+        lib.record_playlist_play("Mix");
+        lib.set_playlist_thumbnail("Mix", Some(&cover));
+        let mix = lib.playlist_path("Mix").unwrap();
+        lib.set_favorite(&mix, true);
+
+        lib.rename_playlist("Mix", "Road Trip").unwrap();
+        assert_eq!(lib.playlists(), ["Other", "Road Trip"]);
+        assert_eq!(lib.playlist_items("Road Trip"), std::slice::from_ref(&song));
+        assert_eq!(lib.playlist_plays.get("Road Trip"), Some(&1));
+        assert!(!lib.playlist_plays.contains_key("Mix"));
+        assert_eq!(lib.playlist_thumbnail("Road Trip"), Some(cover.as_path()));
+        assert_eq!(lib.playlist_thumbnail("Mix"), None);
+        let road = lib.playlist_path("Road Trip").unwrap();
+        assert!(lib.is_favorite(&road) && !lib.is_favorite(&mix));
+
+        let taken = lib.rename_playlist("Road Trip", "other").unwrap_err();
+        assert_eq!(taken.kind(), ErrorKind::AlreadyExists);
+        assert_eq!(
+            lib.rename_playlist("Road Trip", "a/b").unwrap_err().kind(),
+            ErrorKind::InvalidInput
+        );
+        assert!(lib.rename_playlist("Gone", "New").is_err());
+        lib.rename_playlist("Road Trip", "road trip").unwrap();
+        assert_eq!(lib.playlists(), ["Other", "road trip"]);
+
+        // Thumbnails and favourites survive a save, and a damaged record is skipped.
+        lib.save().unwrap();
+        let state = tmp.0.join(STATE_FILE);
+        let mut text = fs::read_to_string(&state).unwrap();
+        text.push_str("thumb\tbad/name\tC:\\x.png\nthumb\tOther\t\nfavorite\t\nfavorite\n");
+        fs::write(&state, text).unwrap();
+        let reloaded = Library::open(&tmp.0, false);
+        assert_eq!(reloaded.thumbnails, lib.thumbnails);
+        assert_eq!(reloaded.favorites, lib.favorites);
+
+        lib.delete_playlist("road trip").unwrap();
+        assert_eq!(lib.playlists(), ["Other"]);
+        assert!(lib.thumbnails.is_empty() && lib.favorites.is_empty());
+        assert!(lib.playlist_plays.is_empty());
+        assert_eq!(
+            lib.delete_playlist("road trip").unwrap_err().kind(),
+            ErrorKind::NotFound
+        );
+    }
+
+    #[test]
+    fn remove_from_playlist_keeps_other_lines() {
+        let tmp = TempDir::new();
+        let mut lib = Library::open(&tmp.0, false);
+        lib.create_playlist("P").unwrap();
+        let file = tmp.0.join(r"playlists\P.m3u");
+        let text = "#EXTM3U\n#EXTINF:10,One\nC:\\a.mp4\n\n# a note\n#EXTINF:20,Two\nC:\\b.mp4\nC:\\c.mp4\n";
+        fs::write(&file, text).unwrap();
+
+        lib.remove_from_playlist("P", 1).unwrap();
+        assert_eq!(
+            fs::read_to_string(&file).unwrap(),
+            "#EXTM3U\n#EXTINF:10,One\nC:\\a.mp4\n\n# a note\nC:\\c.mp4\n"
+        );
+        lib.remove_from_playlist("P", 0).unwrap();
+        assert_eq!(lib.playlist_items("P"), [PathBuf::from(r"C:\c.mp4")]);
+        let err = lib.remove_from_playlist("P", 1).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(lib.remove_from_playlist("Nope", 0).is_err());
+    }
+
+    #[test]
+    fn mark_watched_and_unwatched() {
+        let tmp = TempDir::new();
+        let mut lib = Library::open(&tmp.0, false);
+        let (half, fresh) = (Path::new(r"C:\v\half.mp4"), Path::new(r"C:\v\new.mp4"));
+        lib.record_position(half, 50.0, 100.0);
+
+        lib.mark_watched(half, true);
+        lib.mark_watched(fresh, true);
+        assert_eq!(lib.resume_position(half), None);
+        let recent = lib.entries(&Place::Recent);
+        assert_eq!(labels(&recent), "half.mp4|new.mp4");
+        assert!(
+            recent
+                .iter()
+                .all(|e| matches!(e, Entry::Media { finished: true, .. }))
+        );
+        assert!(!lib.plays.contains_key(fresh), "marking is not playing");
+
+        lib.mark_watched(half, false);
+        let Entry::Media {
+            progress, finished, ..
+        } = &lib.entries(&Place::Recent)[0]
+        else {
+            panic!()
+        };
+        assert_eq!((*progress, *finished), (Some(0.0), false));
+        assert_eq!(lib.resume_position(half), None);
+
+        // Playing the marked file counts a play, since it never became the most recent.
+        lib.record_position(fresh, 5.0, 60.0);
+        assert_eq!(lib.plays[fresh], 1);
+    }
+
+    #[test]
+    fn favorites_lead_home() {
+        let tmp = TempDir::new();
+        let root = tmp.0.join("Videos");
+        let clip = tmp.touch(r"Videos\Show\ep1.mp4");
+        tmp.touch(r"Videos\Gone\x.mp4");
+        let mut lib = Library::open(&tmp.0.join("state"), false);
+        lib.add_root(Section::Videos, root.clone());
+        lib.create_playlist("Mix").unwrap();
+        lib.record_position(&root.join("half.mp4"), 50.0, 100.0);
+
+        lib.set_favorite(&clip, true);
+        lib.set_favorite(&root.join("Show"), true);
+        lib.set_favorite(&lib.playlist_path("Mix").unwrap(), true);
+        lib.set_favorite(&root.join("Gone"), true);
+        lib.set_favorite(&clip, true);
+        fs::remove_dir_all(root.join("Gone")).unwrap();
+        assert!(lib.is_favorite(&clip));
+
+        let home = lib.entries(&Place::Home);
+        assert_eq!(
+            labels(&home[..5]),
+            "Favorites|ep1.mp4|Show|Mix|Continue Watching"
+        );
+        assert_eq!(
+            home[0],
+            Entry::Header {
+                label: "Favorites".into(),
+                more: None
+            }
+        );
+        assert_eq!(
+            home[2],
+            folder("Show", Place::Folder(Section::Videos, root.join("Show")))
+        );
+        assert_eq!(home[3], folder("Mix", Place::Playlist("Mix".into())));
+
+        lib.set_favorite(&clip, false);
+        lib.set_favorite(&root.join("Show"), false);
+        lib.delete_playlist("Mix").unwrap();
+        assert!(!lib.is_favorite(&clip));
+        assert_eq!(
+            labels(&lib.entries(&Place::Home)),
+            "Continue Watching|half.mp4"
+        );
     }
 
     #[test]

@@ -9,6 +9,7 @@ mod captions;
 mod dsp;
 mod library;
 mod player;
+mod probe;
 mod render;
 mod session;
 mod subs;
@@ -63,7 +64,9 @@ use render::{DeviceLock, Flip, Renderer, VideoAdjust, Zoom};
 use session::{Session, TrackKind};
 use subs::Cues;
 use ui::panels::{ASPECT, CROP};
-use ui::{Action, Hit, Layout, Page, PanelAction, PanelData, Scene, TrackTab, Ui};
+use ui::{
+    Action, Dialog, DialogAction, Hit, Layout, Page, PanelAction, PanelData, Scene, TrackTab, Ui,
+};
 
 /// The window procedure has no user data pointer here, so it reaches shared state through statics.
 static SHARED: OnceLock<Arc<Shared>> = OnceLock::new();
@@ -89,6 +92,10 @@ thread_local! {
     static PENDING: RefCell<Vec<Hit>> = const { RefCell::new(Vec::new()) };
     /// Changes from the tracks and settings popups, applied by the render loop.
     static PANEL_ACTIONS: RefCell<Vec<PanelAction>> = const { RefCell::new(Vec::new()) };
+    /// Requests from the open dialog, applied by the render loop.
+    static DIALOG_ACTIONS: RefCell<Vec<DialogAction>> = const { RefCell::new(Vec::new()) };
+    /// Ctrl+I asked for the Properties dialog; the render loop knows which file.
+    static WANT_PROPERTIES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// Sleep timer choices in minutes, by index into the panel's list; the last one is "End of file".
@@ -636,6 +643,12 @@ fn run() -> Result<(), Box<dyn Error>> {
             // Video adjustments change the picture without a new frame.
             UI.with_borrow_mut(|ui| ui.dirty = true);
         }
+        for action in DIALOG_ACTIONS.with_borrow_mut(std::mem::take) {
+            apply_dialog(&mut app, hwnd, action);
+        }
+        if WANT_PROPERTIES.take() {
+            show_properties(&app);
+        }
         if app.sleep_at.is_some_and(|at| Instant::now() >= at) {
             app.sleep_at = None;
             app.sleep = 0;
@@ -781,13 +794,16 @@ fn run() -> Result<(), Box<dyn Error>> {
                     changed.then(|| renderer.library_layout(w, h, &ui.browse, card))
                 }
             };
-            if let Some(layout) = layout {
+            if let Some(mut layout) = layout {
+                if let Some(d) = &ui.dialog {
+                    renderer.add_dialog(&mut layout, d);
+                }
                 ui.layout = layout;
                 ui.relayout = false;
                 ui.dirty = true;
                 ui.rehover();
             }
-            if ui.settle_seek_preview() {
+            if ui.settle_seek_preview() || ui.dialog_tick() {
                 ui.dirty = true;
             }
             std::mem::take(&mut ui.dirty)
@@ -841,6 +857,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                     has_frame: app.current.is_some(),
                     browse: &ui.browse,
                     panel: Some(&panel_data),
+                    dialog: ui.dialog.as_ref(),
                     cues: &cues,
                     caption_style: &app.caption,
                     stats: stats.as_deref(),
@@ -907,6 +924,7 @@ fn handle(app: &mut App, hwnd: HWND, hit: Hit) {
         }
         Hit::AddHere => match UI.with_borrow(|ui| ui.browse.place.clone()) {
             Place::Playlists => create_playlist(app),
+            Place::Playlist(name) => add_files_to_playlist(app, hwnd, &name),
             place => add_folder(app, hwnd, place.section()),
         },
         Hit::Back => UI.with_borrow_mut(|ui| ui.browse.back()),
@@ -992,18 +1010,199 @@ fn add_folder(app: &mut App, hwnd: HWND, section: Section) {
     }
 }
 
-/// Creates "Playlist N" with the first free N.
-// ponytail: no rename yet; that needs a text field like the search box.
+/// Opens the New Playlist dialog.
 fn create_playlist(app: &mut App) {
-    let taken = app.library.playlists();
-    let name = (1..)
-        .map(|n| format!("Playlist {n}"))
-        .find(|n| !taken.contains(n))
-        .unwrap();
-    match app.library.create_playlist(&name) {
-        Ok(()) => UI.with_borrow_mut(|ui| ui.browse.stale = true),
-        Err(e) => eprintln!("library: cannot create {name}: {e}"),
+    open_dialog(app, Dialog::NewPlaylist { files: Vec::new() });
+}
+
+/// Opens a dialog, filling in what it needs from the library: Rename Playlist shows the
+/// playlist's current thumbnail.
+fn open_dialog(app: &App, dialog: Dialog) {
+    let thumbnail = match &dialog {
+        Dialog::RenamePlaylist(name) => app.library.playlist_thumbnail(name).map(Path::to_owned),
+        _ => None,
+    };
+    UI.with_borrow_mut(|ui| {
+        ui.open_dialog(dialog);
+        ui.dialog_show_thumbnail(thumbnail);
+    });
+}
+
+/// Does what the open dialog asked for.
+fn apply_dialog(app: &mut App, hwnd: HWND, action: DialogAction) {
+    // Library errors in words for the dialog's error line.
+    let explain = |e: std::io::Error| match e.kind() {
+        std::io::ErrorKind::AlreadyExists => "A playlist with this name already exists.".to_owned(),
+        _ => format!("Can't save the playlist: {e}"),
+    };
+    match action {
+        DialogAction::PickFiles => {
+            let files = pick_media_files(hwnd);
+            UI.with_borrow_mut(|ui| ui.dialog_add_files(files));
+        }
+        DialogAction::PickThumbnail => {
+            let images = [(
+                "Images",
+                "*.png;*.jpg;*.jpeg;*.bmp;*.gif;*.webp;*.tif;*.tiff".to_owned(),
+            )];
+            if let Some(image) = pick_files(hwnd, &images, false).pop() {
+                UI.with_borrow_mut(|ui| ui.dialog_set_thumbnail(Some(image)));
+            }
+        }
+        DialogAction::CreatePlaylist {
+            name,
+            thumbnail,
+            files,
+        } => {
+            if let Err(e) = app.library.create_playlist(&name) {
+                UI.with_borrow_mut(|ui| ui.dialog_error(explain(e)));
+                return;
+            }
+            for file in &files {
+                if let Err(e) = app.library.add_to_playlist(&name, file) {
+                    eprintln!("library: cannot add {file:?} to {name}: {e}");
+                }
+            }
+            app.library
+                .set_playlist_thumbnail(&name, thumbnail.as_deref());
+            app.library_changed = true;
+            app.save();
+            UI.with_borrow_mut(|ui| {
+                ui.close_dialog();
+                ui.browse.stale = true;
+            });
+        }
+        DialogAction::RenamePlaylist {
+            from,
+            to,
+            thumbnail,
+        } => {
+            if let Err(e) = app.library.rename_playlist(&from, &to) {
+                UI.with_borrow_mut(|ui| ui.dialog_error(explain(e)));
+                return;
+            }
+            // The thumbnail moved with the playlist; only a new pick replaces it.
+            if let Some(image) = thumbnail {
+                app.library.set_playlist_thumbnail(&to, Some(&image));
+            }
+            app.library_changed = true;
+            app.save();
+            UI.with_borrow_mut(|ui| {
+                ui.close_dialog();
+                // The open playlist page follows its new name.
+                if ui.browse.place == Place::Playlist(from) {
+                    ui.browse.place = Place::Playlist(to);
+                }
+                ui.browse.stale = true;
+            });
+        }
+        DialogAction::OpenLink(url) => {
+            use windows::Win32::UI::Shell::ShellExecuteW;
+            unsafe {
+                ShellExecuteW(
+                    Some(hwnd),
+                    w!("open"),
+                    &HSTRING::from(url),
+                    None,
+                    None,
+                    SW_SHOWNORMAL,
+                )
+            };
+        }
     }
+    UI.with_borrow_mut(|ui| ui.dirty = true);
+}
+
+/// Properties of the file playing, else of the library file under the pointer.
+fn show_properties(app: &App) {
+    let path = app.session.as_ref().map(|s| s.path.clone()).or_else(|| {
+        UI.with_borrow(|ui| match ui.hover {
+            Some(Hit::Entry(i)) => match ui.browse.entries.get(i) {
+                Some(Entry::Media { path, .. }) => Some(path.clone()),
+                _ => None,
+            },
+            _ => None,
+        })
+    });
+    if let Some(path) = path {
+        open_dialog(app, Dialog::Properties(path));
+    }
+}
+
+/// The header's "+" on a playlist page: picks files and appends them.
+fn add_files_to_playlist(app: &mut App, hwnd: HWND, name: &str) {
+    for file in pick_media_files(hwnd) {
+        if let Err(e) = app.library.add_to_playlist(name, &file) {
+            eprintln!("library: cannot add {file:?} to {name}: {e}");
+        }
+    }
+    UI.with_borrow_mut(|ui| ui.browse.stale = true);
+}
+
+/// The system file picker for video and audio files, several at once.
+fn pick_media_files(hwnd: HWND) -> Vec<PathBuf> {
+    let spec = |exts: &[&str]| {
+        exts.iter()
+            .map(|e| format!("*.{e}"))
+            .collect::<Vec<_>>()
+            .join(";")
+    };
+    let (video, audio) = (spec(library::VIDEO_EXTS), spec(library::AUDIO_EXTS));
+    let filters = [
+        ("Media files", format!("{video};{audio}")),
+        ("Video files", video),
+        ("Audio files", audio),
+        ("All files", "*.*".to_owned()),
+    ];
+    pick_files(hwnd, &filters, true)
+}
+
+/// The system file picker with (name, "*.a;*.b") filters; empty when cancelled. Modal, like
+/// the folder picker.
+fn pick_files(hwnd: HWND, filters: &[(&str, String)], multiple: bool) -> Vec<PathBuf> {
+    use windows::Win32::UI::Shell::Common::COMDLG_FILTERSPEC;
+    use windows::Win32::UI::Shell::FOS_ALLOWMULTISELECT;
+    // The filter strings must outlive the dialog.
+    let strings: Vec<(HSTRING, HSTRING)> = filters
+        .iter()
+        .map(|(name, spec)| (HSTRING::from(*name), HSTRING::from(spec.as_str())))
+        .collect();
+    let specs: Vec<COMDLG_FILTERSPEC> = strings
+        .iter()
+        .map(|(name, spec)| COMDLG_FILTERSPEC {
+            pszName: windows::core::PCWSTR(name.as_ptr()),
+            pszSpec: windows::core::PCWSTR(spec.as_ptr()),
+        })
+        .collect();
+    let picked = || -> Option<Vec<PathBuf>> {
+        unsafe {
+            let dialog: IFileOpenDialog =
+                CoCreateInstance(&FileOpenDialog, None, CLSCTX_INPROC_SERVER).ok()?;
+            dialog.SetFileTypes(&specs).ok()?;
+            let mut options = dialog.GetOptions().ok()? | FOS_FORCEFILESYSTEM;
+            if multiple {
+                options |= FOS_ALLOWMULTISELECT;
+            }
+            dialog.SetOptions(options).ok()?;
+            dialog.Show(Some(hwnd)).ok()?; // fails when cancelled
+            let items = dialog.GetResults().ok()?;
+            let mut paths = Vec::new();
+            for i in 0..items.GetCount().ok()? {
+                let Ok(name) = items
+                    .GetItemAt(i)
+                    .and_then(|item| item.GetDisplayName(SIGDN_FILESYSPATH))
+                else {
+                    continue;
+                };
+                if let Ok(path) = name.to_string() {
+                    paths.push(PathBuf::from(path));
+                }
+                CoTaskMemFree(Some(name.0 as _));
+            }
+            Some(paths)
+        }
+    };
+    picked().unwrap_or_default()
 }
 
 /// "16:9" or "2.39:1" as a whole-number ratio; None for "Default".
@@ -1286,7 +1485,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             let mut p = windows::Win32::Foundation::POINT { x: sx, y: sy };
             unsafe { _ = ScreenToClient(hwnd, &mut p) };
             let (x, y) = to_dips(hwnd, p.x, p.y);
-            if UI.with_borrow(|ui| ui.over_panel(x, y)) {
+            if UI.with_borrow(|ui| ui.dialog.is_some()) {
+                UI.with_borrow_mut(|ui| ui.scroll_dialog(notches));
+            } else if UI.with_borrow(|ui| ui.over_panel(x, y)) {
                 UI.with_borrow_mut(|ui| ui.scroll_panel(x, y, -60.0 * notches));
             } else if UI.with_borrow(|ui| ui.page == Page::Library || ui.over_overlay()) {
                 UI.with_borrow_mut(|ui| ui.scroll(-120.0 * notches));
@@ -1301,6 +1502,22 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         WM_DROPFILES => {
             let drop = HDROP(wparam.0 as _);
             let mut name = [0u16; 32_768];
+            // The New Playlist dialog takes every dropped file into its list.
+            if UI.with_borrow(Ui::dialog_takes_files) {
+                let count = unsafe { DragQueryFileW(drop, u32::MAX, None) };
+                let files = (0..count)
+                    .filter_map(|i| {
+                        let len = unsafe { DragQueryFileW(drop, i, Some(&mut name)) } as usize;
+                        (len > 0).then(|| PathBuf::from(String::from_utf16_lossy(&name[..len])))
+                    })
+                    .collect();
+                unsafe { DragFinish(drop) };
+                UI.with_borrow_mut(|ui| {
+                    ui.dialog_add_files(files);
+                    ui.dirty = true;
+                });
+                return LRESULT(0);
+            }
             let len = unsafe { DragQueryFileW(drop, 0, Some(&mut name)) } as usize;
             unsafe { DragFinish(drop) };
             if len > 0 {
@@ -1317,11 +1534,19 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 unsafe { SetCursor(None) };
                 return LRESULT(1);
             }
+            if over_client && let Some(cursor) = UI.with_borrow(Ui::dialog_cursor) {
+                unsafe { SetCursor(LoadCursorW(None, cursor).ok()) };
+                return LRESULT(1);
+            }
             return unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) };
         }
         WM_CHAR => {
             // Typing goes to the library's search box while it has focus.
             let c = wparam.0 as u32;
+            // An open dialog takes typing before the search box.
+            if UI.with_borrow_mut(|ui| ui.dialog_char(c)) {
+                return LRESULT(0);
+            }
             UI.with_borrow_mut(|ui| {
                 let b = &mut ui.browse;
                 if !b.searching {
@@ -1462,6 +1687,7 @@ fn act(hwnd: HWND, shared: &Shared, action: Option<Action>) {
         }
         Action::SetVolume(volume) => shared.set_volume(volume),
         Action::Panel(a) => PANEL_ACTIONS.with_borrow_mut(|p| p.push(a)),
+        Action::Dialog(a) => DIALOG_ACTIONS.with_borrow_mut(|p| p.push(a)),
     }
 }
 
@@ -1469,6 +1695,13 @@ fn on_key(hwnd: HWND, shared: &Shared, key: VIRTUAL_KEY) {
     let shift = unsafe { GetKeyState(i32::from(VK_SHIFT.0)) } < 0;
     let step = if shift { 60.0 } else { 10.0 };
     let page = UI.with_borrow(|ui| ui.page);
+    // An open dialog takes every key.
+    if UI.with_borrow(|ui| ui.dialog.is_some()) {
+        let ctrl = unsafe { GetKeyState(i32::from(VK_CONTROL.0)) } < 0;
+        let action = UI.with_borrow_mut(|ui| ui.dialog_key(key, shift, ctrl));
+        act(hwnd, shared, action);
+        return;
+    }
     // While searching, keys type; Esc clears the search and Enter keeps it.
     if UI.with_borrow(|ui| ui.browse.searching) {
         UI.with_borrow_mut(|ui| match key {
@@ -1500,6 +1733,9 @@ fn on_key(hwnd: HWND, shared: &Shared, key: VIRTUAL_KEY) {
         // Esc leaves the player for the library, which keeps playing in the mini player.
         VK_ESCAPE => UI.with_borrow_mut(|ui| ui.show(Page::Library)),
         VK_Q => unsafe { _ = DestroyWindow(hwnd) },
+        VK_F1 => UI.with_borrow_mut(|ui| ui.open_dialog(Dialog::Shortcuts)),
+        // VLC's "Media Information": the file playing, else the file under the pointer.
+        VK_I if unsafe { GetKeyState(i32::from(VK_CONTROL.0)) } < 0 => WANT_PROPERTIES.set(true),
         _ => {}
     }
 }

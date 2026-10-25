@@ -4,6 +4,7 @@
 //! Sizes are DIPs measured from the design's 1920x1080 frames.
 
 mod browse;
+pub mod dialog;
 pub mod panels;
 
 use std::collections::HashMap;
@@ -11,6 +12,7 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 pub use browse::Browse;
+pub use dialog::{Dialog, DialogAction};
 pub use panels::{Panel, PanelAction, PanelData, TrackTab};
 use windows::Win32::Foundation::E_FAIL;
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
@@ -167,6 +169,8 @@ pub enum Hit {
     Panel,
     /// The tracks or settings popup.
     Popup(panels::Target),
+    /// The open dialog, which takes every click.
+    Dialog(dialog::Target),
 }
 
 impl Hit {
@@ -197,6 +201,7 @@ pub struct Layout {
     volume: Rect,
     browse: browse::Geometry,
     panels: panels::Geometry,
+    dialog: Option<dialog::Geometry>,
 }
 
 impl Layout {
@@ -249,6 +254,7 @@ impl Layout {
             volume: Rect::new(w - 292.0, cy - 14.0, w - 204.0, cy + 14.0),
             browse: Default::default(),
             panels: Default::default(),
+            dialog: None,
         }
     }
 
@@ -269,6 +275,9 @@ impl Layout {
     }
 
     pub fn hit(&self, x: f32, y: f32) -> Option<Hit> {
+        if let Some(d) = &self.dialog {
+            return Some(Hit::Dialog(d.hit(x, y)));
+        }
         if self.page == Page::Library {
             return self.browse_hit(x, y);
         }
@@ -313,6 +322,7 @@ pub enum Action {
     SeekTo(f64),
     SetVolume(f32),
     Panel(PanelAction),
+    Dialog(DialogAction),
 }
 
 /// Pointer state. Lives on the UI thread; the window procedure feeds it and the render loop
@@ -337,6 +347,8 @@ pub struct Ui {
     pub panels: panels::State,
     /// The last slider pressed and when, to spot a double-click that resets it.
     last_slider: Option<(panels::Ctl, Instant)>,
+    /// The open dialog, if any.
+    pub dialog: Option<dialog::State>,
 }
 
 /// Two presses on a slider this close together reset it.
@@ -359,6 +371,7 @@ impl Ui {
             overlay: false,
             panels: panels::State::default(),
             last_slider: None,
+            dialog: None,
         }
     }
 
@@ -481,6 +494,7 @@ impl Ui {
         self.page == Page::Library
             || self.overlay
             || self.panels.open.is_some()
+            || self.dialog.is_some()
             || paused
             || self.drag.is_some()
             || self.hover.is_some_and(Hit::in_bars)
@@ -524,6 +538,7 @@ impl Ui {
                 x - self.layout.volume.l,
             ))),
             Some(Hit::Popup(panels::Target::Ctl(ctl))) => self.slide(ctl, x),
+            Some(Hit::Dialog(_)) => self.dialog_drag(x),
             _ => None,
         }
     }
@@ -565,6 +580,7 @@ impl Ui {
                 self.drag = Some(hit);
                 self.slide(ctl, x)
             }
+            Some(Hit::Dialog(target)) => self.dialog_down(target, x),
             _ => None,
         }
     }
@@ -592,6 +608,7 @@ impl Ui {
             None => match hit {
                 Some(Hit::Caption | Hit::Seek | Hit::Volume | Hit::Panel) => None,
                 Some(Hit::Popup(target)) => self.panel_click(target),
+                Some(Hit::Dialog(target)) => self.dialog_click(target),
                 Some(h @ (Hit::Audio | Hit::Subtitles | Hit::Settings)) => {
                     // Its own button closes a popup; another button switches to its popup.
                     let open = self.panels.opener != Some(h);
@@ -647,6 +664,8 @@ pub struct Scene<'a> {
     pub browse: &'a Browse,
     /// What the tracks and settings popups show.
     pub panel: Option<&'a PanelData>,
+    /// The open dialog's text, files and caret.
+    pub dialog: Option<&'a dialog::State>,
     /// Subtitle cues to show now, and how.
     pub cues: &'a [crate::subs::Cue],
     pub caption_style: &'a crate::captions::CaptionStyle,
@@ -902,6 +921,7 @@ pub struct Painter {
     dwrite: IDWriteFactory6,
     lib: browse::Resources,
     panels: panels::Resources,
+    dialog: dialog::Resources,
     /// Thumbnails by file; None means the file has no picture.
     thumbs: HashMap<PathBuf, Option<ID2D1Bitmap>>,
     /// Visible files without a thumbnail yet, collected while painting.
@@ -937,6 +957,7 @@ impl Painter {
             frame: None,
             lib: browse::Resources::new(ctx, &factory, &dwrite, &fonts)?,
             panels: panels::Resources::new(ctx, &dwrite, &fonts)?,
+            dialog: dialog::Resources::new(ctx, &factory, &dwrite, &fonts)?,
             captions: crate::captions::CaptionRenderer::new(ctx, &dwrite, Some(&fonts))?,
             stats_text: {
                 let f = text_format(
@@ -1020,8 +1041,16 @@ impl Painter {
     }
 
     /// Paints the interface over the video, which the renderer has already drawn into the
-    /// video area. Runs between BeginDraw and EndDraw.
+    /// video area, and the open dialog over both. Runs between BeginDraw and EndDraw.
     pub fn paint(&mut self, ctx: &ID2D1DeviceContext5, s: &Scene) -> Result<()> {
+        self.paint_page(ctx, s)?;
+        match (&s.layout.dialog, s.dialog) {
+            (Some(g), Some(d)) => self.paint_dialog(ctx, s, g, d),
+            _ => Ok(()),
+        }
+    }
+
+    fn paint_page(&mut self, ctx: &ID2D1DeviceContext5, s: &Scene) -> Result<()> {
         if s.layout.page == Page::Library {
             return self.paint_library(ctx, s);
         }

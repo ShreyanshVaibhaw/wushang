@@ -34,7 +34,9 @@ Esc or the folder name in the player's title bar goes back to the library, and t
 In the player, the sidebar button opens the design's overlay panel over the video: a rail of section icons and a compact list of the same library, with history, breadcrumb and sort.
 Clicking a file there plays it with the panel still open; a click on the video or Esc closes it, and the arrow button at its top right opens the full library page.
 Dropping a file on the window plays it, or adds it to the playlist on screen.
-"Create playlist" makes "Playlist 1", "Playlist 2" and so on; playlists are standard M3U files.
+"Create playlist" and the header's + open the New Playlist dialog from the design: a name, an optional thumbnail picture, and files picked or dropped on the window.
+On a playlist's page the header's + adds files to it.
+Playlists are standard M3U files.
 
 Library state (folders, recent files and positions, visit and play counts) lives in `%APPDATA%\myvlc`, or in the folder named by the `MYVLC_HOME` environment variable, which never seeds your own folders and suits tests.
 
@@ -68,6 +70,8 @@ Switching tracks and seeking land on the exact moment: the decoders read from th
 | Esc | Leave fullscreen, or go to the library |
 | Backspace | Back, in the library |
 | Q | Quit |
+| F1 | Keyboard shortcuts |
+| Ctrl+I | Properties of the file playing, or of the file under the pointer |
 
 The window opens the way it was launched, so a shortcut set to "Run: Minimized", or a script that asks for minimized without activation, never takes focus.
 
@@ -232,7 +236,7 @@ Each of these is marked with a `ponytail:` comment in the code, along with the u
 - A video stream that fails its first 60 packets counts as undecodable, and playback goes on with audio only.
 - The music tag index isn't saved, so Albums, Artists and Genres fill in a moment after each start.
 - Thumbnails stay in memory for the whole run, about 350 KB each.
-- Playlists can't be renamed yet, and Network, Podcasts and Radio do nothing.
+- Network, Podcasts and Radio do nothing.
 - The folder picker is modal, so the video pauses on screen while it is open (audio keeps playing).
 
 ## Licence of the build
