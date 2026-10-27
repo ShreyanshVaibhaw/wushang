@@ -5,7 +5,7 @@ edition = "2024"
 
 [dependencies]
 cpal = "0.18.2"
-ffmpeg-next = { version = "9.0.0", default-features = false, features = ["codec", "format", "software-resampling", "software-scaling"] }
+ffmpeg-next = { version = "9.0.0", default-features = false, features = ["codec", "device", "format", "software-resampling", "software-scaling"] }
 windows-numerics = "0.3.1"
 windows = { version = "0.62.2", features = [
   "Win32_Foundation",

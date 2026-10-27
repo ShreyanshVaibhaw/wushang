@@ -1295,7 +1295,7 @@ impl Painter {
                                     self.wanted.push(path.clone());
                                 }
                                 // Streams never get a picture; they show the Network glyph.
-                                let stream = crate::net::is_url_path(path);
+                                let stream = crate::net::is_address(path);
                                 let audio = *kind == MediaKind::Audio;
                                 let fill = if audio || stream {
                                     &self.lib.panel

@@ -15,6 +15,7 @@ use ffmpeg_next as ff;
 use crate::audio;
 use crate::net;
 use crate::player::{self, FrameQueue, HwDevice, PacketQueue, Route, Routes, Shared};
+use crate::record;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum TrackKind {
@@ -86,6 +87,9 @@ pub fn open_input(
     options: NetOptions,
     cancel: &Arc<AtomicBool>,
 ) -> Result<ff::format::context::Input, String> {
+    if crate::capture::is_capture_path(path) {
+        return crate::capture::open(path);
+    }
     if !net::is_url_path(path) {
         return ff::format::input(path).map_err(|e| format!("cannot open {path:?}: {e}"));
     }
@@ -162,6 +166,8 @@ pub struct Session {
     initial_subtitles: Option<SubtitleStream>,
     /// Set on drop, so a network read that hangs gives up and the demuxer can be joined.
     cancel: Arc<AtomicBool>,
+    /// Asks the demuxer to record, and hears back when a recording is done.
+    record: record::Control,
 }
 
 impl Session {
@@ -281,7 +287,10 @@ impl Session {
         };
 
         let url = net::is_url_path(path).then(|| path.to_string_lossy().into_owned());
+        let capture = crate::capture::is_capture_path(path);
         let title = match &url {
+            // The app names a device after the menu entry it came from.
+            _ if capture => "Capture".to_owned(),
             // A stream's own title ("icy-name" for radio) beats its address.
             Some(url) => (input.metadata().get("icy-name"))
                 .or(input.metadata().get("title"))
@@ -295,6 +304,7 @@ impl Session {
                 .replace('_', " "),
         };
         let folder = match &url {
+            _ if capture => String::new(),
             Some(url) => net::host_of(url).unwrap_or_default(),
             None => path
                 .parent()
@@ -322,6 +332,7 @@ impl Session {
             subtitle_track: None,
             initial_subtitles: None,
             cancel,
+            record: record::Control::default(),
         };
         if let Some(stream) = video {
             let decoder = session.open_video(stream)?;
@@ -344,7 +355,7 @@ impl Session {
             input,
             session.routes.clone(),
             shared.clone(),
-            false,
+            player::Role::Main(Some(session.record.clone())),
         ));
         Ok(session)
     }
@@ -565,7 +576,12 @@ impl Session {
         }
         self.tracks[TrackKind::Audio as usize].extend(added);
         let routes: Routes = Arc::new(Mutex::new(Vec::new()));
-        let demuxer = player::spawn_demuxer(input, routes.clone(), self.shared.clone(), true);
+        let demuxer = player::spawn_demuxer(
+            input,
+            routes.clone(),
+            self.shared.clone(),
+            player::Role::Follower,
+        );
         self.externals.push(External {
             path: path.to_owned(),
             routes,
@@ -644,6 +660,20 @@ impl Session {
     /// The subtitle track opened with the file (a default and forced one), handed out once.
     pub fn take_initial_subtitles(&mut self) -> Option<SubtitleStream> {
         self.initial_subtitles.take()
+    }
+
+    /// Records from here on into `path`, or stops recording with None.
+    pub fn set_recording(&self, path: Option<PathBuf>) {
+        self.record.lock().unwrap().want = path;
+    }
+
+    pub fn recording(&self) -> bool {
+        self.record.lock().unwrap().want.is_some()
+    }
+
+    /// The control the demuxer reports finished recordings through, which outlives the session.
+    pub fn record_control(&self) -> record::Control {
+        self.record.clone()
     }
 
     /// Start in seconds and title of each chapter, read when the file opened.

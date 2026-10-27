@@ -59,7 +59,7 @@ The title bar has minimize, maximize, fullscreen and close, and dragging it move
 While playing, the bars hide after 3 seconds without mouse movement and the video fills the window inside a 10 px rounded frame; moving the mouse brings them back.
 The "…" button opens the main menu from the design: open files, open a folder, recent files, settings profiles, keyboard shortcuts, Customize Player, Settings and About.
 Right-clicking the video opens the player menu: play, stop, previous, next, hide the controls, the mini player, and submenus for speed and sleep timer, video tracks and transforms, audio tracks, stereo mode and output device, subtitles, the settings tabs, the queue, and opening media.
-Items for features myvlc doesn't have (discs, capture devices, converting, recording) are shown dimmed.
+Items for features myvlc doesn't have (discs, streaming out) are shown dimmed.
 
 The playlist button opens the queue panel from the design, in the settings panel's place, with three tabs:
 
@@ -110,6 +110,9 @@ The window opens the way it was launched, so a shortcut set to "Run: Minimized",
 ### Snapshots
 
 Shift+S, "Take Snapshot" in the player menu's Video submenu, or the snapshot button from Customize Player saves the frame on screen as a PNG in `Pictures\myvlc`.
+R, "Record" in the player menu, or the record button from Customize Player records what plays into a Matroska file in `Videos\myvlc`, copied packet for packet without re-encoding, until R is pressed again or the media ends.
+The file holds what was on screen: it starts at the keyframe before the picture (copied video can only start on one), packets go in as playback reaches them rather than as the demuxer reads ahead, and a seek while recording carries on in the same file instead of jumping in it.
+Network streams record too; the recording button lights while it runs.
 It is the full-resolution frame with flips, rotation, crop, aspect ratio and colour adjustments as shown, but not zoom or the interface.
 The file is named after the video and the moment in it, such as `Holiday 1m05s.png`, and a line over the video says where it went.
 
@@ -121,7 +124,7 @@ Dropping on the seek bar starts the centre group, and the control bar then takes
 Save keeps the bars in `toolbar.txt` next to the library state; Cancel or Esc drops the changes.
 
 Besides the bars' own controls, the palette has spacers and dividers, snapshot, playback speed, skip 10 or 15 seconds either way, stop, repeat, shuffle, the mini player, zoom, quit, Settings, the library, the file name, properties, replay, chapters, favourite, add a bookmark, bookmarks and playlists.
-Record, HDR, the right sidebar, a thumbnail and the artist and playlist names are dimmed, as myvlc can't do them yet.
+HDR, the right sidebar, a thumbnail and the artist and playlist names are dimmed, as myvlc can't do them yet.
 
 ### Mini player
 
@@ -147,6 +150,19 @@ Podcasts takes an RSS or Atom feed and lists its episodes, newest as the feed or
 Radio lists the 100 most voted stations of the community [Radio Browser](https://www.radio-browser.info) directory, with their genre and country.
 Episodes and stations play with the name the page shows, and next and previous move through the page.
 Feeds and the directory load over WinHTTP on a background thread, so the window never waits on them.
+
+### Capture devices
+
+"Open Capture Device" in the "..." menu lists the cameras, capture cards and microphones DirectShow sees, and the screen.
+Picking one plays it live, and Record saves it like any other media.
+The list is gathered in the background and again each time the menu opens, so a camera plugged in later shows up.
+
+### Converting
+
+"Convert" in a file's right-click menu, or in the "..." menu for the open file, re-encodes it into an MP4 (H.264 and AAC, saved in `Videos\myvlc`) or an MP3 (the sound alone, saved in `Music\myvlc`); Ctrl+R makes an MP4 of the open file.
+It encodes with Windows' own Media Foundation encoders, so the FFmpeg build carries no encoder library and stays LGPL.
+The conversion runs in the background with its progress in the corner, on the player or the library, and "Stop Converting" in the "..." menu ends it and deletes the unfinished file.
+Video gets about 0.08 bits per pixel per frame (5 Mb/s for 1080p at 30 frames a second), sound 192 kb/s.
 
 ### Settings
 
@@ -208,13 +224,16 @@ SRC=/mnt/d/tools/src/ffmpeg-9.0.2 DAV1D_SRC=/mnt/d/tools/src/dav1d-1.5.4 \
   bash scripts/build-ffmpeg.sh
 ```
 
-It builds the file protocol and the network ones a player opens (http, https, tcp, udp, rtp, with TLS from Windows' Schannel), 36 demuxers (HLS and RTSP among them), 20 parsers, 50 decoders and the D3D11VA hwaccels, plus libswresample and libswscale.
+It builds the file protocol and the network ones a player opens (http, https, tcp, udp, rtp, with TLS from Windows' Schannel), 36 demuxers (HLS and RTSP among them), 20 parsers, 51 decoders (raw video among them, for capture devices) and the D3D11VA hwaccels, plus libswresample and libswscale.
+For recording and converting it adds 9 muxers (Matroska, MP4 and MPEG-TS among them), every bitstream filter, and Media Foundation's H.264, HEVC, AAC and MP3 encoders, which come with Windows.
+The DirectShow and GDI capture devices are in a sixth DLL, `avdevice-63.dll` (89 KB).
 The subtitle decoders (SRT, ASS/SSA, WebVTT, MP4 text, MicroDVD, SubViewer, SAMI, DVD, DVB and PGS) and their file demuxers add 78 KB.
 zlib, linked statically into `avformat-63.dll` (43 KB more), lets the Matroska reader open tracks stored zlib-compressed, which mkvmerge does to subtitles by default; without it those files log "Unsupported encoding type" and their subtitles are lost.
 One of the decoders is libdav1d, linked statically into `avcodec-63.dll`, so AV1 plays in software on GPUs without AV1 support.
-Encoders, muxers, filters, devices and the command-line programs are left out.
+Other encoders, filters and the command-line programs are left out.
 Networking adds 286 KB to `avformat-63.dll`, which then also imports `WS2_32`, `Secur32`, `CRYPT32` and `ncrypt`.
 x86 assembly stays on, so software decoding is as fast as in a full build.
+Media Foundation makes `avcodec-63.dll` import `mfplat` and `ole32`, and capture makes `avdevice-63.dll` import `GDI32`, `USER32`, `OLEAUT32` and `SHLWAPI`.
 Apart from that, the DLLs import only `KERNEL32`, `msvcrt` and `bcrypt`.
 
 ## How it works
@@ -312,8 +331,8 @@ The memory, CPU and startup rows were measured before libdav1d was added to the 
 
 | | Full (BtbN LGPL) | Slim, with libdav1d |
 |---|---|---|
-| Five FFmpeg DLLs on disk | 114.4 MB | 14.3 MB (12.1 MB without libdav1d) |
-| `avcodec-63.dll` | 86.9 MB | 9.9 MB (7.9 MB without libdav1d) |
+| FFmpeg DLLs on disk | 114.4 MB | 15.4 MB (13.2 MB without libdav1d) |
+| `avcodec-63.dll` | 86.9 MB | 10.7 MB (8.7 MB without libdav1d) |
 | H.264: private memory / working set | 88.8 / 88.2 MB | 79.1 / 82.2 MB |
 | HEVC: private memory / working set | 98.2 / 94.9 MB | 88.6 / 89.1 MB |
 | VP9: private memory / working set | 65.3 / 64.6 MB | 55.5 / 58.5 MB |

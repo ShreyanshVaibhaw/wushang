@@ -12,8 +12,9 @@ use std::path::{Path, PathBuf};
 use super::browse::SortMode;
 use super::panels::{ASPECT, CROP, PanelAction, PanelData, SLEEP, STEREO, SettingsTab, ZOOM};
 use super::*;
+use crate::convert::Target as Format;
 use crate::library::{Entry, Place};
-use crate::net::{NetKind, is_url_path};
+use crate::net::{NetKind, is_address};
 
 const ROW: f32 = 48.0;
 /// Space between the frame and the first and last rows, and the rows' inset from the sides.
@@ -73,6 +74,15 @@ pub enum MenuAction {
     CustomizePlayer,
     /// Saves the frame on screen as a picture.
     Snapshot,
+    /// Starts recording what plays, or stops.
+    Record,
+    /// Plays a capture device: its address and its name.
+    OpenCapture(String, String),
+    /// Converts a file into an MP4 or an MP3.
+    Convert(PathBuf, Format),
+    /// Converts the open file into an MP4 (Ctrl+R).
+    ConvertOpen,
+    CancelConvert,
     /// Switches to the named settings profile.
     Profile(String),
     /// Asks for a name and adds a profile.
@@ -708,7 +718,38 @@ impl Geometry {
 }
 
 /// The title bar's "..." menu. `recent` is the newest first; `profile` is the one in force.
-pub fn main_menu(recent: &[PathBuf], profiles: &[String], profile: &str) -> Vec<Item> {
+/// What the main menu's Convert offers.
+pub enum Converting<'a> {
+    /// Nothing open that can be converted.
+    Nothing,
+    /// The open file.
+    File(&'a Path),
+    /// A conversion is running; Convert becomes Stop Converting.
+    Running,
+}
+
+pub fn main_menu(
+    recent: &[PathBuf],
+    profiles: &[String],
+    profile: &str,
+    devices: &[crate::capture::Device],
+    converting: Converting,
+) -> Vec<Item> {
+    // A submenu row has its arrow where the shortcut would go.
+    let convert = match converting {
+        Converting::Nothing => Item::off("Convert").key("Ctrl + R"),
+        Converting::File(path) => Item::submenu("Convert", convert_menu(path)),
+        Converting::Running => Item::new("Stop Converting", MenuAction::CancelConvert),
+    };
+    let devices = devices
+        .iter()
+        .map(|d| {
+            Item::new(
+                d.name.clone(),
+                MenuAction::OpenCapture(d.address.clone(), d.name.clone()),
+            )
+        })
+        .collect();
     let recent = recent
         .iter()
         .take(10)
@@ -731,13 +772,10 @@ pub fn main_menu(recent: &[PathBuf], profiles: &[String], profile: &str) -> Vec<
         Item::new("Open Network Stream", MenuAction::OpenNetwork)
             .icon(Icon::Network)
             .key("Ctrl + N"),
-        // ponytail: discs, capture devices and converting need FFmpeg's devices and muxers,
-        // which the slim build leaves out; build with them first.
+        // ponytail: discs need libdvdnav and libbluray, which the FFmpeg build leaves out.
         Item::off("Open Disc").icon(Icon::Disc).key("Ctrl + D"),
-        Item::off("Open Capture Device")
-            .icon(Icon::Capture)
-            .key("Ctrl + C"),
-        Item::off("Convert").icon(Icon::Convert).key("Ctrl + R"),
+        Item::submenu("Open Capture Device", devices).icon(Icon::Capture),
+        convert.icon(Icon::Convert),
         Item::submenu("Open Recent", recent).icon(Icon::Recent),
         Item::divider(),
         Item::submenu(format!("Profile ({profile})"), profile_items).icon(Icon::Profile),
@@ -917,8 +955,16 @@ pub fn player_menu(d: &PanelData, paused: bool) -> Vec<Item> {
         Item::new("Next Item", MenuAction::Next)
             .icon(Icon::Next)
             .key("N"),
-        // ponytail: recording needs a muxer, which the slim FFmpeg build leaves out.
-        Item::off("Record").icon(Icon::Record).key("R"),
+        Item::new(
+            if d.recording {
+                "Stop Recording"
+            } else {
+                "Record"
+            },
+            MenuAction::Record,
+        )
+        .icon(Icon::Record)
+        .key("R"),
         Item::divider(),
         Item::new("Hide UI", MenuAction::HideUi)
             .icon(Icon::HideUi)
@@ -957,7 +1003,7 @@ pub fn entry_menu(
         _ => None,
     };
     match entry {
-        Entry::Media { path, .. } if is_url_path(path) => {
+        Entry::Media { path, .. } if is_address(path) => {
             let saved = *place == Place::Network;
             Some((Kind::File, stream_menu(path, playlists, saved)))
         }
@@ -1018,6 +1064,20 @@ fn stream_menu(path: &Path, playlists: &[String], saved: bool) -> Vec<Item> {
     items
 }
 
+/// Convert's choices for `path`.
+fn convert_menu(path: &Path) -> Vec<Item> {
+    vec![
+        Item::new(
+            "MP4 (H.264 + AAC)",
+            MenuAction::Convert(path.to_owned(), Format::Mp4),
+        ),
+        Item::new(
+            "MP3 (sound only)",
+            MenuAction::Convert(path.to_owned(), Format::Mp3),
+        ),
+    ]
+}
+
 fn file_menu(path: &Path, playlists: &[String], within: Option<&str>) -> Vec<Item> {
     let one = || vec![path.to_owned()];
     let add = add_to_playlist(path, playlists);
@@ -1025,9 +1085,9 @@ fn file_menu(path: &Path, playlists: &[String], within: Option<&str>) -> Vec<Ite
         Item::new("Play", MenuAction::Play(path.to_owned())).icon(Icon::Play),
         Item::new("Mark as Watched", MenuAction::MarkWatched(path.to_owned())).icon(Icon::Watched),
         Item::new("Favorite", MenuAction::Favorite(path.to_owned())).icon(Icon::Heart),
-        // ponytail: streaming and converting need FFmpeg's muxers and network output.
+        // ponytail: streaming out needs a server side (an HTTP or RTSP output); VLC's sout has one.
         Item::off("Stream").icon(Icon::Network),
-        Item::off("Convert").icon(Icon::Convert),
+        Item::submenu("Convert", convert_menu(path)).icon(Icon::Convert),
         Item::new("Add to Queue", MenuAction::AddToQueue(one())).icon(Icon::Queue),
         Item::submenu("Add to Playlist", add).icon(Icon::Playlist),
         Item::new(
@@ -1067,7 +1127,7 @@ pub fn queue_menu(
     playlists: &[String],
 ) -> Vec<Item> {
     use crate::ui::queue::QueueAction;
-    let mut items = if is_url_path(path) {
+    let mut items = if is_address(path) {
         stream_menu(path, playlists, false)
     } else {
         file_menu(path, playlists, None)
@@ -1373,7 +1433,12 @@ mod tests {
     #[test]
     fn layout_follows_the_design_rows() {
         let mut s = State::default();
-        s.open(Kind::Main, main_menu(&[], &[], "Movies"), 51.0, 38.0);
+        s.open(
+            Kind::Main,
+            main_menu(&[], &[], "Movies", &[], Converting::Nothing),
+            51.0,
+            38.0,
+        );
         let g = Geometry::new(&s, 1600.0, 900.0);
         let level = &g.levels[0];
         // 12 rows of 48 and one divider, inside 4 DIPs of padding: the design's 375 x 585.
@@ -1444,10 +1509,10 @@ mod tests {
         assert_eq!(items[0].label, "Play");
         let playback = &items.iter().find(|i| i.label == "Playback").unwrap().sub;
         assert!(playback.iter().find(|i| i.label == "1.5x").unwrap().checked);
-        assert!(!items[4].enabled, "Record");
+        assert!(items[4].label == "Record" && items[4].enabled);
 
         // Settings opens without a file; Open Recent needs recent files.
-        let main = main_menu(&[], &[], "Movies");
+        let main = main_menu(&[], &[], "Movies", &[], Converting::Nothing);
         assert!(main.iter().find(|i| i.label == "Settings").unwrap().enabled);
         assert!(
             !main
@@ -1459,7 +1524,7 @@ mod tests {
 
         // The Profile row names the profile in force and checks it in its submenu.
         let names = ["Movies".to_owned(), "Work".to_owned()];
-        let main = main_menu(&[], &names, "Work");
+        let main = main_menu(&[], &names, "Work", &[], Converting::Nothing);
         let profile = main.iter().find(|i| i.label == "Profile (Work)").unwrap();
         let checked: Vec<_> = profile.sub.iter().filter(|i| i.checked).collect();
         assert_eq!(checked.len(), 1);

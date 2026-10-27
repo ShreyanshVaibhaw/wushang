@@ -6,6 +6,9 @@
 # Networking covers the stream protocols a player opens (http/https/HLS/RTSP/UDP/RTP); TLS comes
 # from Windows Schannel, so https needs no extra library. The DASH demuxer stays out: it needs
 # libxml2, and HLS/RTSP cover the common live formats.
+# Recording copies packets into Matroska, MP4 or MPEG-TS without re-encoding. Converting encodes
+# with Windows' own Media Foundation encoders (H.264, HEVC, AAC, MP3), which keeps the build LGPL
+# with no codec library of its own. Capture devices come from DirectShow, the screen from GDI.
 #
 # Needs: gcc-mingw-w64-x86-64-win32 nasm make pkg-config meson ninja-build, plus gcc and
 # libc6-dev for FFmpeg's build-time host tools.
@@ -49,10 +52,13 @@ demuxers=(mov matroska avi mpegts mpegps flv ogg asf ivf obu
           srt ass webvtt microdvd subviewer sami vobsub sup
           hls rtsp sdp)
 protocols=(file data http https tls tcp udp rtp crypto)
+muxers=(matroska webm mov mp4 mpegts adts mp3 wav flac)
+encoders=(h264_mf hevc_mf aac_mf mp3_mf)
+indevs=(dshow gdigrab)
 parsers=(h264 hevc av1 vp8 vp9 mpeg4video mpegvideo vc1 mjpeg
          aac aac_latm ac3 mpegaudio opus vorbis flac dca mlp
          dvdsub dvbsub)
-decoders=(h264 hevc av1 libdav1d vp8 vp9 mpeg4 mpeg2video mpeg1video vc1 wmv3 msmpeg4v3 mjpeg theora
+decoders=(h264 hevc av1 libdav1d vp8 vp9 mpeg4 mpeg2video mpeg1video vc1 wmv3 msmpeg4v3 mjpeg theora rawvideo
           aac aac_latm mp3float mp2float ac3 eac3 opus vorbis flac alac dca truehd wmav2
           pcm_s16le pcm_s16be pcm_s24le pcm_s32le pcm_f32le pcm_u8 pcm_alaw pcm_mulaw pcm_bluray pcm_dvd
           subrip srt ass ssa webvtt movtext text microdvd subviewer sami dvdsub dvbsub pgssub)
@@ -68,9 +74,9 @@ cd "$SRC"
   --target-os=mingw32 --arch=x86_64 --cross-prefix=x86_64-w64-mingw32- \
   --enable-shared --disable-static \
   --disable-programs --disable-doc --disable-debug \
-  --disable-avdevice --disable-avfilter \
+  --disable-avfilter \
   --disable-autodetect --enable-w32threads --enable-d3d11va \
-  --enable-network --enable-schannel \
+  --enable-network --enable-schannel --enable-mediafoundation \
   --enable-libdav1d --pkg-config=pkg-config --pkg-config-flags=--static \
   --enable-zlib --extra-cflags="-I$DAV1D_PREFIX/include" \
   --disable-everything \
@@ -78,6 +84,10 @@ cd "$SRC"
   --enable-demuxer="$(join "${demuxers[@]}")" \
   --enable-parser="$(join "${parsers[@]}")" \
   --enable-decoder="$(join "${decoders[@]}")" \
+  --enable-muxer="$(join "${muxers[@]}")" \
+  --enable-encoder="$(join "${encoders[@]}")" \
+  --enable-indev="$(join "${indevs[@]}")" \
+  --enable-bsfs \
   --enable-hwaccel="$(join "${hwaccels[@]}")" \
   --extra-ldflags="-static-libgcc -L$DAV1D_PREFIX/lib" \
   --ln_s="cp -f" # D: is exFAT, which has no symlinks

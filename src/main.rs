@@ -7,7 +7,9 @@
 mod audio;
 mod bookmarks;
 mod captions;
+mod capture;
 mod codepage;
+mod convert;
 mod dsp;
 mod library;
 mod net;
@@ -17,6 +19,7 @@ mod prefs;
 mod probe;
 mod profiles;
 mod queue;
+mod record;
 mod render;
 mod session;
 mod snapshot;
@@ -215,6 +218,12 @@ struct App {
     shown_place: Option<Place>,
     /// Names for stream addresses played from a library page: a station or episode name.
     stream_titles: HashMap<PathBuf, String>,
+    /// Where the last recording reports back; it outlives the session it recorded.
+    record_control: Option<record::Control>,
+    /// The capture menu's devices, found on a thread of their own.
+    capture_devices: Arc<Mutex<Vec<capture::Device>>>,
+    /// The conversion running, one at a time.
+    converting: Option<convert::Job>,
 }
 
 struct Opening {
@@ -245,12 +254,15 @@ impl App {
             reconnect: p.net_reconnect,
         };
         let cancel = Arc::new(AtomicBool::new(false));
-        if net::is_url_path(path) {
+        if net::is_address(path) {
             let (done, ready) = mpsc::channel();
             let (url, flag) = (path.to_owned(), cancel.clone());
             thread::spawn(move || _ = done.send(session::open_input(&url, options, &flag)));
-            let host = net::host_of(&path.to_string_lossy()).unwrap_or_default();
-            self.notice = Some((format!("Connecting to {host}..."), Instant::now()));
+            let line = match net::host_of(&path.to_string_lossy()) {
+                Some(host) => format!("Connecting to {host}..."),
+                None => "Opening the capture device...".to_owned(),
+            };
+            self.notice = Some((line, Instant::now()));
             self.opening = Some(Opening {
                 path: path.to_owned(),
                 ready,
@@ -319,10 +331,12 @@ impl App {
             }
             Err(e) => {
                 eprintln!("myvlc: {e}");
-                if net::is_url_path(path) {
-                    let host = net::host_of(&path.to_string_lossy()).unwrap_or_default();
-                    self.notice =
-                        Some((format!("Can't play the stream from {host}"), Instant::now()));
+                if net::is_address(path) {
+                    let line = match net::host_of(&path.to_string_lossy()) {
+                        Some(host) => format!("Can't play the stream from {host}"),
+                        None => "Can't open the capture device".to_owned(),
+                    };
+                    self.notice = Some((line, Instant::now()));
                 }
                 false
             }
@@ -331,7 +345,7 @@ impl App {
 
     /// Plays a file opened from outside the library, queued with the rest of its folder.
     fn play_file(&mut self, path: &Path) -> bool {
-        if net::is_url_path(path) {
+        if net::is_address(path) {
             return self.play(path, vec![path.to_owned()]);
         }
         let queue = path.parent().map_or_else(Vec::new, |dir| {
@@ -339,6 +353,117 @@ impl App {
                 .media_in(&Place::Folder(section_of(path), dir.to_owned()))
         });
         self.play(path, queue)
+    }
+
+    /// Starts recording the open file into Videos\myvlc, or stops; the notice says where it went.
+    fn toggle_record(&mut self) {
+        // A notice about the last recording would otherwise be lost under the new one's.
+        self.take_recordings();
+        let Some(session) = &self.session else {
+            return;
+        };
+        if session.recording() {
+            session.set_recording(None);
+            return;
+        }
+        let dir = snapshot::known_folder(&windows::Win32::UI::Shell::FOLDERID_Videos)
+            .map(|d| d.join("myvlc"))
+            .map_err(|e| e.message())
+            .and_then(|dir| {
+                std::fs::create_dir_all(&dir)
+                    .map(|()| dir)
+                    .map_err(|e| e.to_string())
+            });
+        let dir = match dir {
+            Ok(dir) => dir,
+            Err(e) => {
+                self.notice = Some((format!("Can't record ({e})"), Instant::now()));
+                return;
+            }
+        };
+        let stem = snapshot::stem(&session.path, &session.title);
+        let seconds = session.position().unwrap_or(0.0);
+        let path = snapshot::free_path(&dir, &snapshot::file_name(&stem, seconds), "mkv");
+        let name = path
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned();
+        session.set_recording(Some(path));
+        self.record_control = Some(session.record_control());
+        self.notice = Some((format!("Recording to {name}"), Instant::now()));
+    }
+
+    /// Converts `path` into Videos\myvlc (MP4) or Music\myvlc (MP3) in the background.
+    fn convert(&mut self, path: &Path, target: convert::Target) {
+        if let Some(job) = &self.converting {
+            let name = job.output.file_name().unwrap_or_default().to_string_lossy();
+            self.notice = Some((format!("Still converting {name}"), Instant::now()));
+            return;
+        }
+        let folder = match target {
+            convert::Target::Mp4 => &windows::Win32::UI::Shell::FOLDERID_Videos,
+            convert::Target::Mp3 => &windows::Win32::UI::Shell::FOLDERID_Music,
+        };
+        let dir = snapshot::known_folder(folder)
+            .map(|d| d.join("myvlc"))
+            .map_err(|e| e.message())
+            .and_then(|dir| {
+                std::fs::create_dir_all(&dir)
+                    .map(|()| dir)
+                    .map_err(|e| e.to_string())
+            });
+        match dir {
+            Ok(dir) => {
+                let stem = snapshot::stem(path, "");
+                let output = snapshot::free_path(&dir, &stem, target.extension());
+                self.converting = Some(convert::Job::start(path, target, output));
+            }
+            Err(e) => self.notice = Some((format!("Can't convert ({e})"), Instant::now())),
+        }
+    }
+
+    /// Keeps the notice on the running conversion's progress, and says how it ended.
+    fn watch_conversion(&mut self) {
+        let Some(job) = &self.converting else { return };
+        let name = job
+            .output
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned();
+        let line = match job.finished() {
+            None => format!("Converting to {name}: {:.0}%", job.progress() * 100.0),
+            Some(result) => {
+                self.converting = None;
+                match result {
+                    Ok(path) => format!("Converted to {}", path.display()),
+                    Err(e) if e == "cancelled" => "Conversion stopped".to_owned(),
+                    Err(e) => format!("Can't convert {name}: {e}"),
+                }
+            }
+        };
+        // While it runs, the notice stays up; the final line then lasts the usual while.
+        if self.notice.as_ref().is_none_or(|(text, _)| *text != line) {
+            UI.with_borrow_mut(|ui| ui.dirty = true);
+        }
+        self.notice = Some((line, Instant::now()));
+    }
+
+    /// Shows how the last recording ended, once its file is closed.
+    fn take_recordings(&mut self) {
+        let Some(control) = &self.record_control else {
+            return;
+        };
+        let done = std::mem::take(&mut control.lock().unwrap().done);
+        for result in done {
+            let line = match result {
+                Ok(path) => format!("Recording saved to {}", path.display()),
+                Err(e) => format!("Can't record: {e}"),
+            };
+            self.notice = Some((line, Instant::now()));
+            UI.with_borrow_mut(|ui| ui.dirty = true);
+        }
     }
 
     fn stop(&mut self) {
@@ -474,6 +599,7 @@ impl App {
             // The panel shows the preamp around 0; VLC's scale has unity at 12 dB.
             eq_preamp: eq.preamp - dsp::PREAMP_UNITY_DB,
             two_pass: eq.two_pass,
+            recording: self.session.as_ref().is_some_and(Session::recording),
             stereo: StereoMode::ALL
                 .iter()
                 .position(|m| *m == effects.stereo())
@@ -645,7 +771,8 @@ impl App {
     fn record(&mut self) {
         self.recorded = Instant::now();
         let Some(s) = &self.session else { return };
-        if !PREFS.with_borrow(|p| p.save_recent) {
+        // A camera has no place to resume from.
+        if !PREFS.with_borrow(|p| p.save_recent) || capture::is_capture_path(&s.path) {
             return;
         }
         let position = if s.finished() {
@@ -1003,7 +1130,11 @@ fn run() -> Result<(), Box<dyn Error>> {
         fetcher: net::Fetcher::new(),
         shown_place: None,
         stream_titles: HashMap::new(),
+        record_control: None,
+        capture_devices: Arc::default(),
+        converting: None,
     };
+    refresh_devices(&app.capture_devices);
     app.queue.set_repeat(REPEAT[settings.repeat.min(2)]);
     app.queue.set_shuffle(settings.shuffle);
     if let Some(path) = &path {
@@ -1183,6 +1314,8 @@ fn run() -> Result<(), Box<dyn Error>> {
             take_snapshot(&app, &mut renderer);
         }
         fetch_network(&mut app);
+        app.take_recordings();
+        app.watch_conversion();
         if let Some(input) = app.opening.as_ref().and_then(|o| o.ready.try_recv().ok()) {
             let o = app.opening.take().unwrap();
             app.notice = None;
@@ -1471,7 +1604,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                     hover: ui.hover,
                     position: ui.seek_preview().map_or(last_position, |f| f * duration),
                     duration,
-                    live: duration <= 0.0 && session.is_some_and(|s| net::is_url_path(&s.path)),
+                    live: duration <= 0.0 && session.is_some_and(|s| net::is_address(&s.path)),
                     paused,
                     volume: shared.volume(),
                     muted: shared.muted.load(Relaxed),
@@ -1493,6 +1626,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                     repeat: app.queue.repeat(),
                     shuffle: app.queue.shuffle(),
                     favorite: session.is_some_and(|s| app.library.is_favorite(&s.path)),
+                    recording: session.is_some_and(Session::recording),
                     cues: &cues,
                     caption_style: &app.caption,
                     stats: stats.as_deref(),
@@ -1760,7 +1894,16 @@ fn open_menu(app: &mut App, hit: Hit, at: (f32, f32)) {
                 })
                 .collect();
             let p = &app.profiles;
-            (Kind::Main, menu::main_menu(&recent, p.names(), p.current()))
+            let devices = app.capture_devices.lock().unwrap().clone();
+            // Look again for next time, in case a camera was plugged in.
+            refresh_devices(&app.capture_devices);
+            let converting = match &app.session {
+                _ if app.converting.is_some() => menu::Converting::Running,
+                Some(s) if !net::is_address(&s.path) => menu::Converting::File(&s.path),
+                _ => menu::Converting::Nothing,
+            };
+            let items = menu::main_menu(&recent, p.names(), p.current(), &devices, converting);
+            (Kind::Main, items)
         }
         Hit::Sort => UI.with_borrow(|ui| {
             let b = &ui.browse;
@@ -1880,6 +2023,27 @@ fn menu_action(app: &mut App, hwnd: HWND, action: MenuAction) {
         MenuAction::NewProfile => open_dialog(app, Dialog::NewProfile),
         MenuAction::OpenNetwork => open_dialog(app, Dialog::Address(NetKind::Stream)),
         MenuAction::Snapshot => WANT_SNAPSHOT.set(true),
+        MenuAction::Record => app.toggle_record(),
+        MenuAction::Convert(path, target) => app.convert(&path, target),
+        MenuAction::ConvertOpen => {
+            if let Some(path) = app.session.as_ref().map(|s| s.path.clone())
+                && !net::is_address(&path)
+            {
+                app.convert(&path, convert::Target::Mp4);
+            }
+        }
+        MenuAction::CancelConvert => {
+            if let Some(job) = &app.converting {
+                job.cancel();
+            }
+        }
+        MenuAction::OpenCapture(address, name) => {
+            let path = PathBuf::from(address);
+            app.stream_titles.insert(path.clone(), name);
+            if app.play(&path, vec![path.clone()]) {
+                show_player();
+            }
+        }
         MenuAction::Panel(a) => app.apply(hwnd, a),
         MenuAction::Queue(a) => {
             app.apply_queue(hwnd, a);
@@ -3053,6 +3217,7 @@ fn use_tool(app: &mut App, hwnd: HWND, item: ui::ToolItem) {
         T::Home => UI.with_borrow_mut(|ui| ui.show(Page::Library)),
         T::Properties => WANT_PROPERTIES.set(true),
         T::Snapshot => WANT_SNAPSHOT.set(true),
+        T::Record => app.toggle_record(),
         T::Favorite => {
             if let Some(path) = app.session.as_ref().map(|s| s.path.clone()) {
                 let on = !app.library.is_favorite(&path);
@@ -3067,6 +3232,20 @@ fn use_tool(app: &mut App, hwnd: HWND, item: ui::ToolItem) {
         }),
         _ => {}
     }
+}
+
+/// Lists the capture devices into `devices` in the background; DirectShow takes a moment.
+fn refresh_devices(devices: &Arc<Mutex<Vec<capture::Device>>>) {
+    let devices = devices.clone();
+    thread::spawn(move || {
+        unsafe {
+            _ = windows::Win32::System::Com::CoInitializeEx(
+                None,
+                windows::Win32::System::Com::COINIT_MULTITHREADED,
+            )
+        };
+        *devices.lock().unwrap() = capture::devices();
+    });
 }
 
 /// Fetches the podcast feed or radio directory the library page shows, and takes in what
@@ -3111,7 +3290,10 @@ fn take_snapshot(app: &App, renderer: &mut render::Renderer) {
     };
     let seconds = session.position().unwrap_or(current.pts);
     match renderer.snapshot(&current.frame, &app.adjust) {
-        Ok(picture) => snapshot::save(picture, &session.path, seconds, app.notices.0.clone()),
+        Ok(picture) => {
+            let stem = snapshot::stem(&session.path, &session.title);
+            snapshot::save(picture, &stem, seconds, app.notices.0.clone());
+        }
         Err(e) => _ = app.notices.0.send(format!("Can't take a snapshot ({e})")),
     }
 }
@@ -3191,6 +3373,7 @@ fn on_key(hwnd: HWND, shared: &Shared, key: VIRTUAL_KEY) {
     let menu = |action| act(hwnd, shared, Some(Action::Menu(action)));
     let shortcut = match key {
         VK_O if ctrl => Some(MenuAction::OpenFiles),
+        VK_R if ctrl => Some(MenuAction::ConvertOpen),
         VK_N if ctrl => Some(MenuAction::OpenNetwork),
         VK_F if ctrl => Some(MenuAction::OpenFolder),
         VK_P if ctrl => Some(MenuAction::Preferences(Category::Playback)),
@@ -3200,6 +3383,7 @@ fn on_key(hwnd: HWND, shared: &Shared, key: VIRTUAL_KEY) {
         VK_F1 if shift => Some(MenuAction::ShowAbout),
         VK_S if shift && page == Page::Player => Some(MenuAction::Snapshot),
         VK_S if page == Page::Player => Some(MenuAction::Stop),
+        VK_R if page == Page::Player => Some(MenuAction::Record),
         _ => None,
     };
     if let Some(action) = shortcut {

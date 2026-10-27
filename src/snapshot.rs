@@ -10,18 +10,18 @@ use windows::Win32::System::Com::{
     CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx, CoTaskMemFree,
 };
 use windows::Win32::UI::Shell::{FOLDERID_Pictures, KF_FLAG_DEFAULT, SHGetKnownFolderPath};
-use windows::core::HSTRING;
+use windows::core::{GUID, HSTRING};
 
 /// Writes `picture` (width, height, BGRA rows) on a thread of its own, so a 4K PNG doesn't
 /// stall playback, then sends the line the player shows about it.
-pub fn save(picture: (u32, u32, Vec<u8>), video: &Path, seconds: f64, done: Sender<String>) {
-    let name = file_name(video, seconds);
+pub fn save(picture: (u32, u32, Vec<u8>), stem: &str, seconds: f64, done: Sender<String>) {
+    let name = file_name(stem, seconds);
     std::thread::spawn(move || {
         let saved = (|| -> windows::core::Result<PathBuf> {
             unsafe { CoInitializeEx(None, COINIT_MULTITHREADED).ok()? };
-            let dir = pictures()?.join("myvlc");
+            let dir = known_folder(&FOLDERID_Pictures)?.join("myvlc");
             std::fs::create_dir_all(&dir)?;
-            let path = free_path(&dir, &name);
+            let path = free_path(&dir, &name, "png");
             write_png(&path, &picture)?;
             Ok(path)
         })();
@@ -33,8 +33,7 @@ pub fn save(picture: (u32, u32, Vec<u8>), video: &Path, seconds: f64, done: Send
 }
 
 /// "Holiday 1m05s", or "Holiday 1h02m05s" past an hour.
-fn file_name(video: &Path, seconds: f64) -> String {
-    let stem = video.file_stem().unwrap_or_default().to_string_lossy();
+pub fn file_name(stem: &str, seconds: f64) -> String {
     let s = seconds.max(0.0) as u64;
     let time = if s >= 3600 {
         format!("{}h{:02}m{:02}s", s / 3600, s / 60 % 60, s % 60)
@@ -44,21 +43,32 @@ fn file_name(video: &Path, seconds: f64) -> String {
     format!("{stem} {time}")
 }
 
-/// `dir\name.png`, or "name (2).png" and up when that is taken.
-fn free_path(dir: &Path, name: &str) -> PathBuf {
+/// What names a file made from `path`: a file's own name, else (a stream address) its `title`,
+/// without the characters Windows file names can't hold.
+pub fn stem(path: &Path, title: &str) -> String {
+    if !crate::net::is_address(path)
+        && let Some(stem) = path.file_stem()
+    {
+        return stem.to_string_lossy().into_owned();
+    }
+    title.replace(['<', '>', ':', '"', '/', '\\', '|', '?', '*'], "_")
+}
+
+/// `dir\name.ext`, or "name (2).ext" and up when that is taken.
+pub fn free_path(dir: &Path, name: &str, ext: &str) -> PathBuf {
     (1..)
         .map(|n| match n {
-            1 => dir.join(format!("{name}.png")),
-            n => dir.join(format!("{name} ({n}).png")),
+            1 => dir.join(format!("{name}.{ext}")),
+            n => dir.join(format!("{name} ({n}).{ext}")),
         })
         .find(|p| !p.exists())
         .unwrap()
 }
 
-/// The Pictures folder, wherever it was moved to (OneDrive often has it).
-fn pictures() -> windows::core::Result<PathBuf> {
+/// A known folder such as Pictures, wherever it was moved to (OneDrive often has it).
+pub fn known_folder(id: &GUID) -> windows::core::Result<PathBuf> {
     unsafe {
-        let p = SHGetKnownFolderPath(&FOLDERID_Pictures, KF_FLAG_DEFAULT, None)?;
+        let p = SHGetKnownFolderPath(id, KF_FLAG_DEFAULT, None)?;
         let path = PathBuf::from(p.to_string()?);
         CoTaskMemFree(Some(p.0 as _));
         Ok(path)
@@ -100,19 +110,23 @@ mod tests {
     #[test]
     fn names_follow_the_file_and_time() {
         let video = Path::new(r"C:\Videos\Holiday.mkv");
-        assert_eq!(file_name(video, 65.4), "Holiday 1m05s");
-        assert_eq!(file_name(video, 3725.0), "Holiday 1h02m05s");
+        assert_eq!(file_name(&stem(video, "x"), 65.4), "Holiday 1m05s");
+        assert_eq!(file_name("Holiday", 3725.0), "Holiday 1h02m05s");
+        assert_eq!(
+            stem(Path::new("https://x.example/live"), "Rock: 24/7"),
+            "Rock_ 24_7"
+        );
 
         let dir = std::env::temp_dir().join(format!("myvlc-snap-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        assert_eq!(free_path(&dir, "a"), dir.join("a.png"));
+        assert_eq!(free_path(&dir, "a", "png"), dir.join("a.png"));
         unsafe { CoInitializeEx(None, COINIT_MULTITHREADED).ok().unwrap() };
         write_png(
             &dir.join("a.png"),
             &(2, 1, vec![0, 0, 255, 255, 255, 0, 0, 255]),
         )
         .unwrap();
-        assert_eq!(free_path(&dir, "a"), dir.join("a (2).png"));
+        assert_eq!(free_path(&dir, "a", "png"), dir.join("a (2).png"));
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

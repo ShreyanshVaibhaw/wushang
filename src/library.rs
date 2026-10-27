@@ -1242,7 +1242,7 @@ fn stem_of(path: &Path) -> String {
 /// Absolute form of `path`, so lookups match however the file was opened. A stream address
 /// stays as it is; Windows would read it as a relative path with backslashes.
 pub fn abs(path: &Path) -> PathBuf {
-    if crate::net::is_url_path(path) {
+    if crate::net::is_address(path) {
         return path.to_path_buf();
     }
     std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf())

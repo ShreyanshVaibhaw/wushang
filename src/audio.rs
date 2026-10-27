@@ -659,7 +659,7 @@ mod tests {
                     sparse: false,
                 }])),
                 shared.clone(),
-                false,
+                player::Role::Main(None),
             ),
         ]
     }

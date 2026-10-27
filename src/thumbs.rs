@@ -41,7 +41,7 @@ pub struct MediaInfo {
 /// Opens a file. ffmpeg-next unwraps the path as UTF-8, so other paths are refused here instead.
 /// Files only: a stream address would download from the network just for a thumbnail or tags.
 fn open(path: &Path) -> Option<ff::format::context::Input> {
-    if crate::net::is_url_path(path) {
+    if crate::net::is_address(path) {
         return None;
     }
     ff::format::input(path.to_str()?).ok()

@@ -536,7 +536,7 @@ mod tests {
         ui.customize_drop(960.0, 500.0);
         assert_eq!(ui.customize.as_ref().unwrap().draft.left.len(), 3);
         // Save hands the draft over; dimmed items don't drag.
-        ui.customize_down(Target::Palette(Item::Record), 0.0, 0.0);
+        ui.customize_down(Target::Palette(Item::Hdr), 0.0, 0.0);
         assert!(ui.customize.as_ref().unwrap().drag.is_none());
         let Some(Action::SaveToolbar(t)) = ui.customize_click(Target::Save) else {
             panic!("save keeps the draft");

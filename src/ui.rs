@@ -981,6 +981,8 @@ pub struct Scene<'a> {
     pub repeat: crate::queue::Repeat,
     pub shuffle: bool,
     pub favorite: bool,
+    /// The bars' record item lights while recording.
+    pub recording: bool,
     /// Subtitle cues to show now, and how.
     pub cues: &'a [crate::subs::Cue],
     pub caption_style: &'a crate::captions::CaptionStyle,
@@ -1437,9 +1439,38 @@ impl Painter {
         }
     }
 
+    /// The notice, one line at the top right of `area`, in the statistics' box.
+    fn notice(&self, rt: &ID2D1RenderTarget, s: &Scene, area: Rect) {
+        let Some(notice) = s.notice else { return };
+        let w = (self.measure(notice, &self.stats_text) + 20.0).min(area.w() - 24.0);
+        let r = Rect::new(
+            area.r - 12.0 - w,
+            area.t + 12.0,
+            area.r - 12.0,
+            area.t + 46.0,
+        );
+        let utf16: Vec<u16> = notice.encode_utf16().collect();
+        unsafe {
+            rt.FillRoundedRectangle(&rounded(r, 6.0), &self.stats_bg);
+            rt.DrawText(
+                &utf16,
+                &self.stats_text,
+                &Rect::new(r.l + 10.0, r.t + 8.0, r.r - 10.0, r.b).d2d(),
+                &self.stats_fg,
+                D2D1_DRAW_TEXT_OPTIONS_CLIP,
+                DWRITE_MEASURING_MODE_NATURAL,
+            );
+        }
+    }
+
     fn paint_page(&mut self, ctx: &ID2D1DeviceContext5, s: &Scene) -> Result<()> {
         match s.layout.page {
-            Page::Library => return self.paint_library(ctx, s),
+            // Notices, such as a conversion's progress, show over the library too.
+            Page::Library => {
+                self.paint_library(ctx, s)?;
+                self.notice(ctx, s, s.layout.browse.content);
+                return Ok(());
+            }
             Page::Mini => return self.paint_mini(ctx, s),
             Page::Player => {}
         }
@@ -1484,26 +1515,7 @@ impl Painter {
                     DWRITE_MEASURING_MODE_NATURAL,
                 );
             }
-            if let Some(notice) = s.notice {
-                // One line at the top right, in the statistics' box.
-                let w = (self.measure(notice, &self.stats_text) + 20.0).min(l.video.w() - 24.0);
-                let r = Rect::new(
-                    l.video.r - 12.0 - w,
-                    l.video.t + 12.0,
-                    l.video.r - 12.0,
-                    l.video.t + 46.0,
-                );
-                rt.FillRoundedRectangle(&rounded(r, 6.0), &self.stats_bg);
-                let utf16: Vec<u16> = notice.encode_utf16().collect();
-                rt.DrawText(
-                    &utf16,
-                    &self.stats_text,
-                    &Rect::new(r.l + 10.0, r.t + 8.0, r.r - 10.0, r.b).d2d(),
-                    &self.stats_fg,
-                    D2D1_DRAW_TEXT_OPTIONS_CLIP,
-                    DWRITE_MEASURING_MODE_NATURAL,
-                );
-            }
+            self.notice(rt, s, l.video);
             if !l.bars {
                 return Ok(());
             }
@@ -1769,6 +1781,7 @@ impl Painter {
                         ToolItem::Repeat => s.repeat != crate::queue::Repeat::Off,
                         ToolItem::Shuffle => s.shuffle,
                         ToolItem::Favorite => s.favorite,
+                        ToolItem::Record => s.recording,
                         _ => false,
                     };
                     let svg = match (item, s.repeat) {

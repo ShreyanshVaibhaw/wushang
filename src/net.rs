@@ -62,6 +62,12 @@ pub fn is_url_path(path: &Path) -> bool {
     path.to_str().is_some_and(is_url)
 }
 
+/// Whether a path is no file at all: a stream or a capture device (`capture.rs`). Such paths are
+/// never made absolute, probed for thumbnails or opened on the UI thread.
+pub fn is_address(path: &Path) -> bool {
+    is_url_path(path) || crate::capture::is_capture_path(path)
+}
+
 /// Checks what the user typed as a stream address and tidies it: a bare host gets
 /// `http://` in front, as in VLC. The error is fit to show under the field.
 pub fn normalize_url(raw: &str) -> Result<String, String> {

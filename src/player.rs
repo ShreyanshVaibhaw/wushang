@@ -12,6 +12,8 @@ use std::time::{Duration, Instant};
 
 use ff::ffi;
 use ffmpeg_next as ff;
+
+use crate::record;
 use windows::Win32::Graphics::Direct3D11::{
     D3D11_DECODER_PROFILE_AV1_VLD_PROFILE0, ID3D11Device, ID3D11VideoDevice,
 };
@@ -428,6 +430,15 @@ pub fn open_video_decoder(
     hw: Option<&HwDevice>,
 ) -> Result<ff::decoder::Video, ff::Error> {
     let id = parameters.id();
+    // Only these have D3D11VA hwaccels in the build. Anything else (MJPEG webcams, BMP screen
+    // grabs, MPEG-4 Part 2) decodes in software from the start, instead of being opened for the
+    // GPU, turned down and reopened, which also seeks, and live sources can't.
+    use ff::codec::Id;
+    let gpu = matches!(
+        id,
+        Id::H264 | Id::HEVC | Id::AV1 | Id::VP9 | Id::MPEG2VIDEO | Id::VC1 | Id::WMV3
+    );
+    let hw = hw.filter(|_| gpu);
     // libavcodec prefers libdav1d for AV1, and libdav1d never uses the GPU. Take FFmpeg's own AV1
     // decoder when the GPU has an AV1 profile; otherwise keep libdav1d and give it every core.
     // A stream the GPU then turns down is reopened in software by the decoder thread.
@@ -487,13 +498,30 @@ pub fn spawn_demuxer(
     mut input: ff::format::context::Input,
     routes: Routes,
     shared: Arc<Shared>,
-    follower: bool,
+    role: Role,
 ) -> JoinHandle<()> {
+    let (follower, record) = match role {
+        Role::Main(record) => (false, record),
+        Role::Follower => (true, None),
+    };
     // Read before the thread starts, which may be after the seek that selects this file's track.
     let mut followed = shared.serial.load(Relaxed);
     thread::spawn(move || {
         let mut eof = false;
+        let mut recorder: Option<record::Recorder> = None;
+        // Where playback is in the input, for the recorder; the clock is unknown just after a
+        // seek, and the last value stands in.
+        let mut playhead = 0.0;
         while !shared.quitting() {
+            if let Some(control) = &record {
+                playhead = shared.clock.get().unwrap_or(playhead);
+                if record::sync(&mut recorder, control, &input, playhead) {
+                    shared.seek_by(0.0);
+                }
+                if let Some(r) = &mut recorder {
+                    r.play_to(playhead);
+                }
+            }
             let target = if follower {
                 let now = shared.serial.load(Relaxed);
                 (now != followed).then(|| {
@@ -528,6 +556,9 @@ pub fn spawn_demuxer(
                 if !follower {
                     shared.clock.invalidate();
                 }
+                if let Some(r) = &mut recorder {
+                    r.seeked();
+                }
                 eof = false;
             }
 
@@ -546,6 +577,9 @@ pub fn spawn_demuxer(
             let mut packet = ff::Packet::empty();
             match packet.read(&mut input) {
                 Ok(()) => {
+                    if let Some(r) = &mut recorder {
+                        r.push(&packet);
+                    }
                     let routes = routes.lock().unwrap();
                     if let Some(r) = routes.iter().find(|r| r.stream == packet.stream()) {
                         r.queue.push(Msg::Packet(packet));
@@ -562,7 +596,18 @@ pub fn spawn_demuxer(
                 }
             }
         }
+        // The media closed, at its end (the recording ends with it, as in VLC) or before.
+        if let Some(control) = &record {
+            record::stop(&mut recorder, control, playhead);
+        }
     })
+}
+
+/// Which demuxer a thread is: the open file's, which owns seeks and can record, or a second
+/// file's (an external audio track) that follows its seeks.
+pub enum Role {
+    Main(Option<record::Control>),
+    Follower,
 }
 
 /// Seeks `input` to the keyframe of `stream` at or before `ts` (in `AV_TIME_BASE` units). A file

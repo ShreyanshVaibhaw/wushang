@@ -58,6 +58,8 @@ pub struct PanelData {
     pub eq_bands: [f32; 10],
     pub eq_preamp: f32,
     pub two_pass: bool,
+    /// The open file is being recorded.
+    pub recording: bool,
     /// Index into `STEREO`.
     pub stereo: usize,
     /// 0 none, 1 horizontal, 2 vertical.
