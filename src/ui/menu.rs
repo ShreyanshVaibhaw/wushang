@@ -69,6 +69,10 @@ pub enum MenuAction {
     MiniPlayer,
     /// Opens Customize Player.
     CustomizePlayer,
+    /// Switches to the named settings profile.
+    Profile(String),
+    /// Asks for a name and adds a profile.
+    NewProfile,
     /// A change the tracks and settings panels also make.
     Panel(PanelAction),
     ShowQueue,
@@ -693,13 +697,20 @@ impl Geometry {
     }
 }
 
-/// The title bar's "..." menu. `recent` is the newest first.
-pub fn main_menu(recent: &[PathBuf]) -> Vec<Item> {
+/// The title bar's "..." menu. `recent` is the newest first; `profile` is the one in force.
+pub fn main_menu(recent: &[PathBuf], profiles: &[String], profile: &str) -> Vec<Item> {
     let recent = recent
         .iter()
         .take(10)
         .map(|p| Item::new(file_name(p), MenuAction::PlayRecent(p.clone())))
         .collect();
+    let mut profile_items: Vec<Item> = (profiles.iter())
+        .map(|name| {
+            Item::new(name.clone(), MenuAction::Profile(name.clone())).checked(name == profile)
+        })
+        .collect();
+    profile_items.push(Item::divider());
+    profile_items.push(Item::new("New", MenuAction::NewProfile).icon(Icon::Add));
     vec![
         Item::new("Open File(s)", MenuAction::OpenFiles)
             .icon(Icon::OpenFile)
@@ -719,8 +730,7 @@ pub fn main_menu(recent: &[PathBuf]) -> Vec<Item> {
         Item::off("Convert").icon(Icon::Convert).key("Ctrl + R"),
         Item::submenu("Open Recent", recent).icon(Icon::Recent),
         Item::divider(),
-        // ponytail: profiles have no settings behind them yet.
-        Item::submenu("Profile (Movies)", Vec::new()).icon(Icon::Profile),
+        Item::submenu(format!("Profile ({profile})"), profile_items).icon(Icon::Profile),
         Item::new("Keyboard Shortcuts", MenuAction::ShowShortcuts).icon(Icon::Keyboard),
         Item::new("Customize Player", MenuAction::CustomizePlayer).icon(Icon::Brush),
         Item::new(
@@ -1179,10 +1189,16 @@ impl Painter {
                 self.menu_text(rt, item.key, &m.key_text, kr, &m.key);
                 right = f.r - KEY_R - self.measure(item.key, &m.key_text) - 12.0;
             }
+            // In a menu with icons, an icon-less row's check takes the icon's place, as in the
+            // design's Profile submenu.
+            let check_left = item.checked && item.icon.is_none() && !level.plain;
+            if check_left {
+                self.icon(ctx, &m.check, f.l + ICON_X - 12.0, cy - 12.0, false);
+            }
             if item.opens {
                 self.icon(ctx, &m.chevron, f.r - MARK_R - 12.0, cy - 12.0, false);
                 right = f.r - MARK_R - 16.0;
-            } else if item.checked {
+            } else if item.checked && !check_left {
                 self.icon(ctx, &m.check, f.r - MARK_R - 12.0, cy - 12.0, false);
                 right = f.r - MARK_R - 16.0;
             }
@@ -1268,7 +1284,7 @@ mod tests {
     #[test]
     fn layout_follows_the_design_rows() {
         let mut s = State::default();
-        s.open(Kind::Main, main_menu(&[]), 51.0, 38.0);
+        s.open(Kind::Main, main_menu(&[], &[], "Movies"), 51.0, 38.0);
         let g = Geometry::new(&s, 1600.0, 900.0);
         let level = &g.levels[0];
         // 12 rows of 48 and one divider, inside 4 DIPs of padding: the design's 375 x 585.
@@ -1342,7 +1358,7 @@ mod tests {
         assert!(!items[4].enabled, "Record");
 
         // Settings opens without a file; Open Recent needs recent files.
-        let main = main_menu(&[]);
+        let main = main_menu(&[], &[], "Movies");
         assert!(main.iter().find(|i| i.label == "Settings").unwrap().enabled);
         assert!(
             !main
@@ -1350,6 +1366,18 @@ mod tests {
                 .find(|i| i.label == "Open Recent")
                 .unwrap()
                 .enabled
+        );
+
+        // The Profile row names the profile in force and checks it in its submenu.
+        let names = ["Movies".to_owned(), "Work".to_owned()];
+        let main = main_menu(&[], &names, "Work");
+        let profile = main.iter().find(|i| i.label == "Profile (Work)").unwrap();
+        let checked: Vec<_> = profile.sub.iter().filter(|i| i.checked).collect();
+        assert_eq!(checked.len(), 1);
+        assert_eq!(checked[0].action, Some(MenuAction::Profile("Work".into())));
+        assert_eq!(
+            profile.sub.last().unwrap().action,
+            Some(MenuAction::NewProfile)
         );
 
         let sort = sort_menu(SortMode::NewestFirst, false);

@@ -12,6 +12,7 @@ mod library;
 mod player;
 mod prefs;
 mod probe;
+mod profiles;
 mod queue;
 mod render;
 mod session;
@@ -192,6 +193,7 @@ struct App {
     /// When the settings changed last without being saved; saved a moment later, so a dragged
     /// slider doesn't write the file at every step.
     prefs_changed: Option<Instant>,
+    profiles: profiles::Profiles,
 }
 
 impl App {
@@ -720,6 +722,20 @@ impl App {
         self.prefs_changed = Some(Instant::now());
     }
 
+    /// Switches to a settings profile, adding it first when `create`, and applies its settings.
+    fn switch_profile(&mut self, hwnd: HWND, name: &str, create: bool) -> std::io::Result<()> {
+        let live = prefs();
+        let new = if create {
+            self.profiles.create(name, &live)?
+        } else {
+            self.profiles.switch(name, &live)?
+        };
+        self.apply_prefs(hwnd, new);
+        // Saved now, along with profile.txt, rather than a moment later.
+        self.prefs_changed = None;
+        prefs().save(&Library::default_dir())
+    }
+
     /// Changes the panels, queue and menus make to things Settings also holds, so the
     /// equalizer, stereo mode, subtitle size, repeat and shuffle stick across launches.
     // ponytail: custom equalizer bands aren't saved, only presets; the equalizer starts off
@@ -883,6 +899,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         show_statistics: false,
         enter_fullscreen: false,
         prefs_changed: None,
+        profiles: profiles::Profiles::load(&Library::default_dir()),
     };
     app.queue.set_repeat(REPEAT[settings.repeat.min(2)]);
     app.queue.set_shuffle(settings.shuffle);
@@ -1496,7 +1513,8 @@ fn open_menu(app: &mut App, hit: Hit, at: (f32, f32)) {
                     _ => None,
                 })
                 .collect();
-            (Kind::Main, menu::main_menu(&recent))
+            let p = &app.profiles;
+            (Kind::Main, menu::main_menu(&recent, p.names(), p.current()))
         }
         Hit::Sort => UI.with_borrow(|ui| {
             let b = &ui.browse;
@@ -1600,6 +1618,12 @@ fn menu_action(app: &mut App, hwnd: HWND, action: MenuAction) {
                 ui.open_customize();
             });
         }
+        MenuAction::Profile(name) => {
+            if let Err(e) = app.switch_profile(hwnd, &name, false) {
+                eprintln!("profiles: cannot switch to {name} ({e})");
+            }
+        }
+        MenuAction::NewProfile => open_dialog(app, Dialog::NewProfile),
         MenuAction::Panel(a) => app.apply(hwnd, a),
         // Files join the queue, or play when nothing is open.
         MenuAction::AddToQueue(paths) => {
@@ -1823,6 +1847,16 @@ fn apply_dialog(app: &mut App, hwnd: HWND, action: DialogAction) {
                 ui.browse.stale = true;
             });
         }
+        DialogAction::CreateProfile(name) => match app.switch_profile(hwnd, &name, true) {
+            Ok(()) => UI.with_borrow_mut(Ui::close_dialog),
+            Err(e) => {
+                let message = match e.kind() {
+                    std::io::ErrorKind::AlreadyExists => e.to_string(),
+                    _ => format!("Can't save the profile: {e}"),
+                };
+                UI.with_borrow_mut(|ui| ui.dialog_error(message));
+            }
+        },
         DialogAction::PickFiles => {
             let files = pick_media_files(hwnd);
             UI.with_borrow_mut(|ui| ui.dialog_add_files(files));

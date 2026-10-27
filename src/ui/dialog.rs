@@ -1,6 +1,6 @@
 //! Modal dialogs: New Playlist and Rename Playlist (the design's "new playlist" frame), and About,
-//! Keyboard Shortcuts and Properties, which have no frame and borrow its title strip, padding,
-//! fonts and colours. A dialog dims the window and takes every click and key while it is open;
+//! Keyboard Shortcuts, Properties and New Profile, which have no frame and borrow its title strip,
+//! padding, fonts and colours. A dialog dims the window and takes every click and key while it is open;
 //! what it wants done goes out as a [`DialogAction`] for main.rs.
 //!
 //! Sizes are DIPs from the 713x589 frame. A dialog taller or wider than the window is scaled down
@@ -36,6 +36,8 @@ pub enum Dialog {
     Properties(PathBuf),
     /// Asks before deleting the named playlist.
     DeletePlaylist(String),
+    /// Names a new settings profile.
+    NewProfile,
 }
 
 /// What the open dialog asks main.rs to do.
@@ -59,6 +61,9 @@ pub enum DialogAction {
     OpenLink(&'static str),
     /// The user confirmed deleting the playlist.
     DeletePlaylist(String),
+    /// Add the profile and switch to it; on success close the dialog, else report with
+    /// [`Ui::dialog_error`].
+    CreateProfile(String),
 }
 
 /// What a click lands on.
@@ -356,7 +361,7 @@ impl State {
             Dialog::NewPlaylist { files } => state.add_files(files),
             Dialog::RenamePlaylist(name) => state.field = TextField::new(&name),
             Dialog::Properties(path) => state.rows = properties(&path),
-            Dialog::About | Dialog::Shortcuts | Dialog::DeletePlaylist(_) => {}
+            Dialog::About | Dialog::Shortcuts | Dialog::DeletePlaylist(_) | Dialog::NewProfile => {}
         }
         state
     }
@@ -369,13 +374,14 @@ impl State {
             Dialog::Shortcuts => "Keyboard Shortcuts",
             Dialog::Properties(_) => "Properties",
             Dialog::DeletePlaylist(_) => "Delete Playlist",
+            Dialog::NewProfile => "New Profile",
         }
     }
 
     pub fn has_field(&self) -> bool {
         matches!(
             self.dialog,
-            Dialog::NewPlaylist { .. } | Dialog::RenamePlaylist(_)
+            Dialog::NewPlaylist { .. } | Dialog::RenamePlaylist(_) | Dialog::NewProfile
         )
     }
 
@@ -462,6 +468,7 @@ impl State {
                 to: name,
                 thumbnail: self.thumbnail.clone().filter(|_| self.thumbnail_picked),
             },
+            Dialog::NewProfile => DialogAction::CreateProfile(name),
             _ => return None,
         })
     }
@@ -800,7 +807,7 @@ impl Painter {
             Dialog::NewPlaylist { .. } | Dialog::RenamePlaylist(_) => W,
             Dialog::Properties(_) => 640.0,
             Dialog::About | Dialog::Shortcuts => 600.0,
-            Dialog::DeletePlaylist(_) => 520.0,
+            Dialog::DeletePlaylist(_) | Dialog::NewProfile => 520.0,
         };
         let mut b = Builder {
             w,
@@ -815,6 +822,7 @@ impl Painter {
             Dialog::NewPlaylist { .. } | Dialog::RenamePlaylist(_) => {
                 self.playlist_parts(&mut b, &mut g, d)
             }
+            Dialog::NewProfile => self.profile_parts(&mut b, &mut g, d),
             Dialog::About => about_parts(&mut b),
             Dialog::Shortcuts => {
                 let mut y = TITLE_H + 14.0;
@@ -947,6 +955,32 @@ impl Painter {
         };
         b.footer(
             bottom + FOOTER_GAP,
+            Some((Target::Cancel, "Cancel")),
+            "Save",
+            d.name().is_some(),
+        )
+    }
+
+    /// New Profile: the name field; returns the height.
+    fn profile_parts(&self, b: &mut Builder, g: &mut Geometry, d: &State) -> f32 {
+        let w = b.w;
+        b.text("Profile Name", Style::Heading, PAD, 87.0, w - PAD);
+        b.text(
+            "The profile starts with the settings in force now.",
+            Style::Help,
+            PAD,
+            117.0,
+            w - PAD,
+        );
+        let field = Rect::new(PAD, 154.0, w - PAD, 188.0);
+        b.parts.push(Part::Field(field));
+        b.target(Target::Field, field);
+        if let Some(e) = &d.error {
+            b.text(e.as_str(), Style::Error, PAD, 201.0, w - PAD);
+        }
+        self.field_stops(g, d, field);
+        b.footer(
+            field.b + FOOTER_GAP,
             Some((Target::Cancel, "Cancel")),
             "Save",
             d.name().is_some(),
@@ -1647,13 +1681,11 @@ impl Painter {
         unsafe {
             rt.PushAxisAlignedClip(&area.d2d(), D2D1_ANTIALIAS_MODE_ALIASED);
             if f.text.is_empty() {
-                self.say(
-                    rt,
-                    "e.g., Favorite Videos",
-                    &r.field_text,
-                    area,
-                    &r.placeholder_fg,
-                );
+                let example = match d.dialog {
+                    Dialog::NewProfile => "e.g., Late Night",
+                    _ => "e.g., Favorite Videos",
+                };
+                self.say(rt, example, &r.field_text, area, &r.placeholder_fg);
             } else {
                 let x0 = area.l - g.text_scroll;
                 let sel = f.selection();
@@ -1819,6 +1851,13 @@ mod tests {
             })
         );
         assert_eq!(State::new(Dialog::About).save(), None);
+        let mut p = State::new(Dialog::NewProfile);
+        assert_eq!(p.save(), None, "no name yet");
+        p.field.insert(" Late Night ");
+        assert_eq!(
+            p.save(),
+            Some(DialogAction::CreateProfile("Late Night".into()))
+        );
     }
 
     #[test]

@@ -56,9 +56,9 @@ The player has the redesign's own title bar and control bar.
 Click play/pause, previous (restart, or the previous file within the first 3 seconds), next, the seek bar, the volume wedge (up to 200%, like VLC) and the speaker (mute).
 The title bar has minimize, maximize, fullscreen and close, and dragging it moves the window.
 While playing, the bars hide after 3 seconds without mouse movement and the video fills the window inside a 10 px rounded frame; moving the mouse brings them back.
-The "…" button opens the main menu from the design: open files, open a folder, recent files, keyboard shortcuts, playback settings and About.
+The "…" button opens the main menu from the design: open files, open a folder, recent files, settings profiles, keyboard shortcuts, Customize Player, Settings and About.
 Right-clicking the video opens the player menu: play, stop, previous, next, hide the controls, the mini player, and submenus for speed and sleep timer, video tracks and transforms, audio tracks, stereo mode and output device, subtitles, the settings tabs, the queue, and opening media.
-Items for features myvlc doesn't have (network streams, discs, capture devices, converting, recording, profiles) are shown dimmed.
+Items for features myvlc doesn't have (network streams, discs, capture devices, converting, recording) are shown dimmed.
 
 The playlist button opens the queue panel from the design, in the settings panel's place, with three tabs:
 
@@ -149,6 +149,16 @@ Changes apply at once and are kept in `settings.txt` next to the library state.
 
 The equalizer, stereo mode, subtitle size, repeat and shuffle chosen in the panels are kept the same way.
 Speed, aspect ratio, tracks and decoding are per-file defaults, so a change there applies from the next file.
+
+### Profiles
+
+A profile is a whole set of settings under a name.
+The "…" menu's Profile row names the one in force, and its submenu, from the design's "Profiles" frame, lists Movies, Shows, Music and Work, then any you added, with "New" at the bottom.
+Picking a profile applies its settings at once, theme and accent included, and myvlc starts in it next time.
+A profile starts as a copy of the settings in force when it is first picked or made, and changes from then on stay with it.
+The window's place and the volume are left alone, since they belong to the machine rather than the profile.
+"New" asks for a name, then adds the profile and switches to it.
+Each profile keeps its settings in `profiles\<name>\settings.txt`, and `profile.txt` names the one in force.
 
 ## Build requirements
 
