@@ -14,9 +14,10 @@ use std::cell::Cell;
 
 /// The design's orange.
 pub const DEFAULT_ACCENT: u32 = 0xD37918;
-/// The accent swatches of the "Settings - global" frame, in its order.
+/// The accent colours, in the design's order. Each is sampled where it's picked and so drawn
+/// bright (the "Onboarding" frames); the design dims the ones not picked.
 pub const ACCENTS: [u32; 9] = [
-    0xD37918, 0x9F3D24, 0x8C721B, 0x107728, 0x127A97, 0x144297, 0x6631B5, 0xAB3C80, 0x7D7D7D,
+    0xD37918, 0xEA4C31, 0xC4A317, 0x1BA035, 0x17ACCD, 0x175FCD, 0x8E43F8, 0xEA55B3, 0xAFAFAF,
 ];
 
 const FIXED: u32 = 1 << 24;
@@ -205,13 +206,13 @@ mod tests {
     fn the_accent_replaces_every_orange_by_ratio() {
         let blue = Theme {
             light: false,
-            accent: 0x144297,
+            accent: 0x175FCD,
         };
-        assert_eq!(map_in(blue, 0xD37918), 0x144297);
+        assert_eq!(map_in(blue, 0xD37918), 0x175FCD);
         assert_eq!(map_in(blue, 0x8F8F8F), 0x8F8F8F, "greys aren't accents");
         let thumb = map_in(blue, 0xB6640E).to_be_bytes();
         assert!(
-            thumb[3] < 0x97 && thumb[3] > 0x70,
+            thumb[3] < 0xCD && thumb[3] > 0xA0,
             "a darker blue: {thumb:?}"
         );
     }

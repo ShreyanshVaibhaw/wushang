@@ -1520,7 +1520,7 @@ impl Painter {
     }
 
     /// An icon in window units: `base` is the window's transform.
-    unsafe fn prefs_glyph(
+    pub(super) unsafe fn prefs_glyph(
         &self,
         ctx: &ID2D1DeviceContext5,
         base: &Matrix3x2,
@@ -1726,8 +1726,10 @@ impl Painter {
                             rt.FillRoundedRectangle(&rounded(cell, 4.0), &r.hover);
                         }
                         let (cx, cy) = centre(cell);
+                        // As in the design: the picked colour bright, the others dimmed.
+                        let alpha = if current == Some(i) { 1.0 } else { 0.62 };
                         r.swatch
-                            .SetColor(&color(theme::fixed(theme::ACCENTS[i]), 1.0));
+                            .SetColor(&color(theme::fixed(theme::ACCENTS[i]), alpha));
                         let sw = Rect::around(cx, cy, SWATCH);
                         rt.FillRoundedRectangle(&rounded(sw, 2.0), &r.swatch);
                     }
@@ -1977,7 +1979,7 @@ mod tests {
         let Some(Action::Preferences(PrefsAction::Changed(p))) = ui.preferences_click(blue) else {
             panic!("a swatch changes the settings");
         };
-        assert_eq!((p.theme, p.accent), (1, 0x144297));
+        assert_eq!((p.theme, p.accent), (1, theme::ACCENTS[5]));
     }
 
     #[test]

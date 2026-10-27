@@ -8,6 +8,7 @@ mod browse;
 pub mod dialog;
 pub mod menu;
 pub mod mini;
+pub mod onboarding;
 pub mod panels;
 pub mod preferences;
 pub mod queue;
@@ -188,6 +189,8 @@ pub enum Hit {
     Dialog(dialog::Target),
     /// The Settings window, which takes every click outside an open dialog.
     Preferences(preferences::Target),
+    /// The first-run welcome, which takes every click outside an open dialog.
+    Onboarding(onboarding::Target),
 }
 
 impl Hit {
@@ -226,6 +229,7 @@ pub struct Layout {
     menu: menu::Geometry,
     dialog: Option<dialog::Geometry>,
     preferences: Option<preferences::Geometry>,
+    onboarding: Option<onboarding::Geometry>,
 }
 
 impl Layout {
@@ -283,6 +287,7 @@ impl Layout {
             menu: Default::default(),
             dialog: None,
             preferences: None,
+            onboarding: None,
         }
     }
 
@@ -305,6 +310,9 @@ impl Layout {
     pub fn hit(&self, x: f32, y: f32) -> Option<Hit> {
         if let Some(d) = &self.dialog {
             return Some(Hit::Dialog(d.hit(x, y)));
+        }
+        if let Some(o) = &self.onboarding {
+            return Some(Hit::Onboarding(o.hit(x, y)));
         }
         if let Some(p) = &self.preferences {
             return Some(Hit::Preferences(p.hit(x, y)));
@@ -372,6 +380,7 @@ pub enum Action {
     OpenMenu(Hit, f32, f32),
     Dialog(DialogAction),
     Preferences(PrefsAction),
+    Onboarding(onboarding::OnboardingAction),
 }
 
 /// Pointer state. Lives on the UI thread; the window procedure feeds it and the render loop
@@ -407,6 +416,8 @@ pub struct Ui {
     /// The open Settings window, if any.
     pub preferences: Option<preferences::State>,
     last_pref_slider: Option<(preferences::Ctl, Instant)>,
+    /// The first-run welcome, while it's open.
+    pub onboarding: Option<onboarding::State>,
     /// From Settings: when the bars hide on their own (an index of `prefs::AUTO_HIDE`), and
     /// after how long without mouse movement.
     pub auto_hide: usize,
@@ -439,6 +450,7 @@ impl Ui {
             dialog: None,
             preferences: None,
             last_pref_slider: None,
+            onboarding: None,
             auto_hide: 0,
             hide_after: Duration::from_secs(3),
         }
@@ -598,6 +610,7 @@ impl Ui {
             || self.queue.open
             || self.dialog.is_some()
             || self.preferences.is_some()
+            || self.onboarding.is_some()
             || paused
             || self.drag.is_some()
             || self.hover.is_some_and(Hit::in_bars)
@@ -737,6 +750,7 @@ impl Ui {
                 Some(Hit::Popup(target)) => self.panel_click(target),
                 Some(Hit::Dialog(target)) => self.dialog_click(target),
                 Some(Hit::Preferences(target)) => self.preferences_click(target),
+                Some(Hit::Onboarding(target)) => self.onboarding_click(target),
                 Some(Hit::Queue(target)) => self.queue_click(target),
                 Some(Hit::Playlist) => {
                     self.toggle_queue();
@@ -908,6 +922,8 @@ pub struct Scene<'a> {
     pub dialog: Option<&'a dialog::State>,
     /// The open Settings window's settings and search.
     pub preferences: Option<&'a preferences::State>,
+    /// The first-run welcome, while it's open.
+    pub onboarding: Option<&'a onboarding::State>,
     /// Subtitle cues to show now, and how.
     pub cues: &'a [crate::subs::Cue],
     pub caption_style: &'a crate::captions::CaptionStyle,
@@ -1181,6 +1197,7 @@ pub struct Painter {
     dialog: dialog::Resources,
     prefs: preferences::Resources,
     mini: mini::Resources,
+    onboard: onboarding::Resources,
     /// Thumbnails by file; None means the file has no picture.
     thumbs: HashMap<PathBuf, Option<ID2D1Bitmap>>,
     /// Visible files without a thumbnail yet, collected while painting.
@@ -1222,6 +1239,7 @@ impl Painter {
             dialog: dialog::Resources::new(ctx, &factory, &dwrite, &fonts)?,
             prefs: preferences::Resources::new(ctx, &dwrite, &fonts)?,
             mini: mini::Resources::new(ctx, &dwrite, &fonts)?,
+            onboard: onboarding::Resources::new(ctx, &dwrite, &fonts)?,
             captions: crate::captions::CaptionRenderer::new(ctx, &dwrite, Some(&fonts))?,
             stats_text: {
                 let f = text_format(
@@ -1331,6 +1349,9 @@ impl Painter {
         unsafe { self.menu(ctx, s) };
         if let (Some(g), Some(p)) = (&s.layout.preferences, s.preferences) {
             self.paint_preferences(ctx, s, g, p);
+        }
+        if let Some(g) = &s.layout.onboarding {
+            self.paint_onboarding(ctx, s, g);
         }
         match (&s.layout.dialog, s.dialog) {
             (Some(g), Some(d)) => self.paint_dialog(ctx, s, g, d),

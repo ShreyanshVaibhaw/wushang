@@ -12,6 +12,10 @@ cargo run --release -- path\to\video.mp4
 ```
 
 Without a file, myvlc opens on the library.
+The first time it does (no `settings.txt` yet), the design's welcome shows over it in three steps.
+The first shows the media folder the library starts from, and Browse adds another to Videos.
+The second picks the theme and accent colour, which apply as you click, over a small picture of the player.
+The third lists the basic keyboard shortcuts; Finish, or Esc at any step, closes it.
 `--sw` forces software decoding, which is useful for comparing the two paths.
 `--play-and-exit` plays the file from the start and quits at its end, like VLC's option of the same name; the measurement scripts use it.
 
@@ -122,6 +126,7 @@ Changes apply at once and are kept in `settings.txt` next to the library state.
   The design has one light frame, and myvlc turns every screen light from it, so menus, panels and dialogs follow the same greys.
   System follows the Windows "app mode" setting and switches when it changes.
   The accent replaces the design's orange everywhere except the VLC cone and the volume meter.
+  Its nine colours are the onboarding frames' bright ones; Settings dims all but the one picked, as the design does.
 - Interface: keep the window above others, remember its size and position, and when and how fast the controls hide.
 - Privacy: whether recently played files are saved, and a button that clears the history.
 - Controls: the four skip lengths, what a click, a double-click and the wheel do on the video, and the keyboard shortcuts.

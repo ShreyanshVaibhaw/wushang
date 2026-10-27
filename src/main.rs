@@ -121,6 +121,9 @@ thread_local! {
     static PREFS: RefCell<Prefs> = RefCell::new(Prefs::default());
     /// Requests from the Settings window, applied by the render loop.
     static PREFS_ACTIONS: RefCell<Vec<PrefsAction>> = const { RefCell::new(Vec::new()) };
+    /// Requests from the first-run welcome, applied by the render loop.
+    static ONBOARDING_ACTIONS: RefCell<Vec<ui::onboarding::OnboardingAction>> =
+        const { RefCell::new(Vec::new()) };
     /// Into the mini player (None) or out of it to a page. The render loop does it, since
     /// moving the window sends messages to the window procedure, which borrows `UI`.
     static MINI_REQUEST: std::cell::Cell<Option<Option<Page>>> = const { std::cell::Cell::new(None) };
@@ -828,6 +831,8 @@ fn run() -> Result<(), Box<dyn Error>> {
     _ = SHARED.set(shared.clone());
     // WASAPI takes seconds to open on some machines, so start now, while the window comes up.
     let audio = audio::Device::open(shared.clone());
+    // No settings yet means myvlc hasn't run here before: the welcome shows.
+    let first_run = !Library::default_dir().join("settings.txt").exists();
     let settings = Prefs::load(&Library::default_dir());
     if !settings.device.is_empty() {
         audio.switch_to(Some(&settings.device));
@@ -931,6 +936,12 @@ fn run() -> Result<(), Box<dyn Error>> {
     // same reason. Only this thread is raised; Windows threads don't inherit priority.
     unsafe { _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL) };
 
+    // Started on a file, it plays; the welcome waits for a launch without one.
+    if first_run && path.is_none() {
+        let folder = videos_folder(&app.library);
+        UI.with_borrow_mut(|ui| ui.open_onboarding(settings.clone(), folder));
+    }
+
     let thumbnailer = thumbs::Thumbnailer::new(2, THUMB_SIZE.0, THUMB_SIZE.1);
     // Tags for Songs, Albums, Artists and Genres come from probing every music file once.
     let prober = thumbs::Prober::new();
@@ -1005,6 +1016,22 @@ fn run() -> Result<(), Box<dyn Error>> {
         }
         if std::mem::take(&mut app.enter_fullscreen) && !is_fullscreen() {
             toggle_fullscreen(hwnd);
+        }
+        for action in ONBOARDING_ACTIONS.with_borrow_mut(std::mem::take) {
+            match action {
+                ui::onboarding::OnboardingAction::PickFolder => {
+                    if let Some(dir) = pick_folder(hwnd) {
+                        app.library.add_root(Section::Videos, dir);
+                        app.library_changed = true;
+                        app.save();
+                        let folder = videos_folder(&app.library);
+                        UI.with_borrow_mut(|ui| {
+                            ui.browse.stale = true;
+                            ui.onboarding_folder(folder);
+                        });
+                    }
+                }
+            }
         }
         for action in DIALOG_ACTIONS.with_borrow_mut(std::mem::take) {
             apply_dialog(&mut app, hwnd, action);
@@ -1217,6 +1244,9 @@ fn run() -> Result<(), Box<dyn Error>> {
                 if let Some(p) = &ui.preferences {
                     layout.add_preferences(p);
                 }
+                if let Some(o) = &ui.onboarding {
+                    layout.add_onboarding(o);
+                }
                 if let Some(d) = &ui.dialog {
                     renderer.add_dialog(&mut layout, d);
                 }
@@ -1282,6 +1312,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                     queue: queue_data.as_ref(),
                     dialog: ui.dialog.as_ref(),
                     preferences: ui.preferences.as_ref(),
+                    onboarding: ui.onboarding.as_ref(),
                     cues: &cues,
                     caption_style: &app.caption,
                     stats: stats.as_deref(),
@@ -2575,7 +2606,16 @@ fn act(hwnd: HWND, shared: &Shared, action: Option<Action>) {
         Action::OpenMenu(hit, x, y) => MENU_REQUESTS.with_borrow_mut(|m| m.push((hit, x, y))),
         Action::Dialog(a) => DIALOG_ACTIONS.with_borrow_mut(|p| p.push(a)),
         Action::Preferences(a) => PREFS_ACTIONS.with_borrow_mut(|p| p.push(a)),
+        Action::Onboarding(a) => ONBOARDING_ACTIONS.with_borrow_mut(|o| o.push(a)),
     }
+}
+
+/// The welcome's media folder: the library's newest Videos folder, the one Browse just added.
+fn videos_folder(library: &Library) -> String {
+    library
+        .roots(Section::Videos)
+        .last()
+        .map_or_else(|| "No folder yet".to_owned(), |p| p.display().to_string())
 }
 
 fn on_key(hwnd: HWND, shared: &Shared, key: VIRTUAL_KEY) {
@@ -2592,6 +2632,11 @@ fn on_key(hwnd: HWND, shared: &Shared, key: VIRTUAL_KEY) {
     // An open dialog takes every key, then the Settings window.
     if UI.with_borrow(|ui| ui.dialog.is_some()) {
         let action = UI.with_borrow_mut(|ui| ui.dialog_key(key, shift, ctrl));
+        act(hwnd, shared, action);
+        return;
+    }
+    if UI.with_borrow(|ui| ui.onboarding.is_some()) {
+        let action = UI.with_borrow_mut(|ui| ui.onboarding_key(key));
         act(hwnd, shared, action);
         return;
     }

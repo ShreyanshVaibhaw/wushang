@@ -368,7 +368,6 @@ impl Library {
         }
     }
 
-    #[cfg(test)]
     pub fn roots(&self, section: Section) -> Vec<PathBuf> {
         self.root_list(section).to_vec()
     }
