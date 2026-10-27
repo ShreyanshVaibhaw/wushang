@@ -67,6 +67,8 @@ pub enum MenuAction {
     HideUi,
     /// Into the mini player window, or back out of it.
     MiniPlayer,
+    /// Opens Customize Player.
+    CustomizePlayer,
     /// A change the tracks and settings panels also make.
     Panel(PanelAction),
     ShowQueue,
@@ -717,10 +719,10 @@ pub fn main_menu(recent: &[PathBuf]) -> Vec<Item> {
         Item::off("Convert").icon(Icon::Convert).key("Ctrl + R"),
         Item::submenu("Open Recent", recent).icon(Icon::Recent),
         Item::divider(),
-        // ponytail: profiles and a customisable player have no settings behind them yet.
+        // ponytail: profiles have no settings behind them yet.
         Item::submenu("Profile (Movies)", Vec::new()).icon(Icon::Profile),
         Item::new("Keyboard Shortcuts", MenuAction::ShowShortcuts).icon(Icon::Keyboard),
-        Item::off("Customize Player").icon(Icon::Brush),
+        Item::new("Customize Player", MenuAction::CustomizePlayer).icon(Icon::Brush),
         Item::new(
             "Settings",
             MenuAction::Preferences(crate::ui::Category::Playback),
@@ -901,6 +903,8 @@ pub fn player_menu(d: &PanelData, paused: bool) -> Vec<Item> {
         Item::new("Mini Player", MenuAction::MiniPlayer)
             .icon(Icon::Mini)
             .key("Ctrl + M"),
+        // Here too, since Customize Player can take the "..." button out of the bars.
+        Item::new("Customize Player", MenuAction::CustomizePlayer).icon(Icon::Brush),
         Item::divider(),
         Item::submenu("Playback", playback).icon(Icon::Playback),
         Item::submenu("Video", video).icon(Icon::Video),

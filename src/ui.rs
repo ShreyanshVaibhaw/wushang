@@ -5,6 +5,7 @@
 //! Sizes are DIPs measured from the design's 1920x1080 frames.
 
 mod browse;
+pub mod customize;
 pub mod dialog;
 pub mod menu;
 pub mod mini;
@@ -13,6 +14,7 @@ pub mod panels;
 pub mod preferences;
 pub mod queue;
 pub mod theme;
+pub mod toolbar;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -24,6 +26,7 @@ pub use menu::MenuAction;
 pub use panels::{Panel, PanelAction, PanelData, TrackTab};
 pub use preferences::{Category, PrefsAction};
 pub use queue::{QueueAction, QueueData, QueueItem};
+pub use toolbar::{Item as ToolItem, Toolbar};
 use windows::Win32::Foundation::E_FAIL;
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
 
@@ -191,6 +194,10 @@ pub enum Hit {
     Preferences(preferences::Target),
     /// The first-run welcome, which takes every click outside an open dialog.
     Onboarding(onboarding::Target),
+    /// A bar item the design's customize palette adds.
+    Tool(toolbar::Item),
+    /// Customize Player and the bars under it, which take every click while it's open.
+    Customize(customize::Target),
 }
 
 impl Hit {
@@ -221,6 +228,8 @@ pub struct Layout {
     current: Rect,
     duration: Rect,
     volume: Rect,
+    /// The bars' items and groups, on the player page.
+    tools: toolbar::Bars,
     /// The mini player card: the library's while something plays, or the whole mini window.
     card: Option<mini::Card>,
     browse: browse::Geometry,
@@ -230,10 +239,18 @@ pub struct Layout {
     dialog: Option<dialog::Geometry>,
     preferences: Option<preferences::Geometry>,
     onboarding: Option<onboarding::Geometry>,
+    customize: Option<customize::Geometry>,
 }
 
 impl Layout {
+    /// The player page with the bars myvlc starts with.
+    #[cfg(test)]
     pub fn new(width: f32, height: f32, bars: bool, fullscreen: bool) -> Self {
+        Self::player(width, height, bars, fullscreen, &Toolbar::default())
+    }
+
+    /// The player page with `toolbar`'s bars.
+    pub fn player(width: f32, height: f32, bars: bool, fullscreen: bool, t: &Toolbar) -> Self {
         if !bars {
             let inset = if fullscreen { 0.0 } else { FRAME };
             let video = Rect::new(inset, inset, width - inset, height - inset);
@@ -246,48 +263,48 @@ impl Layout {
                 ..Default::default()
             };
         }
-        let (w, cy) = (width, height - CONTROL_BAR / 2.0);
+        let w = width;
+        let tools = toolbar::layout(t, w, height);
         let top = |x: f32, size: f32| Rect::new(x, 6.0, x + size, 34.0);
-        let icon = |x: f32| Rect::new(x, cy - 16.0, x + 30.0, cy + 16.0);
-        let buttons = vec![
-            (Hit::More, top(51.0, 28.0)),
-            (Hit::Sidebar, top(89.0, 28.0)),
+        let mut buttons = vec![
             (Hit::Minimize, top(w - 150.0, 36.0)),
             (Hit::Maximize, top(w - 114.0, 36.0)),
             (Hit::Fullscreen, top(w - 78.0, 36.0)),
             (Hit::Close, top(w - 42.0, 36.0)),
-            (Hit::Previous, icon(20.0)),
-            (Hit::Play, Rect::new(58.0, cy - 14.0, 112.0, cy + 14.0)),
-            (Hit::Next, icon(120.0)),
-            (
-                Hit::Speaker,
-                Rect::new(w - 324.0, cy - 12.0, w - 300.0, cy + 12.0),
-            ),
-            (Hit::Audio, icon(w - 184.0)),
-            (Hit::Subtitles, icon(w - 142.0)),
-            (Hit::Settings, icon(w - 100.0)),
-            (Hit::Playlist, icon(w - 50.0)),
-            (Hit::Folder, Rect::new(139.0, 6.0, 300.0, 34.0)),
         ];
+        let mut volume = Rect::default();
+        for p in &tools.placed {
+            let r = p.r;
+            match p.item {
+                // The speaker and its wedge, which drags like the seek bar.
+                ToolItem::Volume => {
+                    let cy = (r.t + r.b) / 2.0;
+                    buttons.push((
+                        Hit::Speaker,
+                        Rect::new(r.l, cy - 12.0, r.l + 24.0, cy + 12.0),
+                    ));
+                    volume = Rect::new(r.l + 32.0, r.t, r.r, r.b);
+                }
+                item => {
+                    if let Some(hit) = item.hit() {
+                        buttons.push((hit, r));
+                    }
+                }
+            }
+        }
         Layout {
             page: Page::Player,
             bars,
             width,
             height,
-            video: Rect::new(FRAME, TITLE_BAR + 1.0, w - FRAME, height - CONTROL_BAR),
+            video: Rect::new(FRAME, TITLE_BAR + 1.0, w - FRAME, height - tools.bar),
             buttons,
-            current: Rect::new(170.0, cy - 14.0, 246.0, cy + 14.0),
-            track: Rect::new(254.0, cy - 14.0, w - 428.0, cy + 14.0),
-            duration: Rect::new(w - 420.0, cy - 14.0, w - 344.0, cy + 14.0),
-            volume: Rect::new(w - 292.0, cy - 14.0, w - 204.0, cy + 14.0),
-            card: None,
-            browse: Default::default(),
-            panels: Default::default(),
-            queue: Default::default(),
-            menu: Default::default(),
-            dialog: None,
-            preferences: None,
-            onboarding: None,
+            current: tools.current,
+            track: tools.track,
+            duration: tools.duration,
+            volume,
+            tools,
+            ..Default::default()
         }
     }
 
@@ -310,6 +327,9 @@ impl Layout {
     pub fn hit(&self, x: f32, y: f32) -> Option<Hit> {
         if let Some(d) = &self.dialog {
             return Some(Hit::Dialog(d.hit(x, y)));
+        }
+        if let Some(c) = &self.customize {
+            return Some(Hit::Customize(c.hit(x, y)));
         }
         if let Some(o) = &self.onboarding {
             return Some(Hit::Onboarding(o.hit(x, y)));
@@ -381,6 +401,8 @@ pub enum Action {
     Dialog(DialogAction),
     Preferences(PrefsAction),
     Onboarding(onboarding::OnboardingAction),
+    /// Customize Player's Save: keep these bars.
+    SaveToolbar(Toolbar),
 }
 
 /// Pointer state. Lives on the UI thread; the window procedure feeds it and the render loop
@@ -418,6 +440,9 @@ pub struct Ui {
     last_pref_slider: Option<(preferences::Ctl, Instant)>,
     /// The first-run welcome, while it's open.
     pub onboarding: Option<onboarding::State>,
+    /// What the bars hold, and Customize Player while it's open.
+    pub toolbar: Toolbar,
+    pub customize: Option<customize::State>,
     /// From Settings: when the bars hide on their own (an index of `prefs::AUTO_HIDE`), and
     /// after how long without mouse movement.
     pub auto_hide: usize,
@@ -451,6 +476,8 @@ impl Ui {
             preferences: None,
             last_pref_slider: None,
             onboarding: None,
+            toolbar: Toolbar::default(),
+            customize: None,
             auto_hide: 0,
             hide_after: Duration::from_secs(3),
         }
@@ -611,6 +638,7 @@ impl Ui {
             || self.dialog.is_some()
             || self.preferences.is_some()
             || self.onboarding.is_some()
+            || self.customize.is_some()
             || paused
             || self.drag.is_some()
             || self.hover.is_some_and(Hit::in_bars)
@@ -666,6 +694,10 @@ impl Ui {
             Some(Hit::Popup(panels::Target::Ctl(ctl))) => self.slide(ctl, x),
             Some(Hit::Dialog(_)) => self.dialog_drag(x),
             Some(Hit::Preferences(_)) => self.preferences_drag(x),
+            Some(Hit::Customize(_)) => {
+                self.customize_drag(x, y);
+                None
+            }
             _ => {
                 self.queue_drag(y);
                 None
@@ -719,6 +751,10 @@ impl Ui {
             }
             Some(Hit::Dialog(target)) => self.dialog_down(target, x),
             Some(Hit::Preferences(target)) => self.preferences_down(target, x),
+            Some(Hit::Customize(target)) => {
+                self.customize_down(target, x, y);
+                None
+            }
             _ => None,
         }
     }
@@ -735,6 +771,10 @@ impl Ui {
                 Some(Action::SeekTo(fraction))
             }
             Some(Hit::Queue(queue::Target::Row(from))) => self.queue_drop(from),
+            Some(Hit::Customize(_)) => {
+                self.customize_drop(x, y);
+                None
+            }
             Some(_) => None,
             // An open choice list takes the next click: a choice, or anywhere else to close it.
             None if self.panels.list.is_some()
@@ -751,6 +791,7 @@ impl Ui {
                 Some(Hit::Dialog(target)) => self.dialog_click(target),
                 Some(Hit::Preferences(target)) => self.preferences_click(target),
                 Some(Hit::Onboarding(target)) => self.onboarding_click(target),
+                Some(Hit::Customize(target)) => self.customize_click(target),
                 Some(Hit::Queue(target)) => self.queue_click(target),
                 Some(Hit::Playlist) => {
                     self.toggle_queue();
@@ -924,6 +965,12 @@ pub struct Scene<'a> {
     pub preferences: Option<&'a preferences::State>,
     /// The first-run welcome, while it's open.
     pub onboarding: Option<&'a onboarding::State>,
+    /// Customize Player, while it's open.
+    pub customize: Option<&'a customize::State>,
+    /// For the bars' repeat, shuffle and favourite items.
+    pub repeat: crate::queue::Repeat,
+    pub shuffle: bool,
+    pub favorite: bool,
     /// Subtitle cues to show now, and how.
     pub cues: &'a [crate::subs::Cue],
     pub caption_style: &'a crate::captions::CaptionStyle,
@@ -1198,6 +1245,12 @@ pub struct Painter {
     prefs: preferences::Resources,
     mini: mini::Resources,
     onboard: onboarding::Resources,
+    custom: customize::Resources,
+    /// The bar items' icons, and their lit versions for repeat, shuffle and favourite.
+    tools: HashMap<ToolItem, Svg>,
+    tools_on: HashMap<ToolItem, Svg>,
+    /// The seconds on the skip items.
+    skip_text: IDWriteTextFormat,
     /// Thumbnails by file; None means the file has no picture.
     thumbs: HashMap<PathBuf, Option<ID2D1Bitmap>>,
     /// Visible files without a thumbnail yet, collected while painting.
@@ -1240,6 +1293,16 @@ impl Painter {
             prefs: preferences::Resources::new(ctx, &dwrite, &fonts)?,
             mini: mini::Resources::new(ctx, &dwrite, &fonts)?,
             onboard: onboarding::Resources::new(ctx, &dwrite, &fonts)?,
+            custom: customize::Resources::new(ctx, &factory, &dwrite, &fonts)?,
+            tools: tool_icons(ctx, false)?,
+            tools_on: tool_icons(ctx, true)?,
+            skip_text: text_format(
+                &dwrite,
+                &fonts,
+                7.5,
+                DWRITE_FONT_WEIGHT_SEMI_BOLD,
+                DWRITE_TEXT_ALIGNMENT_CENTER,
+            )?,
             captions: crate::captions::CaptionRenderer::new(ctx, &dwrite, Some(&fonts))?,
             stats_text: {
                 let f = text_format(
@@ -1346,6 +1409,9 @@ impl Painter {
     /// video area, and the open dialog over both. Runs between BeginDraw and EndDraw.
     pub fn paint(&mut self, ctx: &ID2D1DeviceContext5, s: &Scene) -> Result<()> {
         self.paint_page(ctx, s)?;
+        if let Some(g) = &s.layout.customize {
+            self.paint_customize(ctx, s, g);
+        }
         unsafe { self.menu(ctx, s) };
         if let (Some(g), Some(p)) = (&s.layout.preferences, s.preferences) {
             self.paint_preferences(ctx, s, g, p);
@@ -1502,23 +1568,23 @@ impl Painter {
 
     unsafe fn title_bar(&self, rt: &ID2D1RenderTarget, ctx: &ID2D1DeviceContext5, s: &Scene) {
         let (i, w) = (&self.icons, s.layout.width);
-        let player = s.layout.page == Page::Player;
         unsafe {
             self.icon(ctx, &i.logo, 13.0, 8.0, false);
-            self.hover_box(rt, s, Hit::More);
-            self.icon(ctx, &i.more, 56.0, 11.0, true);
-            // The library page has its own sidebar and breadcrumb.
-            if player {
-                self.hover_box(rt, s, Hit::Sidebar);
-                self.icon(ctx, &i.sidebar, 91.0, 8.0, true);
-                self.icon(ctx, &i.divider, 117.0, 8.0, true);
-                self.icon(ctx, &i.folder, 143.0, 8.0, true);
-                self.text(
-                    rt,
-                    s.folder,
-                    &self.folder,
-                    Rect::new(171.0, 0.0, 300.0, TITLE_BAR),
-                );
+            // The library page has its own sidebar and breadcrumb; the player's title bar group
+            // is whatever Customize Player put there.
+            if s.layout.page == Page::Player {
+                for p in s
+                    .layout
+                    .tools
+                    .placed
+                    .iter()
+                    .filter(|p| p.zone == toolbar::Zone::Title)
+                {
+                    self.tool(rt, ctx, s, p);
+                }
+            } else {
+                self.hover_box(rt, s, Hit::More);
+                self.icon(ctx, &i.more, 56.0, 11.0, true);
             }
             let title = if s.title.is_empty() { "myvlc" } else { s.title };
             self.text(
@@ -1546,22 +1612,8 @@ impl Painter {
     }
 
     unsafe fn control_bar(&self, rt: &ID2D1RenderTarget, ctx: &ID2D1DeviceContext5, s: &Scene) {
-        let (i, l) = (&self.icons, s.layout);
-        let cy = l.height - CONTROL_BAR / 2.0;
+        let l = s.layout;
         unsafe {
-            self.hover_box(rt, s, Hit::Previous);
-            self.icon(ctx, &i.previous, 23.0, cy - 12.0, false);
-            rt.FillRoundedRectangle(&rounded(l.button(Hit::Play), 6.0), &self.accent);
-            self.icon(
-                ctx,
-                if s.paused { &i.play } else { &i.pause },
-                75.0,
-                cy - 12.0,
-                false,
-            );
-            self.hover_box(rt, s, Hit::Next);
-            self.icon(ctx, &i.next, 123.0, cy - 12.0, false);
-
             self.text(rt, &clock_text(s.position), &self.times, l.current);
             self.text(rt, &clock_text(s.duration), &self.times, l.duration);
             // Seek bar: dark track, a played section and an orange handle at its end.
@@ -1579,67 +1631,243 @@ impl Painter {
                 &rounded(Rect::new(fill.r - 8.0, fill.t, fill.r, fill.b), 4.0),
                 &self.accent,
             );
-
-            let speaker = match (s.muted, s.volume) {
-                (true, _) => &i.speaker_muted,
-                (_, v) if v <= 0.0 => &i.speaker_muted,
-                (_, v) if v < 0.34 => &i.speaker_low,
-                (_, v) if v < 0.67 => &i.speaker_medium,
-                _ => &i.speaker_high,
-            };
-            self.icon(ctx, speaker, l.button(Hit::Speaker).l, cy - 12.0, true);
-            // Volume wedge: the track, then the gradient fill clipped to the level.
-            let v = l.volume;
-            self.icon(ctx, &i.volume_track, v.l, v.t + 0.32, false);
-            if !s.muted {
-                let clip = Rect::new(v.l, v.t, v.l + fill_width(s.volume), v.b);
-                rt.PushAxisAlignedClip(&clip.d2d(), D2D1_ANTIALIAS_MODE_ALIASED);
-                self.icon(ctx, &i.volume_fill, v.l + 1.5, v.t + 1.72, false);
-                rt.PopAxisAlignedClip();
-            }
-
-            // The button whose popup is open turns orange.
-            let on = |hit| l.panels.opener == Some(hit);
-            let p = &self.panels;
-            for (hit, svg) in [
-                (
-                    Hit::Audio,
-                    if on(Hit::Audio) {
-                        &p.audio_on
-                    } else {
-                        &i.audio
-                    },
-                ),
-                (
-                    Hit::Subtitles,
-                    if on(Hit::Subtitles) {
-                        &p.subtitles_on
-                    } else {
-                        &i.subtitles
-                    },
-                ),
-                (
-                    Hit::Settings,
-                    if on(Hit::Settings) {
-                        &p.settings_on
-                    } else {
-                        &i.settings
-                    },
-                ),
-                (
-                    Hit::Playlist,
-                    if l.queue.open {
-                        &self.queue.playlist_on
-                    } else {
-                        &i.playlist
-                    },
-                ),
-            ] {
-                self.hover_box(rt, s, hit);
-                self.icon(ctx, svg, l.button(hit).l + 3.0, cy - 12.0, false);
+            for p in l
+                .tools
+                .placed
+                .iter()
+                .filter(|p| p.zone != toolbar::Zone::Title)
+            {
+                self.tool(rt, ctx, s, p);
             }
         }
     }
+
+    /// One bar item where the layout put it.
+    unsafe fn tool(
+        &self,
+        rt: &ID2D1RenderTarget,
+        ctx: &ID2D1DeviceContext5,
+        s: &Scene,
+        p: &toolbar::Placed,
+    ) {
+        let (i, l, r) = (&self.icons, s.layout, p.r);
+        let cy = (r.t + r.b) / 2.0;
+        // The button whose popup is open turns orange.
+        let on = |hit| l.panels.opener == Some(hit);
+        let pp = &self.panels;
+        unsafe {
+            match p.item {
+                ToolItem::More => {
+                    self.hover_box(rt, s, Hit::More);
+                    self.icon(ctx, &i.more, r.l + 5.0, cy - 9.0, true);
+                }
+                ToolItem::Sidebar => {
+                    self.hover_box(rt, s, Hit::Sidebar);
+                    self.icon(ctx, &i.sidebar, r.l + 2.0, cy - 12.0, true);
+                }
+                ToolItem::Divider => {
+                    self.icon(ctx, &i.divider, r.l + (r.w() - 24.0) / 2.0, cy - 12.0, true)
+                }
+                ToolItem::Spacer => {}
+                ToolItem::Folder => {
+                    self.icon(ctx, &i.folder, r.l + 2.0, cy - 12.0, true);
+                    let tr = Rect::new(r.l + 30.0, cy - 20.0, r.r, cy + 20.0);
+                    self.text(rt, s.folder, &self.folder, tr);
+                }
+                ToolItem::FileName => {
+                    let tr = Rect::new(r.l, cy - 20.0, r.r, cy + 20.0);
+                    self.text(rt, s.file, &self.folder, tr);
+                }
+                ToolItem::Previous => {
+                    self.hover_box(rt, s, Hit::Previous);
+                    self.icon(ctx, &i.previous, r.l + 3.0, cy - 12.0, false);
+                }
+                ToolItem::Play => {
+                    rt.FillRoundedRectangle(&rounded(r, 6.0), &self.accent);
+                    let svg = if s.paused { &i.play } else { &i.pause };
+                    self.icon(ctx, svg, r.l + 17.0, cy - 12.0, false);
+                }
+                ToolItem::Next => {
+                    self.hover_box(rt, s, Hit::Next);
+                    self.icon(ctx, &i.next, r.l + 3.0, cy - 12.0, false);
+                }
+                ToolItem::Volume => {
+                    let speaker = match (s.muted, s.volume) {
+                        (true, _) => &i.speaker_muted,
+                        (_, v) if v <= 0.0 => &i.speaker_muted,
+                        (_, v) if v < 0.34 => &i.speaker_low,
+                        (_, v) if v < 0.67 => &i.speaker_medium,
+                        _ => &i.speaker_high,
+                    };
+                    self.icon(ctx, speaker, r.l, cy - 12.0, true);
+                    // Volume wedge: the track, then the gradient fill clipped to the level.
+                    let v = l.volume;
+                    self.icon(ctx, &i.volume_track, v.l, v.t + 0.32, false);
+                    if !s.muted {
+                        let clip = Rect::new(v.l, v.t, v.l + fill_width(s.volume), v.b);
+                        rt.PushAxisAlignedClip(&clip.d2d(), D2D1_ANTIALIAS_MODE_ALIASED);
+                        self.icon(ctx, &i.volume_fill, v.l + 1.5, v.t + 1.72, false);
+                        rt.PopAxisAlignedClip();
+                    }
+                }
+                ToolItem::Audio | ToolItem::Subtitles | ToolItem::Settings | ToolItem::Queue => {
+                    let (hit, svg) = match p.item {
+                        ToolItem::Audio if on(Hit::Audio) => (Hit::Audio, &pp.audio_on),
+                        ToolItem::Audio => (Hit::Audio, &i.audio),
+                        ToolItem::Subtitles if on(Hit::Subtitles) => {
+                            (Hit::Subtitles, &pp.subtitles_on)
+                        }
+                        ToolItem::Subtitles => (Hit::Subtitles, &i.subtitles),
+                        ToolItem::Settings if on(Hit::Settings) => (Hit::Settings, &pp.settings_on),
+                        ToolItem::Settings => (Hit::Settings, &i.settings),
+                        _ if l.queue.open => (Hit::Playlist, &self.queue.playlist_on),
+                        _ => (Hit::Playlist, &i.playlist),
+                    };
+                    self.hover_box(rt, s, hit);
+                    self.icon(ctx, svg, r.l + 3.0, cy - 12.0, false);
+                }
+                item => {
+                    self.hover_box(rt, s, Hit::Tool(item));
+                    let lit = match item {
+                        ToolItem::Repeat => s.repeat != crate::queue::Repeat::Off,
+                        ToolItem::Shuffle => s.shuffle,
+                        ToolItem::Favorite => s.favorite,
+                        _ => false,
+                    };
+                    let svg = match (item, s.repeat) {
+                        (ToolItem::Repeat, crate::queue::Repeat::One) => &self.queue.repeat_one_on,
+                        _ if lit => &self.tools_on[&item],
+                        _ => self.tool_icon(item),
+                    };
+                    let x = r.l + (r.w() - 24.0) / 2.0;
+                    self.icon(ctx, svg, x, cy - 12.0, false);
+                    self.tool_number(rt, item, x + 12.0, cy);
+                }
+            }
+        }
+    }
+
+    /// A bar item's icon for the palette and the bars.
+    fn tool_icon(&self, item: ToolItem) -> &Svg {
+        &self.tools[&item]
+    }
+
+    /// The seconds inside the skip items' arrows.
+    unsafe fn tool_number(&self, rt: &ID2D1RenderTarget, item: ToolItem, cx: f32, cy: f32) {
+        let n = match item {
+            ToolItem::Forward10 | ToolItem::Back10 => "10",
+            ToolItem::Forward15 | ToolItem::Back15 => "15",
+            _ => return,
+        };
+        let r = Rect::new(cx - 8.0, cy - 4.0, cx + 8.0, cy + 8.0);
+        unsafe { self.text(rt, n, &self.skip_text, r) };
+    }
+}
+
+/// The bar items' icons, grey or (`lit`) in the accent for the ones that light up. The menus'
+/// two-tone icons come out grey, as the palette shows them.
+fn tool_icons(ctx: &ID2D1DeviceContext5, lit: bool) -> Result<HashMap<ToolItem, Svg>> {
+    use toolbar::Item as T;
+    let table: [(T, &[u8]); 41] = [
+        (T::More, include_bytes!("../assets/icons/more.svg")),
+        (T::Sidebar, include_bytes!("../assets/icons/sidebar.svg")),
+        (T::Folder, include_bytes!("../assets/icons/menu_info.svg")),
+        (T::Previous, include_bytes!("../assets/icons/previous.svg")),
+        (T::Play, include_bytes!("../assets/icons/menu_play.svg")),
+        (T::Next, include_bytes!("../assets/icons/next.svg")),
+        (T::Volume, include_bytes!("../assets/icons/speaker.svg")),
+        (T::Audio, include_bytes!("../assets/icons/audio.svg")),
+        (
+            T::Subtitles,
+            include_bytes!("../assets/icons/subtitles.svg"),
+        ),
+        (
+            T::Settings,
+            include_bytes!("../assets/icons/playback_settings.svg"),
+        ),
+        (T::Queue, include_bytes!("../assets/icons/playlist.svg")),
+        (T::Spacer, include_bytes!("../assets/icons/tool_spacer.svg")),
+        (T::Divider, include_bytes!("../assets/icons/divider.svg")),
+        (T::Speed, include_bytes!("../assets/icons/tool_speed.svg")),
+        (
+            T::Forward10,
+            include_bytes!("../assets/icons/tool_forward.svg"),
+        ),
+        (T::Back10, include_bytes!("../assets/icons/tool_back.svg")),
+        (
+            T::Forward15,
+            include_bytes!("../assets/icons/tool_forward.svg"),
+        ),
+        (T::Back15, include_bytes!("../assets/icons/tool_back.svg")),
+        (T::Stop, include_bytes!("../assets/icons/menu_stop.svg")),
+        (T::Repeat, include_bytes!("../assets/icons/repeat.svg")),
+        (T::Shuffle, include_bytes!("../assets/icons/shuffle.svg")),
+        (T::Record, include_bytes!("../assets/icons/menu_record.svg")),
+        (
+            T::Snapshot,
+            include_bytes!("../assets/icons/tool_snapshot.svg"),
+        ),
+        (
+            T::MiniPlayer,
+            include_bytes!("../assets/icons/menu_mini.svg"),
+        ),
+        (T::Hdr, include_bytes!("../assets/icons/tool_hdr.svg")),
+        (T::Zoom, include_bytes!("../assets/icons/tool_zoom.svg")),
+        (
+            T::RightSidebar,
+            include_bytes!("../assets/icons/sidebar.svg"),
+        ),
+        (T::Quit, include_bytes!("../assets/icons/menu_quit.svg")),
+        (
+            T::Preferences,
+            include_bytes!("../assets/icons/menu_settings.svg"),
+        ),
+        (T::Home, include_bytes!("../assets/icons/nav_home.svg")),
+        (
+            T::Thumbnail,
+            include_bytes!("../assets/icons/tool_thumbnail.svg"),
+        ),
+        (T::FileName, include_bytes!("../assets/icons/menu_info.svg")),
+        (
+            T::ArtistName,
+            include_bytes!("../assets/icons/menu_info.svg"),
+        ),
+        (
+            T::PlaylistName,
+            include_bytes!("../assets/icons/menu_info.svg"),
+        ),
+        (
+            T::Properties,
+            include_bytes!("../assets/icons/menu_info.svg"),
+        ),
+        (T::Replay, include_bytes!("../assets/icons/tool_replay.svg")),
+        (T::Chapters, include_bytes!("../assets/icons/chapters.svg")),
+        (
+            T::Favorite,
+            include_bytes!("../assets/icons/menu_heart.svg"),
+        ),
+        (T::Bookmark, include_bytes!("../assets/icons/bookmark.svg")),
+        (
+            T::Bookmarks,
+            include_bytes!("../assets/icons/tool_bookmarks.svg"),
+        ),
+        (
+            T::Playlists,
+            include_bytes!("../assets/icons/nav_playlists.svg"),
+        ),
+    ];
+    let (from, to) = if lit {
+        ("#8F8F8F", "#D37918")
+    } else {
+        ("#D37918", "#8F8F8F")
+    };
+    table
+        .iter()
+        .map(|(item, bytes)| {
+            let text = String::from_utf8_lossy(bytes).replace(from, to);
+            Ok((*item, svg(ctx, text.as_bytes())?))
+        })
+        .collect()
 }
 
 #[cfg(test)]

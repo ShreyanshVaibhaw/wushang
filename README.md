@@ -58,7 +58,7 @@ The title bar has minimize, maximize, fullscreen and close, and dragging it move
 While playing, the bars hide after 3 seconds without mouse movement and the video fills the window inside a 10 px rounded frame; moving the mouse brings them back.
 The "…" button opens the main menu from the design: open files, open a folder, recent files, keyboard shortcuts, playback settings and About.
 Right-clicking the video opens the player menu: play, stop, previous, next, hide the controls, the mini player, and submenus for speed and sleep timer, video tracks and transforms, audio tracks, stereo mode and output device, subtitles, the settings tabs, the queue, and opening media.
-Items for features myvlc doesn't have (network streams, discs, capture devices, converting, recording, profiles, customizing the player) are shown dimmed.
+Items for features myvlc doesn't have (network streams, discs, capture devices, converting, recording, profiles) are shown dimmed.
 
 The playlist button opens the queue panel from the design, in the settings panel's place, with three tabs:
 
@@ -102,6 +102,16 @@ Switching tracks and seeking land on the exact moment: the decoders read from th
 | Q, Ctrl+Q | Quit |
 
 The window opens the way it was launched, so a shortcut set to "Run: Minimized", or a script that asks for minimized without activation, never takes focus.
+
+### Customize Player
+
+"Customize Player" in the "…" menu or the player's right-click menu opens the design's palette over the player, and every item and group in the bars gets a dashed box.
+Drag an item from the palette into the title bar group or the control bar's left, centre or right group, between items or across groups, and drag one back onto the palette to take it out.
+Dropping on the seek bar starts the centre group, and the control bar then takes two rows with the seek bar across the top, as in the design's customize frames.
+Save keeps the bars in `toolbar.txt` next to the library state; Cancel or Esc drops the changes.
+
+Besides the bars' own controls, the palette has spacers and dividers, playback speed, skip 10 or 15 seconds either way, stop, repeat, shuffle, the mini player, zoom, quit, Settings, the library, the file name, properties, replay, chapters, favourite, add a bookmark, bookmarks and playlists.
+Record, snapshot, HDR, the right sidebar, a thumbnail and the artist and playlist names are dimmed, as myvlc can't do them yet.
 
 ### Mini player
 

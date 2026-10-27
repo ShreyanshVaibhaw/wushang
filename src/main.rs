@@ -841,6 +841,7 @@ fn run() -> Result<(), Box<dyn Error>> {
     shared.set_volume(settings.startup_volume());
     library::SHOW_HIDDEN.store(settings.show_hidden, Relaxed);
     ui::theme::set(theme_of(&settings));
+    UI.with_borrow_mut(|ui| ui.toolbar = ui::Toolbar::load(&Library::default_dir()));
     UI.with_borrow_mut(|ui| {
         ui.auto_hide = settings.auto_hide;
         ui.hide_after = Duration::from_secs_f32(settings.hide_after);
@@ -1179,8 +1180,9 @@ fn run() -> Result<(), Box<dyn Error>> {
         let panel_data = app.panel_data();
         let queue_data = UI.with_borrow(|ui| ui.queue.open).then(|| app.queue_data());
         let needs_paint = UI.with_borrow_mut(|ui| {
-            // Nothing to show on the player page once playback ends or fails.
-            if app.session.is_none() {
+            // Nothing to show on the player page once playback ends or fails, unless its bars
+            // are being customized.
+            if app.session.is_none() && ui.customize.is_none() {
                 ui.show(Page::Library);
             }
             ui.menu_tick();
@@ -1200,7 +1202,11 @@ fn run() -> Result<(), Box<dyn Error>> {
                         || ui.queue_stale(queue_data.as_ref())
                         || (w, h) != (old.width, old.height);
                     changed.then(|| {
-                        let mut layout = Layout::new(w, h, bars, fullscreen);
+                        let toolbar = ui.customize.as_ref().map_or(&ui.toolbar, |c| &c.draft);
+                        let mut layout = Layout::player(w, h, bars, fullscreen, toolbar);
+                        if let Some(c) = &ui.customize {
+                            layout.add_customize(c);
+                        }
                         if ui.overlay {
                             renderer.add_overlay(&mut layout, &ui.browse);
                         }
@@ -1313,6 +1319,10 @@ fn run() -> Result<(), Box<dyn Error>> {
                     dialog: ui.dialog.as_ref(),
                     preferences: ui.preferences.as_ref(),
                     onboarding: ui.onboarding.as_ref(),
+                    customize: ui.customize.as_ref(),
+                    repeat: app.queue.repeat(),
+                    shuffle: app.queue.shuffle(),
+                    favorite: session.is_some_and(|s| app.library.is_favorite(&s.path)),
                     cues: &cues,
                     caption_style: &app.caption,
                     stats: stats.as_deref(),
@@ -1434,6 +1444,7 @@ fn handle(app: &mut App, hwnd: HWND, hit: Hit) {
             }
         }
         Hit::Card => UI.with_borrow_mut(|ui| ui.show(Page::Player)),
+        Hit::Tool(item) => use_tool(app, hwnd, item),
         Hit::MiniExpand if is_mini() => MINI_REQUEST.set(Some(Some(Page::Player))),
         Hit::MiniExpand => UI.with_borrow_mut(|ui| ui.show(Page::Player)),
         Hit::MiniClose => {
@@ -1580,6 +1591,15 @@ fn menu_action(app: &mut App, hwnd: HWND, action: MenuAction) {
         MenuAction::HideUi => UI.with_borrow_mut(Ui::hide_bars),
         MenuAction::MiniPlayer if is_mini() => MINI_REQUEST.set(Some(Some(Page::Player))),
         MenuAction::MiniPlayer => MINI_REQUEST.set(Some(None)),
+        MenuAction::CustomizePlayer => {
+            if is_mini() {
+                MINI_REQUEST.set(Some(Some(Page::Player)));
+            }
+            UI.with_borrow_mut(|ui| {
+                ui.show(Page::Player);
+                ui.open_customize();
+            });
+        }
         MenuAction::Panel(a) => app.apply(hwnd, a),
         // Files join the queue, or play when nothing is open.
         MenuAction::AddToQueue(paths) => {
@@ -2591,6 +2611,7 @@ fn act(hwnd: HWND, shared: &Shared, action: Option<Action>) {
             | Hit::Card
             | Hit::MiniClose
             | Hit::MiniExpand
+            | Hit::Tool(_)
             | Hit::Folder
             | Hit::Next
             | Hit::Previous),
@@ -2607,6 +2628,72 @@ fn act(hwnd: HWND, shared: &Shared, action: Option<Action>) {
         Action::Dialog(a) => DIALOG_ACTIONS.with_borrow_mut(|p| p.push(a)),
         Action::Preferences(a) => PREFS_ACTIONS.with_borrow_mut(|p| p.push(a)),
         Action::Onboarding(a) => ONBOARDING_ACTIONS.with_borrow_mut(|o| o.push(a)),
+        Action::SaveToolbar(t) => {
+            if let Err(e) = t.save(&Library::default_dir()) {
+                eprintln!("toolbar: cannot save ({e})");
+            }
+            UI.with_borrow_mut(|ui| {
+                ui.toolbar = t;
+                ui.relayout = true;
+            });
+        }
+    }
+}
+
+/// A click on one of the bar items Customize Player adds.
+fn use_tool(app: &mut App, hwnd: HWND, item: ui::ToolItem) {
+    use ui::ToolItem as T;
+    let queue = |a| QUEUE_ACTIONS.with_borrow_mut(|q| q.push(a));
+    let queue_tab = |tab| {
+        UI.with_borrow_mut(|ui| {
+            ui.queue.tab = tab;
+            ui.queue.scroll = 0.0;
+            if !ui.queue.open {
+                ui.toggle_queue();
+            }
+            ui.relayout = true;
+        })
+    };
+    match item {
+        T::Forward10 => app.shared.seek_by(10.0),
+        T::Back10 => app.shared.seek_by(-10.0),
+        T::Forward15 => app.shared.seek_by(15.0),
+        T::Back15 => app.shared.seek_by(-15.0),
+        T::Replay => app.shared.seek_to(0.0),
+        T::Stop => app.stop(),
+        T::Repeat => queue(QueueAction::CycleRepeat),
+        T::Shuffle => queue(QueueAction::ToggleShuffle),
+        T::Bookmark => queue(QueueAction::AddBookmark),
+        T::Chapters => queue_tab(ui::queue::Tab::Chapters),
+        T::Bookmarks => queue_tab(ui::queue::Tab::Bookmarks),
+        T::MiniPlayer => MINI_REQUEST.set(Some(None)),
+        T::Zoom => {
+            PANEL_ACTIONS.with_borrow_mut(|p| p.push(PanelAction::SetZoom((app.zoom + 1) % 3)))
+        }
+        // The speed slider is on the settings popup's Playback tab.
+        T::Speed => UI.with_borrow_mut(|ui| {
+            let panel = ui::panels::Panel::Settings(ui::panels::SettingsTab::Playback);
+            ui.panels.show(Some(panel), Some(Hit::Settings));
+            ui.queue.open = false;
+            ui.relayout = true;
+        }),
+        T::Quit => unsafe { _ = DestroyWindow(hwnd) },
+        T::Preferences => open_preferences(app, Category::Playback),
+        T::Home => UI.with_borrow_mut(|ui| ui.show(Page::Library)),
+        T::Properties => WANT_PROPERTIES.set(true),
+        T::Favorite => {
+            if let Some(path) = app.session.as_ref().map(|s| s.path.clone()) {
+                let on = !app.library.is_favorite(&path);
+                app.library.set_favorite(&path, on);
+                app.library_changed = true;
+                UI.with_borrow_mut(|ui| ui.browse.stale = true);
+            }
+        }
+        T::Playlists => UI.with_borrow_mut(|ui| {
+            ui.browse.go(Place::Playlists);
+            ui.show(Page::Library);
+        }),
+        _ => {}
     }
 }
 
@@ -2632,6 +2719,11 @@ fn on_key(hwnd: HWND, shared: &Shared, key: VIRTUAL_KEY) {
     // An open dialog takes every key, then the Settings window.
     if UI.with_borrow(|ui| ui.dialog.is_some()) {
         let action = UI.with_borrow_mut(|ui| ui.dialog_key(key, shift, ctrl));
+        act(hwnd, shared, action);
+        return;
+    }
+    if UI.with_borrow(|ui| ui.customize.is_some()) {
+        let action = UI.with_borrow_mut(|ui| ui.customize_key(key));
         act(hwnd, shared, action);
         return;
     }

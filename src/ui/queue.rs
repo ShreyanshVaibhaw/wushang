@@ -208,7 +208,7 @@ impl Layout {
         }
         let (w, h) = (self.width, self.height);
         let top = TOP.max(TITLE_BAR + FRAME);
-        let bottom = (h - CONTROL_BAR - MARGIN).max(top + 200.0);
+        let bottom = (h - self.tools.bar - MARGIN).max(top + 200.0);
         let frame = Rect::new(w - MARGIN - W, top, w - MARGIN, bottom);
         self.queue = queue_geometry(PANEL, frame, state, state.tab, data);
     }
@@ -484,7 +484,7 @@ pub(super) struct Resources {
     sort: Svg,
     repeat: Svg,
     repeat_on: Svg,
-    repeat_one_on: Svg,
+    pub(super) repeat_one_on: Svg,
     shuffle: Svg,
     shuffle_on: Svg,
     minus: Svg,

@@ -933,7 +933,7 @@ impl Layout {
     pub fn add_panel(&mut self, state: &State, data: &PanelData) {
         let Some(panel) = state.open else { return };
         let (w, h) = (self.width, self.height);
-        let bottom = h - CONTROL_BAR - MARGIN;
+        let bottom = h - self.tools.bar - MARGIN;
         let top = match panel {
             Panel::Tracks(_) => bottom - TRACKS_H,
             Panel::Settings(_) => SETTINGS_TOP,
@@ -1025,7 +1025,7 @@ impl Layout {
         let anchor = rows.iter().find(|r| r.ctl == Some(ctl) && r.click)?.r;
         let items = ctl.options(d)?;
         let full = items.len() as f32 * LIST_ROW + 2.0 * LIST_PAD;
-        let (min, max) = (TITLE_BAR + 8.0, self.height - CONTROL_BAR - 8.0);
+        let (min, max) = (TITLE_BAR + 8.0, self.height - self.tools.bar - 8.0);
         let below = max - (anchor.b + 4.0);
         let above = anchor.t - 4.0 - min;
         let (t, h) = if full <= below || below >= above {
