@@ -1006,7 +1006,8 @@ fn run() -> Result<(), Box<dyn Error>> {
     let mut last_position = 0.0;
     // Whether Windows is asked to keep the screen on.
     let mut awake = false;
-    while pump_messages() && !shared.quit.load(Relaxed) {
+    // One pass of the render loop; false ends playback (--play-and-exit). See `run_frames`.
+    let mut frame = || -> Result<bool, Box<dyn Error>> {
         // Nothing to show in the mini player once playback ends.
         if app.session.is_none() && is_mini() {
             MINI_REQUEST.set(Some(Some(Page::Library)));
@@ -1418,7 +1419,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         } else {
             if !paused && app.session.as_ref().is_some_and(Session::finished) {
                 if play_and_exit {
-                    break;
+                    return Ok(false);
                 }
                 // Like VLC's playlist: carry on with the next file, or stop at the end (or where
                 // the sleep timer says).
@@ -1440,7 +1441,10 @@ fn run() -> Result<(), Box<dyn Error>> {
             }
             thread::sleep(Duration::from_millis(2));
         }
-    }
+        Ok(true)
+    };
+    // Saved below even when rendering failed for good.
+    let rendered = run_frames(&mut frame, &shared.quit);
 
     shared.quit.store(true, Relaxed);
     if !play_and_exit {
@@ -1457,7 +1461,74 @@ fn run() -> Result<(), Box<dyn Error>> {
     unsafe { SetThreadExecutionState(ES_CONTINUOUS) };
     drop(app);
     eprintln!("shown {shown} frames, dropped {dropped}");
-    Ok(())
+    rendered
+}
+
+/// A pass of the render loop.
+type Frame<'a> = dyn FnMut() -> Result<bool, Box<dyn Error>> + 'a;
+
+thread_local! {
+    /// The pass `run_frames` is running, for the window procedure.
+    static FRAME: std::cell::Cell<Option<*mut Frame<'static>>> = const { std::cell::Cell::new(None) };
+    /// A pass is under way, so another can't start inside it.
+    static IN_FRAME: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// The timer that runs passes while Windows' own move and size loop has the thread.
+const MODAL_TIMER: usize = 1;
+/// Passes in a row that may fail, about two seconds' worth, before myvlc gives up. One failed
+/// pass only costs a frame.
+const MAX_FAILED_PASSES: u32 = 120;
+
+/// Runs `frame` until the window closes, `quit` is set or the pass returns false.
+///
+/// Dragging the window or its edge makes Windows run a message loop of its own until the mouse
+/// lets go, so this loop stops and the video froze. While that loop runs, a timer has the window
+/// procedure run passes instead (`modal_frame`).
+fn run_frames(frame: &mut Frame<'_>, quit: &AtomicBool) -> Result<(), Box<dyn Error>> {
+    // The lifetime is erased for the thread-local; the pointer is gone before `frame` is, and
+    // every pass goes through it, one at a time.
+    let ptr: *mut Frame<'static> = unsafe { std::mem::transmute(frame as *mut Frame<'_>) };
+    FRAME.set(Some(ptr));
+    let mut failed = 0;
+    let result = loop {
+        if !pump_messages() || quit.load(Relaxed) {
+            break Ok(());
+        }
+        match call_frame(ptr) {
+            Ok(true) => failed = 0,
+            Ok(false) => break Ok(()),
+            Err(e) => {
+                failed += 1;
+                if failed == 1 {
+                    eprintln!("render: {e}");
+                }
+                if failed == MAX_FAILED_PASSES {
+                    break Err(e);
+                }
+            }
+        }
+    };
+    FRAME.set(None);
+    result
+}
+
+fn call_frame(ptr: *mut Frame<'static>) -> Result<bool, Box<dyn Error>> {
+    if IN_FRAME.replace(true) {
+        return Ok(true);
+    }
+    let result = unsafe { (*ptr)() };
+    IN_FRAME.set(false);
+    result
+}
+
+/// A pass from the window procedure's timer during a window drag.
+fn modal_frame() {
+    if let Some(ptr) = FRAME.get()
+        && let Err(e) = call_frame(ptr)
+    {
+        eprintln!("render: {e}");
+    }
 }
 
 fn save_tags(tracks: &HashMap<PathBuf, (tags::Stamp, Track)>) {
@@ -2436,6 +2507,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             };
         }
         WM_SIZE => RESIZED.store(true, Relaxed),
+        // The render loop can't run while Windows moves or sizes the window; a timer stands in.
+        WM_ENTERSIZEMOVE => unsafe { _ = SetTimer(Some(hwnd), MODAL_TIMER, 1, None) },
+        WM_EXITSIZEMOVE => unsafe { _ = KillTimer(Some(hwnd), MODAL_TIMER) },
+        WM_TIMER if wparam.0 == MODAL_TIMER => modal_frame(),
         // Windows switched between light and dark apps.
         WM_SETTINGCHANGE if prefs().theme == 2 => {
             ui::theme::set(theme_of(&prefs()));

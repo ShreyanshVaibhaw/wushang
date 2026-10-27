@@ -251,6 +251,8 @@ The decoder thread repacks software frames to NV12 with swscale, splitting each 
 On the test laptop a 4K60 10-bit H.264 clip went from 90 dropped frames of 300 to about 50; the rest is the CPU's limit for decoding and repacking at once.
 
 The render loop runs above normal priority, as VLC's video output thread does.
+While the window is dragged or resized, Windows runs a message loop of its own until the mouse lets go; a timer then runs the render loop's passes from the window procedure, so the video keeps playing.
+A pass that fails (a lost frame) is logged and skipped rather than closing the player.
 At normal priority, libdav1d's bursts across all cores made it wake up about 40 ms late and skip frames.
 
 ## Measured against VLC 3.0.23
@@ -331,8 +333,6 @@ Each of these is marked with a `ponytail:` comment in the code, along with the u
 - The audio callback takes a mutex.
 - Settings keep equalizer presets, not hand-tuned bands, so a custom equalizer starts off next time.
 - Network read errors end playback instead of retrying.
-- Video freezes while you drag the window edge, because Windows runs a modal resize loop.
-  Audio keeps playing.
 - A video stream that fails its first 60 packets counts as undecodable, and playback goes on with audio only.
 - Thumbnails stay in memory for the whole run, about 350 KB each.
 - Network, Podcasts and Radio do nothing.
