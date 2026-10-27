@@ -18,6 +18,7 @@ mod render;
 mod session;
 mod snapshot;
 mod subs;
+mod tags;
 mod thumbs;
 mod ui;
 
@@ -971,13 +972,31 @@ fn run() -> Result<(), Box<dyn Error>> {
     }
 
     let thumbnailer = thumbs::Thumbnailer::new(2, THUMB_SIZE.0, THUMB_SIZE.1);
-    // Tags for Songs, Albums, Artists and Genres come from probing every music file once.
+    // Tags for Songs, Albums, Artists and Genres come from probing every music file once; the
+    // index on disk covers the files that haven't changed since.
     let prober = thumbs::Prober::new();
+    let mut tracks: HashMap<PathBuf, (tags::Stamp, Track)> = HashMap::new();
     if !play_and_exit {
-        prober.request_all(app.library.music_files());
+        let mut saved_tags = tags::load(&Library::default_dir());
+        let mut changed = Vec::new();
+        // ponytail: one metadata read per music file on the UI thread at startup, like the
+        // folder walk before it; move both to a thread if a large library delays the window.
+        for path in app.library.music_files() {
+            match saved_tags.remove(&path) {
+                Some((stamp, track)) if tags::stamp(&path) == Some(stamp) => {
+                    tracks.insert(path, (stamp, track));
+                }
+                _ => changed.push(path),
+            }
+        }
+        if !tracks.is_empty() {
+            app.library
+                .set_tracks(tracks.values().map(|(_, t)| t.clone()).collect());
+        }
+        prober.request_all(changed);
     }
-    let mut tracks: HashMap<PathBuf, Track> = HashMap::new();
     let mut tracks_changed = false;
+    let mut tags_unsaved = false;
     let mut tracks_set = Instant::now();
     let mut saved = Instant::now();
 
@@ -1129,21 +1148,22 @@ fn run() -> Result<(), Box<dyn Error>> {
         }
         for (path, info) in prober.take_ready() {
             let info = info.unwrap_or_default();
-            tracks.insert(
-                path.clone(),
-                Track {
-                    path,
-                    title: info.title,
-                    artist: info.artist,
-                    album: info.album,
-                    genre: info.genre,
-                    duration: info.duration,
-                },
-            );
-            tracks_changed = true;
+            // A file that can't be read gets no stamp, so it is probed again next time.
+            let stamp = tags::stamp(&path).unwrap_or_default();
+            let track = Track {
+                path: path.clone(),
+                title: info.title,
+                artist: info.artist,
+                album: info.album,
+                genre: info.genre,
+                duration: info.duration,
+            };
+            tracks.insert(path, (stamp, track));
+            (tracks_changed, tags_unsaved) = (true, true);
         }
         if tracks_changed && tracks_set.elapsed() > Duration::from_secs(1) {
-            app.library.set_tracks(tracks.values().cloned().collect());
+            app.library
+                .set_tracks(tracks.values().map(|(_, t)| t.clone()).collect());
             (tracks_changed, tracks_set) = (false, Instant::now());
             UI.with_borrow_mut(|ui| {
                 if ui.browse.place.section() == Section::Music || ui.browse.place == Place::Home {
@@ -1156,6 +1176,9 @@ fn run() -> Result<(), Box<dyn Error>> {
         }
         if saved.elapsed() > SAVE_EVERY {
             app.save();
+            if std::mem::take(&mut tags_unsaved) {
+                save_tags(&tracks);
+            }
             saved = Instant::now();
         }
 
@@ -1421,6 +1444,9 @@ fn run() -> Result<(), Box<dyn Error>> {
     if !play_and_exit {
         app.stop();
         app.save();
+        if tags_unsaved {
+            save_tags(&tracks);
+        }
         PREFS.with_borrow_mut(|p| p.volume = shared.volume());
         if let Err(e) = prefs().save(&Library::default_dir()) {
             eprintln!("settings: cannot save ({e})");
@@ -1430,6 +1456,12 @@ fn run() -> Result<(), Box<dyn Error>> {
     drop(app);
     eprintln!("shown {shown} frames, dropped {dropped}");
     Ok(())
+}
+
+fn save_tags(tracks: &HashMap<PathBuf, (tags::Stamp, Track)>) {
+    if let Err(e) = tags::save(&Library::default_dir(), tracks) {
+        eprintln!("tags: cannot save ({e})");
+    }
 }
 
 /// A click that needs the library or opens files.

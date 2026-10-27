@@ -29,6 +29,7 @@ The header shows the item count, the sort menu (unwatched or watched first, newe
 Thumbnails come from a frame at 10% of each video, and audio files show their embedded cover.
 A bar under a thumbnail shows how much of it you watched, and finished files are dimmed.
 Music also has Songs, Albums, Artists and Genres, built from the files' tags.
+The tags are kept in `tags.txt` next to the library state, so these fill in at once on the next start; only new or changed files are read again.
 Home collects Continue Watching, Listen Again, and your most visited folders, playlists and artists.
 
 Clicking a file plays it, resuming where you left it.
@@ -329,7 +330,6 @@ Each of these is marked with a `ponytail:` comment in the code, along with the u
   Audio keeps playing.
 - An AV1 stream that the GPU's AV1 profile rejects (12-bit, 4:4:4) gets no video instead of falling back to libdav1d.
 - A video stream that fails its first 60 packets counts as undecodable, and playback goes on with audio only.
-- The music tag index isn't saved, so Albums, Artists and Genres fill in a moment after each start.
 - Thumbnails stay in memory for the whole run, about 350 KB each.
 - Network, Podcasts and Radio do nothing.
 - The folder picker is modal, so the video pauses on screen while it is open (audio keeps playing).
