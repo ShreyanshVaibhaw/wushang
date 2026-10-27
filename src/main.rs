@@ -10,6 +10,7 @@ mod captions;
 mod codepage;
 mod dsp;
 mod library;
+mod net;
 mod nv12;
 mod player;
 mod prefs;

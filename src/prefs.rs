@@ -52,6 +52,13 @@ pub const OUTLINE_WIDTH: [f32; 4] = [0.0, 1.0, 2.0, 3.5];
 /// The skip choices in seconds, for the four skip lengths.
 pub const SKIPS: [u32; 12] = [1, 3, 5, 10, 15, 20, 30, 60, 90, 120, 300, 600];
 pub const VOLUME_STEPS: [u32; 5] = [1, 2, 5, 10, 20];
+pub const NET_TIMEOUT: Choices = &[
+    ("5", "5 seconds"),
+    ("10", "10 seconds"),
+    ("15", "15 seconds"),
+    ("30", "30 seconds"),
+    ("60", "1 minute"),
+];
 /// Subtitle and outline colours to pick from; the caption's own grey and near-black first.
 pub const COLORS: [(u32, &str); 8] = [
     (0xB8B8B8, "Light grey"),
@@ -133,6 +140,11 @@ pub struct Prefs {
     pub show_hidden: bool,
     // Performance.
     pub hw_decoding: bool,
+    // Network.
+    /// Reconnect when a stream drops, and keep trying while it is down.
+    pub net_reconnect: bool,
+    /// Seconds a stream may stall before its connection counts as dead.
+    pub net_timeout: u32,
 }
 
 impl Default for Prefs {
@@ -181,6 +193,8 @@ impl Default for Prefs {
             sub_shadow: false,
             show_hidden: false,
             hw_decoding: true,
+            net_reconnect: true,
+            net_timeout: 15,
         }
     }
 }
@@ -251,6 +265,8 @@ impl Prefs {
         line("sub_shadow", self.sub_shadow.to_string());
         line("show_hidden", self.show_hidden.to_string());
         line("hw_decoding", self.hw_decoding.to_string());
+        line("net_reconnect", self.net_reconnect.to_string());
+        line("net_timeout", self.net_timeout.to_string());
         out
     }
 
@@ -385,6 +401,14 @@ fn parse(text: &str) -> Prefs {
             "sub_shadow" => flag(&mut p.sub_shadow),
             "show_hidden" => flag(&mut p.show_hidden),
             "hw_decoding" => flag(&mut p.hw_decoding),
+            "net_reconnect" => flag(&mut p.net_reconnect),
+            "net_timeout" => {
+                if let Ok(n) = v.parse::<u32>()
+                    && NET_TIMEOUT.iter().any(|c| c.0.parse::<u32>() == Ok(n))
+                {
+                    p.net_timeout = n;
+                }
+            }
             _ => {}
         }
     }
@@ -439,6 +463,8 @@ mod tests {
             sub_shadow: true,
             show_hidden: true,
             hw_decoding: false,
+            net_reconnect: false,
+            net_timeout: 30,
             ..Prefs::default()
         };
         let dir = std::env::temp_dir().join(format!("myvlc-prefs-{}", std::process::id()));
@@ -461,6 +487,17 @@ mod tests {
         assert_eq!(p.volume, d.volume);
         assert_eq!(p.on_top, d.on_top);
         assert_eq!(p.hide_after, 4.0);
+    }
+
+    #[test]
+    fn network_timeout_only_takes_listed_values() {
+        assert_eq!(
+            parse("net_timeout = 45\nnet_reconnect = false").net_timeout,
+            15
+        );
+        let p = parse("net_timeout = 60\nnet_reconnect = false");
+        assert_eq!((p.net_timeout, p.net_reconnect), (60, false));
+        assert!(Prefs::default().net_reconnect);
     }
 
     #[test]

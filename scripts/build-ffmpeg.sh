@@ -3,6 +3,9 @@
 # Only the demuxers, parsers and decoders a desktop player needs are built, plus D3D11VA, dav1d
 # for software AV1, and zlib for Matroska tracks stored compressed. Subtitles cover embedded text
 # and picture tracks and the common external files (.srt .ass .ssa .vtt .sub .idx .smi .sup).
+# Networking covers the stream protocols a player opens (http/https/HLS/RTSP/UDP/RTP); TLS comes
+# from Windows Schannel, so https needs no extra library. The DASH demuxer stays out: it needs
+# libxml2, and HLS/RTSP cover the common live formats.
 #
 # Needs: gcc-mingw-w64-x86-64-win32 nasm make pkg-config meson ninja-build, plus gcc and
 # libc6-dev for FFmpeg's build-time host tools.
@@ -43,7 +46,9 @@ join() { local IFS=,; echo "$*"; }
 demuxers=(mov matroska avi mpegts mpegps flv ogg asf ivf obu
           wav w64 aiff caf mp3 aac ac3 eac3 dts truehd flac
           h264 hevc m4v mpegvideo
-          srt ass webvtt microdvd subviewer sami vobsub sup)
+          srt ass webvtt microdvd subviewer sami vobsub sup
+          hls rtsp sdp)
+protocols=(file data http https tls tcp udp rtp crypto)
 parsers=(h264 hevc av1 vp8 vp9 mpeg4video mpegvideo vc1 mjpeg
          aac aac_latm ac3 mpegaudio opus vorbis flac dca mlp
          dvdsub dvbsub)
@@ -63,12 +68,13 @@ cd "$SRC"
   --target-os=mingw32 --arch=x86_64 --cross-prefix=x86_64-w64-mingw32- \
   --enable-shared --disable-static \
   --disable-programs --disable-doc --disable-debug \
-  --disable-avdevice --disable-avfilter --disable-network \
+  --disable-avdevice --disable-avfilter \
   --disable-autodetect --enable-w32threads --enable-d3d11va \
+  --enable-network --enable-schannel \
   --enable-libdav1d --pkg-config=pkg-config --pkg-config-flags=--static \
   --enable-zlib --extra-cflags="-I$DAV1D_PREFIX/include" \
   --disable-everything \
-  --enable-protocol=file \
+  --enable-protocol="$(join "${protocols[@]}")" \
   --enable-demuxer="$(join "${demuxers[@]}")" \
   --enable-parser="$(join "${parsers[@]}")" \
   --enable-decoder="$(join "${decoders[@]}")" \
