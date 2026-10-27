@@ -52,6 +52,8 @@ pub struct PanelData {
     pub sub_delay: f64,
     pub eq_presets: Vec<String>,
     pub eq_preset: Option<usize>,
+    /// Hand-tuned bands are playing, so no preset is.
+    pub eq_custom: bool,
     /// dB, -20..20.
     pub eq_bands: [f32; 10],
     pub eq_preamp: f32,
@@ -340,6 +342,7 @@ impl Ctl {
             Ctl::Stereo => Some(d.stereo),
             Ctl::AudioTrack => track(d.audio_selected),
             Ctl::SubTrack => track(d.sub_selected),
+            Ctl::EqPreset if d.eq_custom => None,
             Ctl::EqPreset => track(d.eq_preset),
             _ => None,
         }
@@ -425,6 +428,7 @@ impl Ctl {
                 .map_or("None".into(), |i| (i + 1).to_string()),
             Ctl::AudioLanguage => track_name(&d.audio_tracks, d.audio_selected),
             Ctl::SubLanguage => track_name(&d.sub_tracks, d.sub_selected),
+            Ctl::EqPreset if d.eq_custom => crate::prefs::EQ_CUSTOM.into(),
             Ctl::EqPreset => track_name(&d.eq_presets, d.eq_preset),
             Ctl::SubSize => format!("{:.0}%", d.sub_size * 100.0),
             _ => String::new(),

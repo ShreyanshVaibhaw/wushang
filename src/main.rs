@@ -398,6 +398,7 @@ impl App {
             sub_delay: self.sub_delay,
             eq_presets: EQ_PRESETS.iter().map(|p| p.name.to_owned()).collect(),
             eq_preset: eq.enabled.then_some(eq.preset).flatten(),
+            eq_custom: eq.enabled && eq.preset.is_none(),
             eq_bands: eq.bands,
             // The panel shows the preamp around 0; VLC's scale has unity at 12 dB.
             eq_preamp: eq.preamp - dsp::PREAMP_UNITY_DB,
@@ -751,14 +752,15 @@ impl App {
 
     /// Changes the panels, queue and menus make to things Settings also holds, so the
     /// equalizer, stereo mode, subtitle size, repeat and shuffle stick across launches.
-    // ponytail: custom equalizer bands aren't saved, only presets; the equalizer starts off
-    // next time. Save the ten bands if anyone tunes them by hand.
     fn sync_prefs(&mut self) {
         let effects = self.audio.effects();
         let eq = effects.eq();
-        let preset = (eq.enabled.then_some(eq.preset).flatten())
-            .and_then(|i| EQ_PRESETS.get(i))
-            .map_or_else(String::new, |e| e.name.to_owned());
+        let custom = eq.enabled && eq.preset.is_none();
+        let preset = match eq.preset.and_then(|i| EQ_PRESETS.get(i)) {
+            _ if !eq.enabled => String::new(),
+            Some(e) => e.name.to_owned(),
+            None => prefs::EQ_CUSTOM.to_owned(),
+        };
         let stereo = (StereoMode::ALL.iter())
             .position(|m| *m == effects.stereo())
             .unwrap_or(0);
@@ -768,6 +770,10 @@ impl App {
         let changed = PREFS.with_borrow_mut(|p| {
             let old = p.clone();
             p.eq_preset = preset;
+            if custom {
+                p.eq_bands[0] = eq.preamp;
+                p.eq_bands[1..].copy_from_slice(&eq.bands);
+            }
             p.two_pass = eq.two_pass;
             p.stereo = stereo;
             p.sub_size = (size * 20.0).round() / 20.0;
@@ -788,7 +794,11 @@ const REPEAT: [Repeat; 3] = [Repeat::Off, Repeat::All, Repeat::One];
 /// changed, so a hand-tuned equalizer survives turning two-pass on.
 fn apply_effects(audio: &audio::Device, old: Option<&Prefs>, new: &Prefs) {
     let effects = audio.effects();
-    if old.is_none_or(|o| o.eq_preset != new.eq_preset) {
+    let custom = new.eq_preset == prefs::EQ_CUSTOM;
+    if custom && old.is_none_or(|o| o.eq_preset != new.eq_preset || o.eq_bands != new.eq_bands) {
+        let [preamp, bands @ ..] = new.eq_bands;
+        effects.set_eq_bands(bands, preamp);
+    } else if !custom && old.is_none_or(|o| o.eq_preset != new.eq_preset) {
         effects.set_eq(EQ_PRESETS.iter().position(|e| e.name == new.eq_preset));
     }
     if old.is_none_or(|o| o.two_pass != new.two_pass) {

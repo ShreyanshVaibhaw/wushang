@@ -52,6 +52,10 @@ pub const OUTLINE_WIDTH: [f32; 4] = [0.0, 1.0, 2.0, 3.5];
 /// The skip choices in seconds, for the four skip lengths.
 pub const SKIPS: [u32; 12] = [1, 3, 5, 10, 15, 20, 30, 60, 90, 120, 300, 600];
 pub const VOLUME_STEPS: [u32; 5] = [1, 2, 5, 10, 20];
+/// `eq_preset` for hand-tuned bands.
+pub const EQ_CUSTOM: &str = "Custom";
+/// Unity preamp (12 dB on VLC's scale) and flat bands.
+pub const EQ_FLAT: [f32; 11] = [12.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
 pub const NET_TIMEOUT: Choices = &[
     ("5", "5 seconds"),
     ("10", "10 seconds"),
@@ -119,8 +123,11 @@ pub struct Prefs {
     pub volume: f32,
     /// Percent per Up/Down press.
     pub volume_step: u32,
-    /// A name of `dsp::EQ_PRESETS`; empty turns the equalizer off.
+    /// A name of `dsp::EQ_PRESETS`, or `EQ_CUSTOM` for `eq_bands`; empty turns the equalizer off.
     pub eq_preset: String,
+    /// The last hand-tuned equalizer: preamp on VLC's scale, then the ten bands, in dB. Kept
+    /// while a preset plays, so "Custom" brings it back.
+    pub eq_bands: [f32; 11],
     pub two_pass: bool,
     /// Index into `ui::panels::STEREO`.
     pub stereo: usize,
@@ -179,6 +186,7 @@ impl Default for Prefs {
             volume: 1.0,
             volume_step: 10,
             eq_preset: String::new(),
+            eq_bands: EQ_FLAT,
             two_pass: false,
             stereo: 0,
             subtitles: true,
@@ -251,6 +259,8 @@ impl Prefs {
         line("volume", self.volume.to_string());
         line("volume_step", self.volume_step.to_string());
         line("eq_preset", self.eq_preset.clone());
+        let bands: Vec<String> = self.eq_bands.iter().map(|b| b.to_string()).collect();
+        line("eq_bands", bands.join(" "));
         line("two_pass", self.two_pass.to_string());
         line("stereo", self.stereo.to_string());
         line("subtitles", self.subtitles.to_string());
@@ -383,6 +393,17 @@ fn parse(text: &str) -> Prefs {
                 }
             }
             "eq_preset" => p.eq_preset = v.into(),
+            "eq_bands" => {
+                let n: Vec<f32> = v
+                    .split_whitespace()
+                    .filter_map(|s| s.parse().ok())
+                    .collect();
+                if let Ok(bands) = <[f32; 11]>::try_from(n)
+                    && bands.iter().all(|b| (-20.0..=20.0).contains(b))
+                {
+                    p.eq_bands = bands;
+                }
+            }
             "two_pass" => flag(&mut p.two_pass),
             "stereo" => {
                 if let Ok(n) = v.parse::<usize>() {
@@ -449,6 +470,7 @@ mod tests {
             volume: 0.4,
             volume_step: 5,
             eq_preset: "Rock".into(),
+            eq_bands: [6.5, -3.0, 0.0, 1.5, 0.0, 0.0, 2.25, 0.0, 0.0, -20.0, 20.0],
             two_pass: true,
             stereo: 3,
             subtitles: false,

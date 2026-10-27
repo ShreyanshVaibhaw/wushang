@@ -152,6 +152,7 @@ Changes apply at once and are kept in `settings.txt` next to the library state.
 - Playback: resuming where you left off, starting paused, the default speed, the preferred audio language, repeat, shuffle, and quitting at the end of the queue.
 - Video: start in fullscreen, keep the screen awake while a video plays, and the default aspect ratio.
 - Audio: output device, startup volume (or the last one), the Up/Down volume step, the equalizer preset, two-pass and stereo mode.
+  "Custom" is the last equalizer tuned by hand in the panel, kept while a preset plays.
 - Subtitles: on or off, the preferred language, loading subtitle files on their own, and their size, weight, colour, opacity, outline and shadow.
 - Library: show hidden files and folders.
 - Performance: turn off GPU decoding.
@@ -339,7 +340,6 @@ Each of these is marked with a `ponytail:` comment in the code, along with the u
 - Software frames reach the GPU as 8-bit NV12, so 10-bit video loses its extra precision there, and 4K60 10-bit H.264 drops frames on a laptop CPU.
 - Audio devices must mix in f32, which every WASAPI shared-mode device seen so far does.
 - The audio callback takes a mutex.
-- Settings keep equalizer presets, not hand-tuned bands, so a custom equalizer starts off next time.
 - Network read errors end playback instead of retrying.
 - A video stream that fails its first 60 packets counts as undecodable, and playback goes on with audio only.
 - Thumbnails stay in memory for the whole run, about 350 KB each.

@@ -333,8 +333,10 @@ impl Ctl {
                 .iter()
                 .map(|s| format!("{s}%"))
                 .collect(),
-            Ctl::EqPreset => std::iter::once("Off".to_owned())
-                .chain(EQ_PRESETS.iter().map(|p| p.name.to_owned()))
+            Ctl::EqPreset => std::iter::once("Off")
+                .chain(EQ_PRESETS.iter().map(|p| p.name))
+                .chain([prefs::EQ_CUSTOM])
+                .map(str::to_owned)
                 .collect(),
             Ctl::Stereo => STEREO.iter().map(|s| (*s).to_owned()).collect(),
             Ctl::SubColor | Ctl::OutlineColor => {
@@ -379,6 +381,7 @@ impl Ctl {
             Ctl::StartupVolume => Some(p.startup_volume),
             Ctl::VolumeStep => prefs::VOLUME_STEPS.iter().position(|v| *v == p.volume_step),
             Ctl::EqPreset if p.eq_preset.is_empty() => Some(0),
+            Ctl::EqPreset if p.eq_preset == prefs::EQ_CUSTOM => Some(EQ_PRESETS.len() + 1),
             Ctl::EqPreset => EQ_PRESETS
                 .iter()
                 .position(|e| e.name == p.eq_preset)
@@ -432,10 +435,12 @@ impl Ctl {
                 }
             }
             Ctl::EqPreset => {
-                p.eq_preset = i
-                    .checked_sub(1)
-                    .and_then(|i| EQ_PRESETS.get(i))
-                    .map_or_else(String::new, |e| e.name.to_owned());
+                p.eq_preset = match i.checked_sub(1) {
+                    Some(i) if i == EQ_PRESETS.len() => prefs::EQ_CUSTOM.to_owned(),
+                    i => i
+                        .and_then(|i| EQ_PRESETS.get(i))
+                        .map_or_else(String::new, |e| e.name.to_owned()),
+                };
             }
             Ctl::Stereo => p.stereo = i.min(STEREO.len() - 1),
             Ctl::SubColor => {
