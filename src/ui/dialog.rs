@@ -124,7 +124,7 @@ const FG_BUTTON_OFF: u32 = 0x606060;
 /// The keys main.rs handles, for the Keyboard Shortcuts dialog.
 // ponytail: a copy of on_key and the menus' accelerators; one table both read would keep them
 // in step.
-const SHORTCUTS: [(&str, &str); 20] = [
+const SHORTCUTS: [(&str, &str); 21] = [
     ("Space", "Play or pause"),
     ("Left / Right", "Skip back or forward (Settings > Controls)"),
     (
@@ -141,6 +141,7 @@ const SHORTCUTS: [(&str, &str); 20] = [
     ),
     ("Backspace", "Back, in the library"),
     ("S / P / N", "Stop, previous file, next file"),
+    ("Shift + S", "Snapshot, saved in Pictures\\myvlc"),
     ("Ctrl + O", "Open files"),
     ("Ctrl + F", "Open a folder"),
     ("Ctrl + P", "Settings"),

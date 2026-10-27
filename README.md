@@ -103,6 +103,12 @@ Switching tracks and seeking land on the exact moment: the decoders read from th
 
 The window opens the way it was launched, so a shortcut set to "Run: Minimized", or a script that asks for minimized without activation, never takes focus.
 
+### Snapshots
+
+Shift+S, "Take Snapshot" in the player menu's Video submenu, or the snapshot button from Customize Player saves the frame on screen as a PNG in `Pictures\myvlc`.
+It is the full-resolution frame with flips, rotation, crop, aspect ratio and colour adjustments as shown, but not zoom or the interface.
+The file is named after the video and the moment in it, such as `Holiday 1m05s.png`, and a line over the video says where it went.
+
 ### Customize Player
 
 "Customize Player" in the "…" menu or the player's right-click menu opens the design's palette over the player, and every item and group in the bars gets a dashed box.
@@ -110,8 +116,8 @@ Drag an item from the palette into the title bar group or the control bar's left
 Dropping on the seek bar starts the centre group, and the control bar then takes two rows with the seek bar across the top, as in the design's customize frames.
 Save keeps the bars in `toolbar.txt` next to the library state; Cancel or Esc drops the changes.
 
-Besides the bars' own controls, the palette has spacers and dividers, playback speed, skip 10 or 15 seconds either way, stop, repeat, shuffle, the mini player, zoom, quit, Settings, the library, the file name, properties, replay, chapters, favourite, add a bookmark, bookmarks and playlists.
-Record, snapshot, HDR, the right sidebar, a thumbnail and the artist and playlist names are dimmed, as myvlc can't do them yet.
+Besides the bars' own controls, the palette has spacers and dividers, snapshot, playback speed, skip 10 or 15 seconds either way, stop, repeat, shuffle, the mini player, zoom, quit, Settings, the library, the file name, properties, replay, chapters, favourite, add a bookmark, bookmarks and playlists.
+Record, HDR, the right sidebar, a thumbnail and the artist and playlist names are dimmed, as myvlc can't do them yet.
 
 ### Mini player
 

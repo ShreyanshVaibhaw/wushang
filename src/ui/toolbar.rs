@@ -211,13 +211,12 @@ impl Item {
     }
 
     /// Whether myvlc can do it; the palette dims the others and won't let them go.
-    // ponytail: recording and snapshots need FFmpeg's encoders, HDR needs tone mapping; a
+    // ponytail: recording needs FFmpeg's encoders, HDR needs tone mapping; a
     // thumbnail, artist and playlist name need the bars to know more about the file.
     pub fn supported(self) -> bool {
         !matches!(
             self,
             Item::Record
-                | Item::Snapshot
                 | Item::Hdr
                 | Item::RightSidebar
                 | Item::Thumbnail

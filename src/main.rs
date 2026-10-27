@@ -16,6 +16,7 @@ mod profiles;
 mod queue;
 mod render;
 mod session;
+mod snapshot;
 mod subs;
 mod thumbs;
 mod ui;
@@ -26,7 +27,7 @@ use std::error::Error;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering::Relaxed;
 use std::sync::atomic::{AtomicBool, AtomicU64};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -117,6 +118,8 @@ thread_local! {
     static DIALOG_ACTIONS: RefCell<Vec<DialogAction>> = const { RefCell::new(Vec::new()) };
     /// Ctrl+I asked for the Properties dialog; the render loop knows which file.
     static WANT_PROPERTIES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// The render loop saves the frame on screen, which only it holds.
+    static WANT_SNAPSHOT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// The settings in force. The window procedure reads the keys', wheel's and clicks'; the
     /// render loop applies the rest.
     static PREFS: RefCell<Prefs> = RefCell::new(Prefs::default());
@@ -194,6 +197,10 @@ struct App {
     /// slider doesn't write the file at every step.
     prefs_changed: Option<Instant>,
     profiles: profiles::Profiles,
+    /// The line over the video and when it appeared.
+    notice: Option<(String, Instant)>,
+    /// Lines for the notice from other threads, such as the snapshot writer.
+    notices: (mpsc::Sender<String>, mpsc::Receiver<String>),
 }
 
 impl App {
@@ -900,6 +907,8 @@ fn run() -> Result<(), Box<dyn Error>> {
         enter_fullscreen: false,
         prefs_changed: None,
         profiles: profiles::Profiles::load(&Library::default_dir()),
+        notice: None,
+        notices: mpsc::channel(),
     };
     app.queue.set_repeat(REPEAT[settings.repeat.min(2)]);
     app.queue.set_shuffle(settings.shuffle);
@@ -1056,6 +1065,21 @@ fn run() -> Result<(), Box<dyn Error>> {
         }
         if WANT_PROPERTIES.take() {
             show_properties(&app);
+        }
+        if WANT_SNAPSHOT.take() {
+            take_snapshot(&app, &mut renderer);
+        }
+        if let Some(text) = app.notices.1.try_iter().last() {
+            app.notice = Some((text, Instant::now()));
+            UI.with_borrow_mut(|ui| ui.dirty = true);
+        }
+        if app
+            .notice
+            .as_ref()
+            .is_some_and(|(_, at)| at.elapsed() > NOTICE_FOR)
+        {
+            app.notice = None;
+            UI.with_borrow_mut(|ui| ui.dirty = true);
         }
         for action in QUEUE_ACTIONS.with_borrow_mut(std::mem::take) {
             app.apply_queue(hwnd, action);
@@ -1343,6 +1367,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                     cues: &cues,
                     caption_style: &app.caption,
                     stats: stats.as_deref(),
+                    notice: app.notice.as_ref().map(|(text, _)| text.as_str()),
                 };
                 renderer.present(
                     app.current.as_ref().map(|c| &c.frame),
@@ -1624,6 +1649,7 @@ fn menu_action(app: &mut App, hwnd: HWND, action: MenuAction) {
             }
         }
         MenuAction::NewProfile => open_dialog(app, Dialog::NewProfile),
+        MenuAction::Snapshot => WANT_SNAPSHOT.set(true),
         MenuAction::Panel(a) => app.apply(hwnd, a),
         // Files join the queue, or play when nothing is open.
         MenuAction::AddToQueue(paths) => {
@@ -2715,6 +2741,7 @@ fn use_tool(app: &mut App, hwnd: HWND, item: ui::ToolItem) {
         T::Preferences => open_preferences(app, Category::Playback),
         T::Home => UI.with_borrow_mut(|ui| ui.show(Page::Library)),
         T::Properties => WANT_PROPERTIES.set(true),
+        T::Snapshot => WANT_SNAPSHOT.set(true),
         T::Favorite => {
             if let Some(path) = app.session.as_ref().map(|s| s.path.clone()) {
                 let on = !app.library.is_favorite(&path);
@@ -2728,6 +2755,21 @@ fn use_tool(app: &mut App, hwnd: HWND, item: ui::ToolItem) {
             ui.show(Page::Library);
         }),
         _ => {}
+    }
+}
+
+/// How long a notice stays over the video.
+const NOTICE_FOR: Duration = Duration::from_secs(3);
+
+/// Saves the frame on screen as a PNG; the notice says where once it's written.
+fn take_snapshot(app: &App, renderer: &mut render::Renderer) {
+    let (Some(current), Some(session)) = (&app.current, &app.session) else {
+        return;
+    };
+    let seconds = session.position().unwrap_or(current.pts);
+    match renderer.snapshot(&current.frame, &app.adjust) {
+        Ok(picture) => snapshot::save(picture, &session.path, seconds, app.notices.0.clone()),
+        Err(e) => _ = app.notices.0.send(format!("Can't take a snapshot ({e})")),
     }
 }
 
@@ -2812,6 +2854,7 @@ fn on_key(hwnd: HWND, shared: &Shared, key: VIRTUAL_KEY) {
         VK_OEM_5 if ctrl && page == Page::Player => Some(MenuAction::HideUi),
         VK_M if ctrl => Some(MenuAction::MiniPlayer),
         VK_F1 if shift => Some(MenuAction::ShowAbout),
+        VK_S if shift && page == Page::Player => Some(MenuAction::Snapshot),
         VK_S if page == Page::Player => Some(MenuAction::Stop),
         _ => None,
     };

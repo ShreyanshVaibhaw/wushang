@@ -337,7 +337,7 @@ impl Renderer {
         let backbuffer: ID3D11Texture2D = unsafe { self.swapchain.GetBuffer(0)? };
         let area = to_pixels(scene.layout.video.scaled(dpi / 96.0));
         let picture = match frame {
-            Some(frame) => self.blit(frame, &backbuffer, area, adjust)?,
+            Some(frame) => self.blit(frame, &backbuffer, self.size, area, adjust)?,
             None => None,
         };
         let px = 96.0 / dpi;
@@ -376,12 +376,77 @@ impl Renderer {
         Ok(())
     }
 
-    /// Converts one frame into `area` of the back buffer, adjusted and letterboxed. Returns where
-    /// the picture landed.
+    /// The frame as shown, adjusted but not zoomed, at its own resolution: width, height and
+    /// BGRA rows. A sample aspect ratio other than 1 widens or narrows it, as on screen.
+    pub fn snapshot(
+        &mut self,
+        frame: &ff::frame::Video,
+        adjust: &VideoAdjust,
+    ) -> Result<(u32, u32, Vec<u8>)> {
+        let adjust = VideoAdjust {
+            zoom: Zoom::Original,
+            ..*adjust
+        };
+        let (_, (pw, ph)) = shown(frame.width(), frame.height(), sample_aspect(frame), &adjust);
+        let (w, h) = ((pw.round() as u32).max(1), (ph.round() as u32).max(1));
+        let mut desc = D3D11_TEXTURE2D_DESC {
+            Width: w,
+            Height: h,
+            MipLevels: 1,
+            ArraySize: 1,
+            Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Usage: D3D11_USAGE_DEFAULT,
+            BindFlags: D3D11_BIND_RENDER_TARGET.0 as u32,
+            ..Default::default()
+        };
+        let (mut target, mut staging) = (None, None);
+        unsafe {
+            self.device
+                .CreateTexture2D(&desc, None, Some(&mut target))?;
+            desc.Usage = D3D11_USAGE_STAGING;
+            desc.BindFlags = 0;
+            desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ.0 as u32;
+            self.device
+                .CreateTexture2D(&desc, None, Some(&mut staging))?;
+        }
+        let (target, staging) = (target.ok_or("no target")?, staging.ok_or("no staging")?);
+        let area = RECT {
+            left: 0,
+            top: 0,
+            right: w as i32,
+            bottom: h as i32,
+        };
+        self.blit(frame, &target, (w, h), area, &adjust)?;
+        let ctx = &self.context;
+        locked(&self.lock, || -> Result<Vec<u8>> {
+            unsafe {
+                ctx.CopyResource(&staging, &target);
+                let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+                ctx.Map(&staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))?;
+                let row = w as usize * 4;
+                let mut pixels = Vec::with_capacity(row * h as usize);
+                for y in 0..h as usize {
+                    let src = (mapped.pData as *const u8).add(y * mapped.RowPitch as usize);
+                    pixels.extend_from_slice(std::slice::from_raw_parts(src, row));
+                }
+                ctx.Unmap(&staging, 0);
+                Ok(pixels)
+            }
+        })
+        .map(|pixels| (w, h, pixels))
+    }
+
+    /// Converts one frame into `area` of `target`, a `size` texture, adjusted and letterboxed.
+    /// Returns where the picture landed.
     fn blit(
         &mut self,
         frame: &ff::frame::Video,
-        backbuffer: &ID3D11Texture2D,
+        target: &ID3D11Texture2D,
+        size: (u32, u32),
         area: RECT,
         adjust: &VideoAdjust,
     ) -> Result<Option<RECT>> {
@@ -403,7 +468,7 @@ impl Renderer {
         let mut desc = D3D11_TEXTURE2D_DESC::default();
         unsafe { texture.GetDesc(&mut desc) };
         let (w, h) = (frame.width(), frame.height());
-        self.ensure_processor(w, h, desc.Format)?;
+        self.ensure_processor(w, h, desc.Format, size)?;
         let p = self.processor.as_ref().unwrap();
 
         // Drop what this GPU can't do, so the geometry matches what it draws.
@@ -436,13 +501,7 @@ impl Renderer {
             eprintln!("video: this GPU can't do {}", missing.join(", "));
             self.warned = true;
         }
-        let sar = frame.aspect_ratio();
-        let sar = if sar.numerator() > 0 && sar.denominator() > 0 {
-            f64::from(sar)
-        } else {
-            1.0
-        };
-        let Some((source, dest)) = geometry(w, h, sar, &adjust, area) else {
+        let Some((source, dest)) = geometry(w, h, sample_aspect(frame), &adjust, area) else {
             return Ok(None); // nothing of the picture is visible
         };
 
@@ -469,7 +528,7 @@ impl Renderer {
                 Some(&mut input),
             )?;
             self.video_device.CreateVideoProcessorOutputView(
-                backbuffer,
+                target,
                 &p.enumerator,
                 &output_desc,
                 Some(&mut output),
@@ -534,8 +593,14 @@ impl Renderer {
         Ok(Some(dest))
     }
 
-    fn ensure_processor(&mut self, w: u32, h: u32, format: DXGI_FORMAT) -> Result<()> {
-        let key = (w, h, format, self.size);
+    fn ensure_processor(
+        &mut self,
+        w: u32,
+        h: u32,
+        format: DXGI_FORMAT,
+        out: (u32, u32),
+    ) -> Result<()> {
+        let key = (w, h, format, out);
         if self.processor.as_ref().is_some_and(|p| p.key == key) {
             return Ok(());
         }
@@ -543,8 +608,8 @@ impl Renderer {
             InputFrameFormat: D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE,
             InputWidth: w,
             InputHeight: h,
-            OutputWidth: self.size.0,
-            OutputHeight: self.size.1,
+            OutputWidth: out.0,
+            OutputHeight: out.1,
             Usage: D3D11_VIDEO_USAGE_PLAYBACK_NORMAL,
             ..Default::default()
         };
@@ -751,30 +816,7 @@ fn filter_level(level: f32, range: &D3D11_VIDEO_PROCESSOR_FILTER_RANGE) -> i32 {
 /// and rather than hand the driver a destination that overflows its target (drivers differ on
 /// clipping that), the destination is cut to `area` and the source shrunk to match.
 fn geometry(w: u32, h: u32, sar: f64, adjust: &VideoAdjust, area: RECT) -> Option<(RECT, RECT)> {
-    let (fw, fh) = (f64::from(w), f64::from(h));
-    // Displayed width of one source pixel, relative to its height.
-    let par = match adjust.aspect {
-        Some((n, d)) if n > 0 && d > 0 => f64::from(n) / f64::from(d) * fh / fw,
-        _ => sar,
-    };
-    // The centred crop, in source pixels.
-    let (mut sw, mut sh) = (fw, fh);
-    if let Some((n, d)) = adjust.crop.filter(|&(n, d)| n > 0 && d > 0) {
-        let ratio = f64::from(n) / f64::from(d);
-        if ratio > fw * par / fh {
-            sh = fw * par / ratio;
-        } else {
-            sw = fh * ratio / par;
-        }
-    }
-    let (sx, sy) = ((fw - sw) / 2.0, (fh - sh) / 2.0);
-    let quarter = matches!(adjust.rotate, 90 | 270);
-    let (pw, ph) = if quarter {
-        (sh, sw * par)
-    } else {
-        (sw * par, sh)
-    };
-
+    let ((sx, sy, sw, sh), (pw, ph)) = shown(w, h, sar, adjust);
     let dest = place(pw, ph, adjust.zoom, area);
     let visible = RECT {
         left: dest.left.max(area.left),
@@ -814,6 +856,45 @@ fn geometry(w: u32, h: u32, sar: f64, adjust: &VideoAdjust, area: RECT) -> Optio
         bottom,
     };
     Some((source, visible))
+}
+
+/// The centred crop of a `w` x `h` frame as (x, y, width, height) in source pixels, and the
+/// size it shows at, in source pixel heights, after aspect ratio and rotation.
+fn shown(w: u32, h: u32, sar: f64, adjust: &VideoAdjust) -> ((f64, f64, f64, f64), (f64, f64)) {
+    let (fw, fh) = (f64::from(w), f64::from(h));
+    // Displayed width of one source pixel, relative to its height.
+    let par = match adjust.aspect {
+        Some((n, d)) if n > 0 && d > 0 => f64::from(n) / f64::from(d) * fh / fw,
+        _ => sar,
+    };
+    // The centred crop, in source pixels.
+    let (mut sw, mut sh) = (fw, fh);
+    if let Some((n, d)) = adjust.crop.filter(|&(n, d)| n > 0 && d > 0) {
+        let ratio = f64::from(n) / f64::from(d);
+        if ratio > fw * par / fh {
+            sh = fw * par / ratio;
+        } else {
+            sw = fh * ratio / par;
+        }
+    }
+    let (sx, sy) = ((fw - sw) / 2.0, (fh - sh) / 2.0);
+    let quarter = matches!(adjust.rotate, 90 | 270);
+    let shown = if quarter {
+        (sh, sw * par)
+    } else {
+        (sw * par, sh)
+    };
+    ((sx, sy, sw, sh), shown)
+}
+
+/// The frame's sample aspect ratio, 1 when the stream doesn't say.
+fn sample_aspect(frame: &ff::frame::Video) -> f64 {
+    let sar = frame.aspect_ratio();
+    if sar.numerator() > 0 && sar.denominator() > 0 {
+        f64::from(sar)
+    } else {
+        1.0
+    }
 }
 
 /// Maps a point on screen, as fractions of the shown picture, back to fractions of the source:

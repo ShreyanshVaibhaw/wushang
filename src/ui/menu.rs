@@ -69,6 +69,8 @@ pub enum MenuAction {
     MiniPlayer,
     /// Opens Customize Player.
     CustomizePlayer,
+    /// Saves the frame on screen as a picture.
+    Snapshot,
     /// Switches to the named settings profile.
     Profile(String),
     /// Asks for a name and adds a profile.
@@ -815,6 +817,7 @@ pub fn player_menu(d: &PanelData, paused: bool) -> Vec<Item> {
             "Video Track",
             tracks(TrackTab::Video, &d.video_tracks, d.video_selected),
         ),
+        Item::new("Take Snapshot", MenuAction::Snapshot).key("Shift + S"),
         Item::divider(),
         flip(1, "Flip Horizontally"),
         flip(2, "Flip Vertically"),

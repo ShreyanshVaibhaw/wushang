@@ -976,6 +976,8 @@ pub struct Scene<'a> {
     pub caption_style: &'a crate::captions::CaptionStyle,
     /// Playback statistics, drawn over the video's top-left corner when turned on.
     pub stats: Option<&'a str>,
+    /// A line shown over the video for a moment, such as where a snapshot went.
+    pub notice: Option<&'a str>,
 }
 
 fn fill_width(volume: f32) -> f32 {
@@ -1467,6 +1469,26 @@ impl Painter {
                     &utf16,
                     &self.stats_text,
                     &r.inset(10.0).d2d(),
+                    &self.stats_fg,
+                    D2D1_DRAW_TEXT_OPTIONS_CLIP,
+                    DWRITE_MEASURING_MODE_NATURAL,
+                );
+            }
+            if let Some(notice) = s.notice {
+                // One line at the top right, in the statistics' box.
+                let w = (self.measure(notice, &self.stats_text) + 20.0).min(l.video.w() - 24.0);
+                let r = Rect::new(
+                    l.video.r - 12.0 - w,
+                    l.video.t + 12.0,
+                    l.video.r - 12.0,
+                    l.video.t + 46.0,
+                );
+                rt.FillRoundedRectangle(&rounded(r, 6.0), &self.stats_bg);
+                let utf16: Vec<u16> = notice.encode_utf16().collect();
+                rt.DrawText(
+                    &utf16,
+                    &self.stats_text,
+                    &Rect::new(r.l + 10.0, r.t + 8.0, r.r - 10.0, r.b).d2d(),
                     &self.stats_fg,
                     D2D1_DRAW_TEXT_OPTIONS_CLIP,
                     DWRITE_MEASURING_MODE_NATURAL,
