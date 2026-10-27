@@ -667,6 +667,7 @@ impl App {
                 }
             }
             QueueAction::Move(from, to) => self.queue.move_item(from, to),
+            QueueAction::PlayNext(i) => self.queue.play_next(i),
             QueueAction::Remove(i) => _ = self.queue.remove(i),
             QueueAction::AddFiles => {
                 let files = pick_media_files(hwnd);
@@ -1549,6 +1550,14 @@ fn open_menu(app: &mut App, hit: Hit, at: (f32, f32)) {
             let paused = app.shared.paused.load(Relaxed);
             (Kind::Player, menu::player_menu(&app.panel_data(), paused))
         }
+        Hit::Queue(ui::queue::Target::More(i)) => {
+            let Some(path) = app.queue.items().get(i).cloned() else {
+                return;
+            };
+            let playlists = app.library.playlists();
+            let items = menu::queue_menu(i, &path, app.queue.current(), &playlists);
+            (Kind::File, items)
+        }
         Hit::Entry(i) => {
             let Some(entry) = UI.with_borrow(|ui| ui.browse.entries.get(i).cloned()) else {
                 return;
@@ -1651,6 +1660,10 @@ fn menu_action(app: &mut App, hwnd: HWND, action: MenuAction) {
         MenuAction::NewProfile => open_dialog(app, Dialog::NewProfile),
         MenuAction::Snapshot => WANT_SNAPSHOT.set(true),
         MenuAction::Panel(a) => app.apply(hwnd, a),
+        MenuAction::Queue(a) => {
+            app.apply_queue(hwnd, a);
+            UI.with_borrow_mut(|ui| ui.dirty = true);
+        }
         // Files join the queue, or play when nothing is open.
         MenuAction::AddToQueue(paths) => {
             if app.session.is_some() {

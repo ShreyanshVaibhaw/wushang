@@ -66,6 +66,7 @@ The playlist button opens the queue panel from the design, in the settings panel
   The playing file is orange with its progress underneath, and files watched to the end are dimmed.
   Click a file to play it, drag it to reorder, and use sort (by name), repeat (off, all, one), shuffle, minus (removes the file last clicked) and + (adds files).
   Repeat One replays the file when it ends, while next and previous still move on; shuffle plays every file once before Repeat All wraps.
+  A file's "…" or a right-click on it opens the design's file menu, where Play plays that row, Play Next queues it after the playing file (shuffled or not), and Remove from Queue takes it out.
 - Bookmarks: positions in the playing file; + adds one where it is, a click seeks there.
   They live in `bookmarks.txt` next to the library state.
 - Chapters: the file's chapters with their titles; a click seeks there.
@@ -332,7 +333,6 @@ Each of these is marked with a `ponytail:` comment in the code, along with the u
 - Thumbnails stay in memory for the whole run, about 350 KB each.
 - Network, Podcasts and Radio do nothing.
 - The folder picker is modal, so the video pauses on screen while it is open (audio keeps playing).
-- A queue row's "…" removes it rather than opening a menu.
 
 ## Licence of the build
 

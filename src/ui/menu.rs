@@ -77,6 +77,8 @@ pub enum MenuAction {
     NewProfile,
     /// A change the tracks and settings panels also make.
     Panel(PanelAction),
+    /// A change the queue panel also makes.
+    Queue(crate::ui::queue::QueueAction),
     ShowQueue,
     ToggleRepeat,
     ToggleShuffle,
@@ -1001,6 +1003,31 @@ fn file_menu(path: &Path, playlists: &[String], within: Option<&str>) -> Vec<Ite
     items
 }
 
+/// The menu of queue row `i`, the design's file menu for `path`: Play plays that row, "Play Next"
+/// queues it after the one playing (`current`), and "Remove from Queue" takes Add to Queue's place.
+pub fn queue_menu(
+    i: usize,
+    path: &Path,
+    current: Option<usize>,
+    playlists: &[String],
+) -> Vec<Item> {
+    use crate::ui::queue::QueueAction;
+    let mut items = file_menu(path, playlists, None);
+    items[0].action = Some(MenuAction::Queue(QueueAction::Play(i)));
+    if let Some(add) = items.iter_mut().find(|item| item.label == "Add to Queue") {
+        *add = Item::new(
+            "Remove from Queue",
+            MenuAction::Queue(QueueAction::Remove(i)),
+        )
+        .icon(Icon::Delete);
+    }
+    if current.is_some_and(|c| c != i) {
+        let play_next = MenuAction::Queue(QueueAction::PlayNext(i));
+        items.insert(1, Item::new("Play Next", play_next).icon(Icon::Next));
+    }
+    items
+}
+
 fn folder_menu(place: &Place) -> Vec<Item> {
     let dir = match place {
         Place::Folder(_, dir) => Some(dir.clone()),
@@ -1382,6 +1409,24 @@ mod tests {
             profile.sub.last().unwrap().action,
             Some(MenuAction::NewProfile)
         );
+
+        // A queue row's menu plays and removes that row, and offers to play it next.
+        use crate::ui::queue::QueueAction;
+        let q = queue_menu(4, Path::new("a.mkv"), Some(1), &[]);
+        assert_eq!(q[0].action, Some(MenuAction::Queue(QueueAction::Play(4))));
+        assert_eq!(
+            q[1].action,
+            Some(MenuAction::Queue(QueueAction::PlayNext(4)))
+        );
+        assert!(
+            q.iter()
+                .any(|i| i.action == Some(MenuAction::Queue(QueueAction::Remove(4))))
+        );
+        assert!(!q.iter().any(|i| i.label == "Add to Queue"));
+        // The one playing, or nothing playing: no "Play Next".
+        let has_next = |q: Vec<Item>| q.iter().any(|i| i.label == "Play Next");
+        assert!(!has_next(queue_menu(1, Path::new("a.mkv"), Some(1), &[])));
+        assert!(!has_next(queue_menu(1, Path::new("a.mkv"), None, &[])));
 
         let sort = sort_menu(SortMode::NewestFirst, false);
         assert!(sort[2].checked);

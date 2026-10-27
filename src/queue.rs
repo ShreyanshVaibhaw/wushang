@@ -251,6 +251,23 @@ impl Queue {
         });
     }
 
+    /// Moves item `i` to play right after the current one: next in the list, and while shuffled
+    /// next in play order too.
+    pub fn play_next(&mut self, i: usize) {
+        let Some(c) = self.current.filter(|&c| c != i && i < self.items.len()) else {
+            return;
+        };
+        let to = if i < c { c } else { c + 1 };
+        self.move_item(i, to);
+        if self.shuffle
+            && let Some(from) = self.order.iter().position(|&o| o == to)
+        {
+            self.order.remove(from);
+            let at = self.current.and_then(|c| self.pos(c)).map_or(0, |p| p + 1);
+            self.order.insert(at, to);
+        }
+    }
+
     /// Sorts by file name in natural order ("E2" before "E10"); the current item stays current.
     pub fn sort_by_name(&mut self) {
         let name = |p: &PathBuf| {
@@ -539,6 +556,27 @@ mod tests {
         assert_eq!(sorted, [0, 1, 2, 3]);
         assert!(q.set_current(Path::new("a")));
         assert!(!q.set_current(Path::new("nope")));
+    }
+
+    #[test]
+    fn play_next_comes_right_after_the_current_item() {
+        let mut q = queue("b");
+        q.play_next(3);
+        assert_eq!(names(&q), ["a", "b", "d", "c"]);
+        q.play_next(0);
+        assert_eq!(names(&q), ["b", "a", "d", "c"]);
+        assert_eq!(q.current(), Some(0));
+        // Shuffled, it is next in play order wherever the list puts it.
+        let items: Vec<PathBuf> = (0..20).map(|i| PathBuf::from(format!("{i:02}"))).collect();
+        let mut q = Queue::new(items, Some(Path::new("07")));
+        q.toggle_shuffle();
+        let last = *q.order.last().unwrap();
+        let path = q.items()[last].clone();
+        q.play_next(last);
+        assert_eq!(q.next(), Some(path));
+        let mut sorted = q.order.clone();
+        sorted.sort();
+        assert_eq!(sorted, (0..20).collect::<Vec<_>>());
     }
 
     #[test]

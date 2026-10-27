@@ -129,6 +129,8 @@ pub enum QueueAction {
     Play(usize),
     /// Moves item `.0` so it ends up at index `.1`.
     Move(usize, usize),
+    /// Moves an item to play right after the current one.
+    PlayNext(usize),
     Remove(usize),
     /// Opens the file picker and appends what it returns.
     AddFiles,
@@ -375,6 +377,12 @@ impl Ui {
                     || g.data.as_ref() != data))
     }
 
+    /// Whether the panel shows the queue's files, which have a menu, rather than bookmarks or
+    /// chapters.
+    pub(super) fn queue_rows_menu(&self) -> bool {
+        self.layout.queue.tab == Tab::Queue
+    }
+
     /// What a click on the panel does. Tabs and selection change here; the rest goes out.
     pub(super) fn queue_click(&mut self, target: Target) -> Option<Action> {
         let s = &mut self.queue;
@@ -411,13 +419,8 @@ impl Ui {
                     Tab::Chapters => QueueAction::SeekTo(d.chapters.get(i)?.0),
                 }
             }
-            // ponytail: the design's "..." leads to the file's context menu; until the menus
-            // land it removes the row, like minus.
-            (Target::More(i), _) => {
-                s.selected = None;
-                QueueAction::Remove(i)
-            }
-            (Target::Body, _) => return None,
+            // "..." opens the row's menu, which Ui::on_up asks main.rs for.
+            (Target::More(_) | Target::Body, _) => return None,
         };
         Some(Action::Queue(action))
     }

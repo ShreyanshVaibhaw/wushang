@@ -792,6 +792,9 @@ impl Ui {
                 Some(Hit::Preferences(target)) => self.preferences_click(target),
                 Some(Hit::Onboarding(target)) => self.onboarding_click(target),
                 Some(Hit::Customize(target)) => self.customize_click(target),
+                Some(h @ Hit::Queue(queue::Target::More(_))) if self.queue_rows_menu() => {
+                    Some(Action::OpenMenu(h, x, y))
+                }
                 Some(Hit::Queue(target)) => self.queue_click(target),
                 Some(Hit::Playlist) => {
                     self.toggle_queue();
@@ -839,7 +842,7 @@ impl Ui {
         }
     }
 
-    /// A right-click: the video and library entries have context menus.
+    /// A right-click: the video, library entries and queue rows have context menus.
     pub fn on_right(&mut self, x: f32, y: f32) -> Option<Action> {
         self.on_move(x, y);
         if matches!(self.hover, Some(Hit::Menu(_))) {
@@ -848,6 +851,11 @@ impl Ui {
         self.close_menu();
         match self.layout.hit(x, y)? {
             hit @ (Hit::Video | Hit::Entry(_)) => Some(Action::OpenMenu(hit, x, y)),
+            Hit::Queue(queue::Target::Row(i) | queue::Target::More(i))
+                if self.queue_rows_menu() =>
+            {
+                Some(Action::OpenMenu(Hit::Queue(queue::Target::More(i)), x, y))
+            }
             _ => None,
         }
     }
