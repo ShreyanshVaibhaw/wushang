@@ -53,7 +53,7 @@ Click play/pause, previous (restart, or the previous file within the first 3 sec
 The title bar has minimize, maximize, fullscreen and close, and dragging it moves the window.
 While playing, the bars hide after 3 seconds without mouse movement and the video fills the window inside a 10 px rounded frame; moving the mouse brings them back.
 The "…" button opens the main menu from the design: open files, open a folder, recent files, keyboard shortcuts, playback settings and About.
-Right-clicking the video opens the player menu: play, stop, previous, next, hide the controls, and submenus for speed and sleep timer, video tracks and transforms, audio tracks, stereo mode and output device, subtitles, the settings tabs, the queue, and opening media.
+Right-clicking the video opens the player menu: play, stop, previous, next, hide the controls, the mini player, and submenus for speed and sleep timer, video tracks and transforms, audio tracks, stereo mode and output device, subtitles, the settings tabs, the queue, and opening media.
 Items for features myvlc doesn't have (network streams, discs, capture devices, converting, recording, profiles, customizing the player) are shown dimmed.
 
 The playlist button opens the queue panel from the design, in the settings panel's place, with three tabs:
@@ -92,11 +92,25 @@ Switching tracks and seeking land on the exact moment: the decoders read from th
 | Ctrl+O / Ctrl+F | Open files / open a folder |
 | Ctrl+P | Settings |
 | Ctrl+\ | Hide the controls until the mouse moves |
+| Ctrl+M | Mini player, and back |
 | Ctrl+I | Properties of the file playing, or of the file under the pointer |
 | F1 / Shift+F1 | Keyboard shortcuts / About |
 | Q, Ctrl+Q | Quit |
 
 The window opens the way it was launched, so a shortcut set to "Run: Minimized", or a script that asks for minimized without activation, never takes focus.
+
+### Mini player
+
+The mini player is the design's "Miniplayer" card: the video, its progress bar, the file name and folder, and a queue button.
+It shows at the library's bottom right while something plays, and Ctrl+M (or "Mini Player" in the player's right-click menu) turns the whole window into it.
+The mini player window stays above other windows and opens at the bottom right of the screen, or where you last left it.
+Drag it by its body to move it.
+
+With the pointer on the card, the video dims and shows the design's controls: previous, play/pause and next in the middle, close at the top left and expand at the top right.
+Close stops playback; expand goes back to the full player, and in the window it restores the window's old size and place.
+The progress bar seeks with a click or a drag.
+The queue button opens the queue above the video, in the design's style, with sort, remove and add; the window grows upward to make room.
+Esc or Ctrl+M also leaves the mini player window.
 
 ### Settings
 

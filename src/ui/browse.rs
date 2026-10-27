@@ -2,9 +2,6 @@
 //! grid or list, and the mini player card. Sizes are DIPs from the design's 1920x1080 library
 //! frames ("Videos > Shows > The Wand > S01"), colours sampled from them.
 
-use std::mem::ManuallyDrop;
-
-use windows::core::Interface;
 use windows_numerics::Vector2;
 
 use super::*;
@@ -46,8 +43,6 @@ const OVERLAY_TOOLS: f32 = 76.0;
 const OVERLAY_DIVIDER: f32 = 105.0;
 const OVERLAY_FIRST_ROW: f32 = 119.0;
 const SEARCH_W: f32 = 323.0;
-const CARD_W: f32 = 391.0;
-const CARD_H: f32 = 338.0;
 /// Room for "..." and its separator in front of a shortened breadcrumb.
 const ELIDED: f32 = 40.0;
 
@@ -326,7 +321,6 @@ pub struct Geometry {
     elided: bool,
     count: Rect,
     search: Rect,
-    pub card: Option<Card>,
     /// Thumbnail grid, or the list.
     grid: bool,
     /// Centre line of the row holding the breadcrumb.
@@ -360,19 +354,19 @@ impl Tile {
     }
 }
 
-#[derive(Clone, Copy)]
-pub struct Card {
-    pub frame: Rect,
-    pub video: Rect,
-    progress: Rect,
-}
-
 fn nav_row(i: usize) -> Rect {
     let cy = NAV_TOP + NAV_PITCH * i as f32;
     Rect::new(16.0, cy - 19.0, SIDEBAR_R - 8.0, cy + 19.0)
 }
 
-pub(super) fn layout(p: &Painter, width: f32, height: f32, b: &Browse, card: bool) -> Layout {
+/// The library page; `card` is Some(queue open) while something plays.
+pub(super) fn layout(
+    p: &Painter,
+    width: f32,
+    height: f32,
+    b: &Browse,
+    card: Option<bool>,
+) -> Layout {
     let w = width;
     let mut buttons: Vec<(Hit, Rect)> = Layout::window_buttons(w).into();
     for (i, section) in SECTIONS.iter().enumerate() {
@@ -418,23 +412,11 @@ pub(super) fn layout(p: &Painter, width: f32, height: f32, b: &Browse, card: boo
     };
     let max_scroll = (bottom + b.scroll - content.b).max(0.0);
 
-    let card = card.then(|| {
-        let frame = Rect::new(
-            w - 6.0 - CARD_W,
-            height - 6.0 - CARD_H,
-            w - 6.0,
-            height - 6.0,
-        );
-        Card {
-            frame,
-            video: Rect::new(frame.l + 8.0, frame.t + 8.0, frame.r - 8.0, frame.t + 217.0),
-            progress: Rect::new(
-                frame.l + 8.0,
-                frame.t + 223.0,
-                frame.r - 8.0,
-                frame.t + 237.0,
-            ),
-        }
+    // The card's queue gets the room above it, short of the title bar.
+    let card = card.map(|queue| {
+        let room = height - 6.0 - mini::H - TITLE_BAR - 6.0;
+        let queue = if queue { room } else { 0.0 };
+        mini::Card::new(w - 6.0 - mini::W, height - 6.0, queue, false)
     });
     Layout {
         page: Page::Library,
@@ -442,6 +424,8 @@ pub(super) fn layout(p: &Painter, width: f32, height: f32, b: &Browse, card: boo
         width,
         height,
         video: card.map_or_else(Rect::default, |c| c.video),
+        track: card.map_or_else(Rect::default, |c| c.progress),
+        card,
         buttons,
         browse: Geometry {
             content,
@@ -451,7 +435,6 @@ pub(super) fn layout(p: &Painter, width: f32, height: f32, b: &Browse, card: boo
             elided,
             count,
             search,
-            card,
             grid: b.grid,
             header_cy: HEADER_CY,
             overlay: None,
@@ -502,7 +485,6 @@ pub(super) fn overlay(p: &Painter, l: &mut Layout, b: &Browse) {
         elided,
         count: Rect::new(x0 + 20.0, tools - 14.0, x0 + 200.0, tools + 14.0),
         search: Rect::default(),
-        card: None,
         grid: false,
         header_cy: cy,
         overlay: Some(panel),
@@ -678,8 +660,11 @@ impl Layout {
 
     pub(super) fn browse_hit(&self, x: f32, y: f32) -> Option<Hit> {
         let g = &self.browse;
-        if g.card.is_some_and(|c| c.frame.contains(x, y)) {
-            return Some(Hit::Card);
+        if let Some(target) = self.queue.hit(x, y) {
+            return Some(Hit::Queue(target));
+        }
+        if let Some(hit) = self.card.and_then(|c| c.hit(x, y)) {
+            return Some(hit);
         }
         if let Some((hit, _)) = self.buttons.iter().find(|(_, r)| r.contains(x, y)) {
             return Some(*hit);
@@ -704,7 +689,6 @@ pub(super) struct Resources {
     label: ID2D1SolidColorBrush,
     dim: ID2D1SolidColorBrush,
     faint: ID2D1SolidColorBrush,
-    shadow: ID2D1SolidColorBrush,
     veil: ID2D1SolidColorBrush,
     nav: IDWriteTextFormat,
     pub(super) crumb: IDWriteTextFormat,
@@ -767,7 +751,6 @@ impl Resources {
             label: brush(FG_LABEL, 1.0)?,
             dim: brush(FG_DIM, 1.0)?,
             faint: brush(FG_FAINT, 1.0)?,
-            shadow: brush(0x000000, 0.18)?,
             veil: brush(0x000000, 0.45)?,
             nav: format(
                 15.0,
@@ -846,7 +829,7 @@ impl Painter {
         let l = s.layout;
         unsafe {
             // The card's video is already in the back buffer; a layer keeps everything off it.
-            let mask = match l.browse.card {
+            let mask = match l.card {
                 Some(card) => {
                     if !s.has_frame {
                         rt.FillRectangle(&card.video.d2d(), &self.black);
@@ -857,17 +840,7 @@ impl Painter {
                 None => None,
             };
             if let Some(mask) = &mask {
-                let params = D2D1_LAYER_PARAMETERS1 {
-                    contentBounds: Rect::new(f32::MIN, f32::MIN, f32::MAX, f32::MAX).d2d(),
-                    geometricMask: ManuallyDrop::new(Some(mask.cast()?)),
-                    maskAntialiasMode: D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
-                    maskTransform: Matrix3x2::identity(),
-                    opacity: 1.0,
-                    opacityBrush: ManuallyDrop::new(None),
-                    layerOptions: D2D1_LAYER_OPTIONS1_NONE,
-                };
-                ctx.PushLayer(&params, None);
-                drop(ManuallyDrop::into_inner(params.geometricMask));
+                mini::push_mask(ctx, mask)?;
             }
             rt.FillRectangle(&Rect::new(0.0, 0.0, l.width, TITLE_BAR).d2d(), &self.bg);
             rt.FillRectangle(
@@ -878,11 +851,17 @@ impl Painter {
             self.sidebar(rt, ctx, s);
             self.header(rt, ctx, s);
             self.entries(rt, ctx, s)?;
-            if let Some(card) = l.browse.card {
-                self.card(rt, ctx, s, card);
+            if let Some(card) = &l.card {
+                self.mini_card(rt, ctx, s, card);
+                if let Some(q) = s.queue.filter(|_| card.queue) {
+                    self.queue_panel(rt, ctx, s, q);
+                }
             }
             if mask.is_some() {
                 ctx.PopLayer();
+            }
+            if let Some(card) = &l.card {
+                self.mini_controls(rt, ctx, s, card);
             }
         }
         Ok(())
@@ -1385,44 +1364,6 @@ impl Painter {
             rt.PopAxisAlignedClip();
         }
         Ok(())
-    }
-
-    unsafe fn card(&self, rt: &ID2D1RenderTarget, ctx: &ID2D1DeviceContext5, s: &Scene, c: Card) {
-        let r = &self.lib;
-        unsafe {
-            for spread in [6.0, 4.0, 2.0] {
-                rt.FillRoundedRectangle(&rounded(c.frame.inset(-spread), 8.0 + spread), &r.shadow);
-            }
-            rt.FillRoundedRectangle(&rounded(c.frame, 8.0), &self.bg);
-            if s.hover == Some(Hit::Card) {
-                rt.FillRoundedRectangle(&rounded(c.frame, 8.0), &self.hover);
-            }
-            rt.FillRoundedRectangle(&rounded(c.video.inset(-1.0), 5.0), &self.track);
-            rt.FillRoundedRectangle(&rounded(c.progress, 4.0), &self.track);
-            if s.duration > 0.0 {
-                let p = c.progress.inset(2.0);
-                let fraction = (s.position / s.duration).clamp(0.0, 1.0) as f32;
-                let fill = Rect::new(p.l, p.t, p.l + (p.w() * fraction).max(6.0), p.b);
-                rt.FillRoundedRectangle(&rounded(fill, 3.0), &self.played);
-            }
-            let f = c.frame;
-            self.text_in(
-                rt,
-                s.file,
-                &r.name,
-                Rect::new(f.l + 15.0, f.t + 258.0, f.r - 15.0, f.t + 284.0),
-                &r.label,
-            );
-            self.icon(ctx, &self.icons.folder, f.l + 13.0, f.t + 298.0, false);
-            self.text_in(
-                rt,
-                s.folder,
-                &r.name,
-                Rect::new(f.l + 46.0, f.t + 298.0, f.r - 60.0, f.t + 322.0),
-                &self.fg,
-            );
-            self.icon(ctx, &self.icons.playlist, f.r - 43.0, f.t + 298.0, false);
-        }
     }
 }
 

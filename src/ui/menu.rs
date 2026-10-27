@@ -65,6 +65,8 @@ pub enum MenuAction {
     Next,
     /// Hides the bars until the mouse moves.
     HideUi,
+    /// Into the mini player window, or back out of it.
+    MiniPlayer,
     /// A change the tracks and settings panels also make.
     Panel(PanelAction),
     ShowQueue,
@@ -151,6 +153,7 @@ menu_icons! {
     Next = "menu_next.svg",
     Record = "menu_record.svg",
     HideUi = "menu_hide_ui.svg",
+    Mini = "menu_mini.svg",
     Playback = "menu_playback.svg",
     Video = "menu_video.svg",
     Audio = "menu_audio.svg",
@@ -895,6 +898,9 @@ pub fn player_menu(d: &PanelData, paused: bool) -> Vec<Item> {
         Item::new("Hide UI", MenuAction::HideUi)
             .icon(Icon::HideUi)
             .key("Ctrl + \\"),
+        Item::new("Mini Player", MenuAction::MiniPlayer)
+            .icon(Icon::Mini)
+            .key("Ctrl + M"),
         Item::divider(),
         Item::submenu("Playback", playback).icon(Icon::Playback),
         Item::submenu("Video", video).icon(Icon::Video),

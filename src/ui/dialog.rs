@@ -119,7 +119,7 @@ const FG_BUTTON_OFF: u32 = 0x606060;
 /// The keys main.rs handles, for the Keyboard Shortcuts dialog.
 // ponytail: a copy of on_key and the menus' accelerators; one table both read would keep them
 // in step.
-const SHORTCUTS: [(&str, &str); 19] = [
+const SHORTCUTS: [(&str, &str); 20] = [
     ("Space", "Play or pause"),
     ("Left / Right", "Skip back or forward (Settings > Controls)"),
     (
@@ -139,6 +139,7 @@ const SHORTCUTS: [(&str, &str); 19] = [
     ("Ctrl + O", "Open files"),
     ("Ctrl + F", "Open a folder"),
     ("Ctrl + P", "Settings"),
+    ("Ctrl + M", "Mini player, and back"),
     ("Ctrl + I", "Properties of the file playing or pointed at"),
     ("Ctrl + \\", "Hide the controls until the mouse moves"),
     ("Right-click", "Player and library menus"),

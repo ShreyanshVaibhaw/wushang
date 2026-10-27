@@ -89,6 +89,8 @@ static OPEN: Mutex<Option<PathBuf>> = Mutex::new(None);
 static RESIZED: AtomicBool = AtomicBool::new(false);
 /// Window style and placement saved while in borderless fullscreen.
 static WINDOWED: Mutex<Option<(isize, WINDOWPLACEMENT)>> = Mutex::new(None);
+/// The full window's placement, saved while it is the mini player.
+static MINI: Mutex<Option<WINDOWPLACEMENT>> = Mutex::new(None);
 /// Thumbnail size in pixels: the grid tile at 125% scaling, 16:9.
 const THUMB_SIZE: (u32, u32) = (400, 225);
 /// How often playback positions go into the library while playing.
@@ -119,6 +121,11 @@ thread_local! {
     static PREFS: RefCell<Prefs> = RefCell::new(Prefs::default());
     /// Requests from the Settings window, applied by the render loop.
     static PREFS_ACTIONS: RefCell<Vec<PrefsAction>> = const { RefCell::new(Vec::new()) };
+    /// Into the mini player (None) or out of it to a page. The render loop does it, since
+    /// moving the window sends messages to the window procedure, which borrows `UI`.
+    static MINI_REQUEST: std::cell::Cell<Option<Option<Page>>> = const { std::cell::Cell::new(None) };
+    /// Where the mini player last was: its left and bottom edges on screen, in pixels.
+    static MINI_SPOT: std::cell::Cell<Option<(i32, i32)>> = const { std::cell::Cell::new(None) };
 }
 
 fn prefs() -> Prefs {
@@ -767,8 +774,6 @@ fn set_topmost(hwnd: HWND, on: bool) {
     unsafe { _ = SetWindowPos(hwnd, Some(after), 0, 0, 0, 0, flags) };
 }
 
-/// The settings window opened at `category`, with the output devices as the tracks panel
-/// lists them.
 /// The colours `p` asks for; "System" follows Windows' app mode.
 fn theme_of(p: &Prefs) -> ui::theme::Theme {
     ui::theme::Theme {
@@ -781,6 +786,8 @@ fn theme_of(p: &Prefs) -> ui::theme::Theme {
     }
 }
 
+/// The settings window opened at `category`, with the output devices as the tracks panel
+/// lists them.
 fn open_preferences(app: &App, category: Category) {
     UI.with_borrow_mut(|ui| ui.open_preferences(prefs(), app.devices.clone(), category));
 }
@@ -940,6 +947,18 @@ fn run() -> Result<(), Box<dyn Error>> {
     // Whether Windows is asked to keep the screen on.
     let mut awake = false;
     while pump_messages() && !shared.quit.load(Relaxed) {
+        // Nothing to show in the mini player once playback ends.
+        if app.session.is_none() && is_mini() {
+            MINI_REQUEST.set(Some(Some(Page::Library)));
+        }
+        match MINI_REQUEST.take() {
+            Some(None) if app.session.is_some() => enter_mini(hwnd),
+            Some(Some(page)) => exit_mini(hwnd, page),
+            _ => {}
+        }
+        if is_mini() {
+            fit_mini(hwnd, UI.with_borrow(|ui| ui.queue.open));
+        }
         if let Some(path) = OPEN.lock().unwrap().take() {
             // Dropped on an open playlist, a file joins it; anywhere else it plays.
             let playlist = UI.with_borrow(|ui| match &ui.browse.place {
@@ -1169,8 +1188,29 @@ fn run() -> Result<(), Box<dyn Error>> {
                     let changed = ui.relayout
                         || old.page != Page::Library
                         || (w, h) != (old.width, old.height)
-                        || card != (old.video.w() > 0.0);
-                    changed.then(|| renderer.library_layout(w, h, &ui.browse, card))
+                        || card != (old.video.w() > 0.0)
+                        || (card && ui.queue_stale(queue_data.as_ref()));
+                    changed.then(|| {
+                        let queue = card.then_some(ui.queue.open);
+                        let mut layout = renderer.library_layout(w, h, &ui.browse, queue);
+                        if let Some(q) = &queue_data {
+                            layout.add_mini_queue(&ui.queue, q);
+                        }
+                        layout
+                    })
+                }
+                Page::Mini => {
+                    let changed = ui.relayout
+                        || old.page != Page::Mini
+                        || (w, h) != (old.width, old.height)
+                        || ui.queue_stale(queue_data.as_ref());
+                    changed.then(|| {
+                        let mut layout = Layout::mini(w, h, ui.queue.open);
+                        if let Some(q) = &queue_data {
+                            layout.add_mini_queue(&ui.queue, q);
+                        }
+                        layout
+                    })
                 }
             };
             if let Some(mut layout) = layout {
@@ -1363,6 +1403,14 @@ fn handle(app: &mut App, hwnd: HWND, hit: Hit) {
             }
         }
         Hit::Card => UI.with_borrow_mut(|ui| ui.show(Page::Player)),
+        Hit::MiniExpand if is_mini() => MINI_REQUEST.set(Some(Some(Page::Player))),
+        Hit::MiniExpand => UI.with_borrow_mut(|ui| ui.show(Page::Player)),
+        Hit::MiniClose => {
+            app.stop();
+            if is_mini() {
+                MINI_REQUEST.set(Some(Some(Page::Library)));
+            }
+        }
         Hit::Folder => {
             if let Some(dir) = app.session.as_ref().and_then(|s| s.path.parent()) {
                 let place = Place::Folder(
@@ -1499,6 +1547,8 @@ fn menu_action(app: &mut App, hwnd: HWND, action: MenuAction) {
         MenuAction::Previous => handle(app, hwnd, Hit::Previous),
         MenuAction::Next => handle(app, hwnd, Hit::Next),
         MenuAction::HideUi => UI.with_borrow_mut(Ui::hide_bars),
+        MenuAction::MiniPlayer if is_mini() => MINI_REQUEST.set(Some(Some(Page::Player))),
+        MenuAction::MiniPlayer => MINI_REQUEST.set(Some(None)),
         MenuAction::Panel(a) => app.apply(hwnd, a),
         // Files join the queue, or play when nothing is open.
         MenuAction::AddToQueue(paths) => {
@@ -2080,8 +2130,10 @@ fn restore_placement(hwnd: HWND, p: &Prefs) -> bool {
 
 /// Keeps the window's restored rect and maximized state for next time, as it closes.
 fn remember_placement(hwnd: HWND) {
-    // In fullscreen, the placement to come back to is the one saved on the way in.
+    // In fullscreen or the mini player, the placement to come back to is the one saved on the
+    // way in.
     let saved = WINDOWED.lock().unwrap().as_ref().map(|(_, p)| *p);
+    let saved = saved.or(*MINI.lock().unwrap());
     let placement = saved.or_else(|| {
         let mut p = WINDOWPLACEMENT {
             length: size_of::<WINDOWPLACEMENT>() as u32,
@@ -2194,12 +2246,19 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             return LRESULT(0);
         }
         WM_NCHITTEST => return LRESULT(nc_hit_test(hwnd, lparam) as isize),
+        // Double-clicking the mini player's body would maximize it.
+        WM_NCLBUTTONDBLCLK if is_mini() => return LRESULT(0),
         WM_GETMINMAXINFO => {
             let info = unsafe { &mut *(lparam.0 as *mut MINMAXINFO) };
             let scale = unsafe { GetDpiForWindow(hwnd) }.max(96) as f32 / 96.0;
             // Narrower than this and the control bar's seek bar has no room left.
-            info.ptMinTrackSize.x = (MIN_SIZE.0 * scale) as i32;
-            info.ptMinTrackSize.y = (MIN_SIZE.1 * scale) as i32;
+            let min = if is_mini() {
+                (ui::mini::W, ui::mini::H)
+            } else {
+                MIN_SIZE
+            };
+            info.ptMinTrackSize.x = (min.0 * scale) as i32;
+            info.ptMinTrackSize.y = (min.1 * scale) as i32;
         }
         WM_DPICHANGED => {
             let r = unsafe { &*(lparam.0 as *const RECT) };
@@ -2407,7 +2466,7 @@ fn nc_hit_test(hwnd: HWND, lparam: LPARAM) -> u32 {
     unsafe { _ = ScreenToClient(hwnd, &mut p) };
     let (w, h) = client_size(hwnd);
     let (w, h) = (w as i32, h as i32);
-    let resizable = !is_fullscreen() && !unsafe { IsZoomed(hwnd) }.as_bool();
+    let resizable = !is_fullscreen() && !is_mini() && !unsafe { IsZoomed(hwnd) }.as_bool();
     if resizable {
         let edge = (6.0 * unsafe { GetDpiForWindow(hwnd) }.max(96) as f32 / 96.0) as i32;
         let (left, right, top, bottom) = (p.x < edge, p.x >= w - edge, p.y < edge, p.y >= h - edge);
@@ -2499,6 +2558,8 @@ fn act(hwnd: HWND, shared: &Shared, action: Option<Action>) {
             | Hit::Crumb(_)
             | Hit::Entry(_)
             | Hit::Card
+            | Hit::MiniClose
+            | Hit::MiniExpand
             | Hit::Folder
             | Hit::Next
             | Hit::Previous),
@@ -2578,6 +2639,7 @@ fn on_key(hwnd: HWND, shared: &Shared, key: VIRTUAL_KEY) {
         VK_P if ctrl => Some(MenuAction::Preferences(Category::Playback)),
         VK_Q if ctrl => Some(MenuAction::Quit),
         VK_OEM_5 if ctrl && page == Page::Player => Some(MenuAction::HideUi),
+        VK_M if ctrl => Some(MenuAction::MiniPlayer),
         VK_F1 if shift => Some(MenuAction::ShowAbout),
         VK_S if page == Page::Player => Some(MenuAction::Stop),
         _ => None,
@@ -2596,12 +2658,14 @@ fn on_key(hwnd: HWND, shared: &Shared, key: VIRTUAL_KEY) {
         VK_UP => shared.set_volume(shared.volume() + volume_step),
         VK_DOWN => shared.set_volume(shared.volume() - volume_step),
         VK_M => shared.toggle_mute(),
+        VK_F if page == Page::Mini => {}
         VK_F => toggle_fullscreen(hwnd),
         VK_ESCAPE if UI.with_borrow_mut(Ui::close_panel) => {}
         VK_ESCAPE if UI.with_borrow(|ui| ui.overlay && ui.page == Page::Player) => {
             UI.with_borrow_mut(|ui| ui.overlay = false)
         }
         VK_ESCAPE if is_fullscreen() => toggle_fullscreen(hwnd),
+        VK_ESCAPE if page == Page::Mini => MINI_REQUEST.set(Some(Some(Page::Player))),
         // Esc leaves the player for the library, which keeps playing in the mini player.
         VK_ESCAPE => UI.with_borrow_mut(|ui| ui.show(Page::Library)),
         VK_Q => unsafe { _ = DestroyWindow(hwnd) },
@@ -2610,6 +2674,91 @@ fn on_key(hwnd: HWND, shared: &Shared, key: VIRTUAL_KEY) {
         VK_I if unsafe { GetKeyState(i32::from(VK_CONTROL.0)) } < 0 => WANT_PROPERTIES.set(true),
         _ => {}
     }
+}
+
+fn is_mini() -> bool {
+    MINI.lock().unwrap().is_some()
+}
+
+/// The mini player's size in pixels: the card, and its queue when that's open.
+fn mini_size(hwnd: HWND, queue: bool) -> (i32, i32) {
+    let scale = unsafe { GetDpiForWindow(hwnd) }.max(96) as f32 / 96.0;
+    let h = ui::mini::H + if queue { ui::mini::QUEUE_H } else { 0.0 };
+    (
+        (ui::mini::W * scale).round() as i32,
+        (h * scale).round() as i32,
+    )
+}
+
+/// Shrinks the window to the mini player, above other windows: where it last was, or at the
+/// bottom right of its monitor's work area.
+fn enter_mini(hwnd: HWND) {
+    if is_mini() {
+        return;
+    }
+    if is_fullscreen() {
+        toggle_fullscreen(hwnd);
+    }
+    let mut placement = WINDOWPLACEMENT {
+        length: size_of::<WINDOWPLACEMENT>() as u32,
+        ..Default::default()
+    };
+    let mut monitor = MONITORINFO {
+        cbSize: size_of::<MONITORINFO>() as u32,
+        ..Default::default()
+    };
+    unsafe {
+        if GetWindowPlacement(hwnd, &mut placement).is_err()
+            || !GetMonitorInfoW(
+                MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST),
+                &mut monitor,
+            )
+            .as_bool()
+        {
+            return;
+        }
+        *MINI.lock().unwrap() = Some(placement);
+        if IsZoomed(hwnd).as_bool() {
+            _ = ShowWindow(hwnd, SW_RESTORE);
+        }
+    }
+    UI.with_borrow_mut(|ui| {
+        ui.overlay = false;
+        ui.show(Page::Mini);
+    });
+    let (w, h) = mini_size(hwnd, false);
+    let work = monitor.rcWork;
+    let margin = 16 * w / 391;
+    let (l, b) = MINI_SPOT
+        .get()
+        .unwrap_or((work.right - margin - w, work.bottom - margin));
+    let flags = SWP_NOOWNERZORDER | SWP_FRAMECHANGED;
+    unsafe { _ = SetWindowPos(hwnd, Some(HWND_TOPMOST), l, b - h, w, h, flags) };
+}
+
+/// Back to the full window, where it was, on `page`.
+fn exit_mini(hwnd: HWND, page: Page) {
+    let Some(placement) = MINI.lock().unwrap().take() else {
+        return;
+    };
+    let mut r = RECT::default();
+    if unsafe { GetWindowRect(hwnd, &mut r) }.is_ok() {
+        MINI_SPOT.set(Some((r.left, r.bottom)));
+    }
+    UI.with_borrow_mut(|ui| ui.show(page));
+    unsafe { _ = SetWindowPlacement(hwnd, &placement) };
+    set_topmost(hwnd, prefs().on_top);
+}
+
+/// Grows the mini player up for its queue and back, keeping its bottom edge.
+fn fit_mini(hwnd: HWND, queue: bool) {
+    let (w, h) = mini_size(hwnd, queue);
+    let mut r = RECT::default();
+    if unsafe { GetWindowRect(hwnd, &mut r) }.is_err() || r.bottom - r.top == h {
+        return;
+    }
+    let flags = SWP_NOZORDER | SWP_NOACTIVATE;
+    unsafe { _ = SetWindowPos(hwnd, None, r.left, r.bottom - h, w, h, flags) };
 }
 
 /// Borderless fullscreen on the window's monitor, and back.

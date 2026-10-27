@@ -291,7 +291,13 @@ impl Renderer {
         Ok(())
     }
 
-    pub fn library_layout(&self, width: f32, height: f32, browse: &Browse, card: bool) -> Layout {
+    pub fn library_layout(
+        &self,
+        width: f32,
+        height: f32,
+        browse: &Browse,
+        card: Option<bool>,
+    ) -> Layout {
         self.painter.library_layout(width, height, browse, card)
     }
 

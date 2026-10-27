@@ -1,7 +1,8 @@
 //! The play queue panel, opened by the control bar's playlist button: QUEUE (the files previous
 //! and next step through, with sort, repeat, shuffle, remove and add), BOOKMARKS and CHAPTERS of
 //! the playing file. It takes the settings panel's place at the window's right. Sizes are DIPs
-//! measured from the design's queue frame, colours sampled from it.
+//! measured from the design's queue frame, colours sampled from it. The mini player shows the
+//! same list in its own style: a "Queue" title instead of the tabs, and sort, remove and add.
 
 use super::*;
 use crate::queue::Repeat;
@@ -11,23 +12,65 @@ const W: f32 = 400.0;
 const MARGIN: f32 = 20.0;
 const TOP: f32 = 61.0;
 const RADIUS: f32 = 8.0;
-const HEADER: f32 = 50.0;
-/// Centre of the "4 items - 2h 3m" line and its buttons, from the panel's top.
-const TOOLBAR_Y: f32 = 85.0;
-/// Top of the scrolling list, and of its first row inside it.
-const LIST_TOP: f32 = 108.0;
 const FIRST_ROW: f32 = 7.5;
 const ROW: f32 = 44.0;
-const ROW_L: f32 = 12.0;
-const ROW_R: f32 = 388.0;
-/// Centre of the drag handle, left edge of the name, right edge of the duration.
-const HANDLE_X: f32 = 35.5;
-const NAME_X: f32 = 62.5;
-const TIME_R: f32 = 374.0;
-/// Centre of the hovered row's "..." button.
-const MORE_X: f32 = 362.0;
-/// Toolbar button centres: sort, repeat, shuffle, minus, plus.
-const TOOL_X: [f32; 5] = [211.0, 251.0, 291.5, 331.5, 368.0];
+
+/// Where a queue's parts sit, from its frame's left and top.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Style {
+    /// The mini player's: a title instead of tabs, and no shadow.
+    mini: bool,
+    header: f32,
+    /// Centre of the "4 items - 2h 3m" line and its buttons.
+    toolbar_y: f32,
+    /// Top of the scrolling list, and of its first row inside it.
+    list_top: f32,
+    row_l: f32,
+    row_r: f32,
+    /// Centre of the drag handle, left edge of the name, right edge of the duration.
+    handle_x: f32,
+    name_x: f32,
+    time_r: f32,
+    /// Centre of the hovered row's "..." button.
+    more_x: f32,
+    /// Toolbar button centres: sort, repeat, shuffle, minus, plus.
+    tool_x: [f32; 5],
+}
+
+const PANEL: Style = Style {
+    mini: false,
+    header: 50.0,
+    toolbar_y: 85.0,
+    list_top: 108.0,
+    row_l: 12.0,
+    row_r: 388.0,
+    handle_x: 35.5,
+    name_x: 62.5,
+    time_r: 374.0,
+    more_x: 362.0,
+    tool_x: [211.0, 251.0, 291.5, 331.5, 368.0],
+};
+
+/// Measured from the Miniplayer component's queue; it has no repeat or shuffle.
+const MINI: Style = Style {
+    mini: true,
+    header: 58.0,
+    toolbar_y: 91.0,
+    list_top: 111.0,
+    row_l: 20.0,
+    row_r: 371.0,
+    handle_x: 43.5,
+    name_x: 70.0,
+    time_r: 358.0,
+    more_x: 346.0,
+    tool_x: [262.0, 0.0, 0.0, 307.0, 351.0],
+};
+
+impl Default for Style {
+    fn default() -> Self {
+        PANEL
+    }
+}
 /// The pointer moves this far from a press on a row before it becomes a drag.
 const DRAG_START: f32 = 4.0;
 
@@ -138,6 +181,7 @@ pub struct State {
 #[derive(Clone, Default, Debug)]
 pub struct Geometry {
     pub open: bool,
+    style: Style,
     tab: Tab,
     frame: Rect,
     header: Rect,
@@ -166,9 +210,24 @@ impl Layout {
         let top = TOP.max(TITLE_BAR + FRAME);
         let bottom = (h - CONTROL_BAR - MARGIN).max(top + 200.0);
         let frame = Rect::new(w - MARGIN - W, top, w - MARGIN, bottom);
-        let header = Rect::new(frame.l, frame.t, frame.r, frame.t + HEADER);
+        self.queue = queue_geometry(PANEL, frame, state, state.tab, data);
+    }
+
+    /// Adds the mini player card's queue when its queue button is on. It always lists the queue,
+    /// whichever tab the player's panel was left on.
+    pub fn add_mini_queue(&mut self, state: &State, data: &QueueData) {
+        self.queue = match self.card.and_then(|c| c.queue_frame()) {
+            Some(frame) if state.open => queue_geometry(MINI, frame, state, Tab::Queue, data),
+            _ => Geometry::default(),
+        };
+    }
+}
+
+fn queue_geometry(st: Style, frame: Rect, state: &State, tab: Tab, data: &QueueData) -> Geometry {
+    {
+        let header = Rect::new(frame.l, frame.t, frame.r, frame.t + st.header);
         // Three equal tabs, as in the tracks popup.
-        let tabs = (0..3)
+        let tabs = (0..if st.mini { 0 } else { 3 })
             .map(|i| {
                 let l = frame.l + 14.0 + 130.0 * i as f32;
                 Rect::new(l, header.t, l + 112.0, header.b)
@@ -177,10 +236,15 @@ impl Layout {
         let tool = |t: Tool, i: usize| {
             (
                 t,
-                Rect::around(frame.l + TOOL_X[i], frame.t + TOOLBAR_Y, 32.0),
+                Rect::around(frame.l + st.tool_x[i], frame.t + st.toolbar_y, 32.0),
             )
         };
-        let tools = match state.tab {
+        let tools = match tab {
+            Tab::Queue if st.mini => vec![
+                tool(Tool::Sort, 0),
+                tool(Tool::Remove, 3),
+                tool(Tool::Add, 4),
+            ],
             Tab::Queue => vec![
                 tool(Tool::Sort, 0),
                 tool(Tool::Repeat, 1),
@@ -191,20 +255,21 @@ impl Layout {
             Tab::Bookmarks => vec![tool(Tool::Remove, 3), tool(Tool::Add, 4)],
             Tab::Chapters => Vec::new(),
         };
-        let list = Rect::new(frame.l, frame.t + LIST_TOP, frame.r, frame.b - 8.0);
-        let n = data.rows(state.tab);
+        let list = Rect::new(frame.l, frame.t + st.list_top, frame.r, frame.b - 8.0);
+        let n = data.rows(tab);
         let content = FIRST_ROW + ROW * n as f32 + 8.0;
         let max_scroll = (content - list.h()).max(0.0);
         let rows_top = list.t + FIRST_ROW - state.scroll.clamp(0.0, max_scroll);
         let rows = (0..n)
             .map(|i| {
                 let t = rows_top + ROW * i as f32;
-                Rect::new(frame.l + ROW_L, t, frame.l + ROW_R, t + ROW)
+                Rect::new(frame.l + st.row_l, t, frame.l + st.row_r, t + ROW)
             })
             .collect();
-        self.queue = Geometry {
+        Geometry {
             open: true,
-            tab: state.tab,
+            style: st,
+            tab,
             frame,
             header,
             tabs,
@@ -216,7 +281,7 @@ impl Layout {
             selected: state.selected,
             drag: state.drag,
             data: Some(data.clone()),
-        };
+        }
     }
 }
 
@@ -234,7 +299,7 @@ impl Geometry {
         if self.list.contains(x, y)
             && let Some(i) = self.rows.iter().position(|r| r.contains(x, y))
         {
-            let more = (x - (self.frame.l + MORE_X)).abs() < 16.0;
+            let more = (x - (self.frame.l + self.style.more_x)).abs() < 16.0;
             return Some(if more && self.tab == Tab::Queue {
                 Target::More(i)
             } else {
@@ -300,9 +365,11 @@ impl Ui {
     /// Whether the panel's layout is out of date.
     pub fn queue_stale(&self, data: Option<&QueueData>) -> bool {
         let (g, s) = (&self.layout.queue, &self.queue);
+        // The mini player's queue always shows the Queue tab.
+        let tab = if g.style.mini { Tab::Queue } else { s.tab };
         s.open != g.open
             || (s.open
-                && (g.tab != s.tab
+                && (g.tab != tab
                     || g.selected != s.selected
                     || g.drag != s.drag
                     || g.data.as_ref() != data))
@@ -311,9 +378,10 @@ impl Ui {
     /// What a click on the panel does. Tabs and selection change here; the rest goes out.
     pub(super) fn queue_click(&mut self, target: Target) -> Option<Action> {
         let s = &mut self.queue;
-        let d = self.layout.queue.data.as_ref()?;
+        let g = &self.layout.queue;
+        let d = g.data.as_ref()?;
         self.relayout = true;
-        let action = match (target, s.tab) {
+        let action = match (target, g.tab) {
             (Target::Tab(i), _) => {
                 s.tab = Tab::ALL[usize::from(i).min(2)];
                 (s.scroll, s.selected) = (0.0, None);
@@ -513,17 +581,25 @@ impl Painter {
         if !g.open {
             return;
         }
-        let f = g.frame;
+        let (f, st) = (g.frame, g.style);
         unsafe {
-            // A soft edge, so the panel holds on bright video.
-            for spread in [8.0, 6.0, 4.0, 2.0] {
-                rt.FillRoundedRectangle(&rounded(f.inset(-spread), RADIUS + spread), &p.shadow);
+            // A soft edge, so the panel holds on bright video. The mini player's queue is part
+            // of its card, which already has one.
+            if !st.mini {
+                for spread in [8.0, 6.0, 4.0, 2.0] {
+                    let edge = rounded(f.inset(-spread), RADIUS + spread);
+                    rt.FillRoundedRectangle(&edge, &p.shadow);
+                }
+                rt.FillRoundedRectangle(&rounded(f, RADIUS), &p.body);
             }
-            rt.FillRoundedRectangle(&rounded(f, RADIUS), &p.body);
             rt.PushAxisAlignedClip(&g.header.d2d(), D2D1_ANTIALIAS_MODE_ALIASED);
             rt.FillRoundedRectangle(&rounded(f, RADIUS), &p.header);
             rt.PopAxisAlignedClip();
-            self.queue_tabs(rt, ctx, s);
+            if st.mini {
+                self.put(rt, "Queue", &p.centred, g.header, &p.row);
+            } else {
+                self.queue_tabs(rt, ctx, s);
+            }
             self.queue_toolbar(rt, ctx, s, d);
 
             rt.PushAxisAlignedClip(&g.list.d2d(), D2D1_ANTIALIAS_MODE_ALIASED);
@@ -534,7 +610,7 @@ impl Painter {
                     Tab::Chapters => "No chapters",
                 };
                 let t = g.list.t + FIRST_ROW;
-                let r = Rect::new(f.l + ROW_L, t, f.l + ROW_R, t + ROW);
+                let r = Rect::new(f.l + st.row_l, t, f.l + st.row_r, t + ROW);
                 self.put(rt, empty, &p.centred, r, &p.dim);
             }
             for (i, r) in g.rows.iter().enumerate() {
@@ -553,9 +629,9 @@ impl Painter {
                     Tab::Bookmarks => {
                         let (name, at) = &d.bookmarks[i];
                         let cy = (r.t + r.b) / 2.0;
-                        self.glyph(ctx, &p.bookmark, f.l + HANDLE_X, cy, 20.0);
+                        self.glyph(ctx, &p.bookmark, f.l + st.handle_x, cy, 20.0);
                         let fg = if hovered { &p.bright } else { &p.label };
-                        self.row_text(rt, r, name, &clock_text(*at), fg, &p.dim);
+                        self.row_text(rt, &st, f.l, r, name, &clock_text(*at), fg, &p.dim);
                     }
                     Tab::Chapters => {
                         let (start, title) = &d.chapters[i];
@@ -566,10 +642,10 @@ impl Painter {
                             (_, true) => &p.bright,
                             _ => &p.label,
                         };
-                        let number =
-                            Rect::new(f.l + HANDLE_X - 16.0, r.t, f.l + HANDLE_X + 16.0, r.b);
+                        let x = f.l + st.handle_x;
+                        let number = Rect::new(x - 16.0, r.t, x + 16.0, r.b);
                         self.put(rt, &(i + 1).to_string(), &p.centred, number, &p.dim);
-                        self.row_text(rt, r, title, &clock_text(*start), fg, &p.dim);
+                        self.row_text(rt, &st, f.l, r, title, &clock_text(*start), fg, &p.dim);
                     }
                 }
             }
@@ -578,17 +654,21 @@ impl Painter {
                     rt.FillRectangle(&r.d2d(), &p.veil);
                 }
                 let y = g.rows_top + ROW * gap as f32;
-                let line = Rect::new(f.l + ROW_L, y - 1.0, f.l + ROW_R, y + 1.0);
+                let line = Rect::new(f.l + st.row_l, y - 1.0, f.l + st.row_r, y + 1.0);
                 rt.FillRoundedRectangle(&rounded(line, 1.0), &self.accent);
             }
             rt.PopAxisAlignedClip();
         }
     }
 
-    /// The name at the left of a row and `right` (a length or time) at its right edge.
+    /// The name at the left of a row and `right` (a length or time) at its right edge. `l` is
+    /// the queue's left edge.
+    #[allow(clippy::too_many_arguments)]
     unsafe fn row_text(
         &self,
         rt: &ID2D1RenderTarget,
+        st: &Style,
+        l: f32,
         r: &Rect,
         name: &str,
         right: &str,
@@ -596,11 +676,10 @@ impl Painter {
         right_fg: &ID2D1SolidColorBrush,
     ) {
         let p = &self.queue;
-        let l = r.l - ROW_L;
         unsafe {
-            let tr = Rect::new(l + NAME_X, r.t, l + TIME_R - 80.0, r.b);
+            let tr = Rect::new(l + st.name_x, r.t, l + st.time_r - 80.0, r.b);
             self.put(rt, name, &p.text, tr, fg);
-            let tr = Rect::new(l + TIME_R - 76.0, r.t, l + TIME_R, r.b);
+            let tr = Rect::new(l + st.time_r - 76.0, r.t, l + st.time_r, r.b);
             self.put(rt, right, &p.text_r, tr, right_fg);
         }
     }
@@ -617,8 +696,9 @@ impl Painter {
         hovered: bool,
     ) {
         let p = &self.queue;
+        let st = s.layout.queue.style;
         let item = &d.items[i];
-        let l = r.l - ROW_L;
+        let l = s.layout.queue.frame.l;
         let cy = (r.t + r.b) / 2.0;
         let current = d.current == Some(i);
         let (fg, right_fg) = match (current, hovered, item.watched) {
@@ -633,20 +713,20 @@ impl Painter {
             } else {
                 &p.handle
             };
-            self.glyph(ctx, handle, l + HANDLE_X, cy, 24.0);
+            self.glyph(ctx, handle, l + st.handle_x, cy, 24.0);
             let length = item.duration.map(duration_text).unwrap_or_default();
             let right = if hovered { "" } else { &length };
-            self.row_text(rt, &r, &item.name, right, fg, right_fg);
+            self.row_text(rt, &st, l, &r, &item.name, right, fg, right_fg);
             if hovered {
                 if s.hover == Some(Hit::Queue(Target::More(i))) {
-                    let b = Rect::around(l + MORE_X, cy, 28.0);
+                    let b = Rect::around(l + st.more_x, cy, 28.0);
                     rt.FillRoundedRectangle(&rounded(b, 4.0), &self.hover);
                 }
-                self.glyph(ctx, &p.more, l + MORE_X, cy, 18.0);
+                self.glyph(ctx, &p.more, l + st.more_x, cy, 18.0);
             }
             // The playing row's progress, as an orange underline.
             if current {
-                let track = Rect::new(l + NAME_X, r.b - 7.0, l + TIME_R, r.b - 5.0);
+                let track = Rect::new(l + st.name_x, r.b - 7.0, l + st.time_r, r.b - 5.0);
                 rt.FillRoundedRectangle(&rounded(track, 1.0), &self.played);
                 let fraction = if s.duration > 0.0 {
                     (s.position / s.duration).clamp(0.0, 1.0) as f32
@@ -696,14 +776,19 @@ impl Painter {
     ) {
         let (g, p) = (&s.layout.queue, &self.queue);
         let f = g.frame;
-        let cy = f.t + TOOLBAR_Y;
+        let cy = f.t + g.style.toolbar_y;
         let text = match g.tab {
             Tab::Queue => summary(d),
             Tab::Bookmarks => plural(d.bookmarks.len(), "bookmark"),
             Tab::Chapters => plural(d.chapters.len(), "chapter"),
         };
         unsafe {
-            let tr = Rect::new(f.l + 28.0, cy - 12.0, f.l + 190.0, cy + 12.0);
+            let tr = Rect::new(
+                f.l + g.style.handle_x - 7.5,
+                cy - 12.0,
+                f.l + 190.0,
+                cy + 12.0,
+            );
             self.put(rt, &text, &p.text, tr, &p.dim);
             for (tool, r) in &g.tools {
                 let svg = match tool {
@@ -779,7 +864,7 @@ mod tests {
         assert_eq!(row(3), Some(Hit::Queue(Target::Row(3))));
         assert_eq!(row(4), Some(Hit::Queue(Target::Body)));
         assert_eq!(
-            l.hit(1500.0 + MORE_X, 61.0 + 181.5),
+            l.hit(1500.0 + PANEL.more_x, 61.0 + 181.5),
             Some(Hit::Queue(Target::More(1)))
         );
         assert_eq!(
@@ -794,7 +879,7 @@ mod tests {
             Some(Hit::Queue(Target::Body))
         );
         assert_eq!(
-            l.hit(1500.0 + MORE_X, 61.0 + 137.5),
+            l.hit(1500.0 + PANEL.more_x, 61.0 + 137.5),
             Some(Hit::Queue(Target::Row(0)))
         );
     }
@@ -803,7 +888,7 @@ mod tests {
     fn drop_gaps_and_scrolling() {
         let l = open(Tab::Queue);
         let g = &l.queue;
-        let top = 61.0 + LIST_TOP + FIRST_ROW;
+        let top = 61.0 + PANEL.list_top + FIRST_ROW;
         assert_eq!(g.gap_at(top - 30.0), 0);
         assert_eq!(g.gap_at(top + ROW * 1.4), 1);
         assert_eq!(g.gap_at(top + ROW * 2.6), 3);

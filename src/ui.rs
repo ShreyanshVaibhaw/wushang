@@ -7,6 +7,7 @@
 mod browse;
 pub mod dialog;
 pub mod menu;
+pub mod mini;
 pub mod panels;
 pub mod preferences;
 pub mod queue;
@@ -167,8 +168,12 @@ pub enum Hit {
     HeaderMore,
     /// An entry of `Browse::entries`.
     Entry(usize),
-    /// The mini player: back to the player page.
+    /// The library's mini player card outside its buttons: back to the player page.
     Card,
+    /// The mini player's close: stops playback.
+    MiniClose,
+    /// The mini player's expand: back to the full player.
+    MiniExpand,
     /// The overlay panel's "open in library" button.
     OpenLibrary,
     /// The overlay panel outside its buttons and entries.
@@ -196,6 +201,8 @@ pub enum Page {
     #[default]
     Library,
     Player,
+    /// The mini player window.
+    Mini,
 }
 
 /// Where everything sits for one window size.
@@ -211,6 +218,8 @@ pub struct Layout {
     current: Rect,
     duration: Rect,
     volume: Rect,
+    /// The mini player card: the library's while something plays, or the whole mini window.
+    card: Option<mini::Card>,
     browse: browse::Geometry,
     panels: panels::Geometry,
     queue: queue::Geometry,
@@ -267,6 +276,7 @@ impl Layout {
             track: Rect::new(254.0, cy - 14.0, w - 428.0, cy + 14.0),
             duration: Rect::new(w - 420.0, cy - 14.0, w - 344.0, cy + 14.0),
             volume: Rect::new(w - 292.0, cy - 14.0, w - 204.0, cy + 14.0),
+            card: None,
             browse: Default::default(),
             panels: Default::default(),
             queue: Default::default(),
@@ -304,6 +314,12 @@ impl Layout {
         }
         if self.page == Page::Library {
             return self.browse_hit(x, y);
+        }
+        if self.page == Page::Mini {
+            if let Some(target) = self.queue.hit(x, y) {
+                return Some(Hit::Queue(target));
+            }
+            return self.card.and_then(|c| c.hit(x, y));
         }
         if let Some(target) = self.panels.hit(x, y) {
             return Some(Hit::Popup(target));
@@ -575,7 +591,7 @@ impl Ui {
             2 => true,
             _ => false,
         };
-        stay || self.page == Page::Library
+        stay || self.page != Page::Player
             || self.menu.is_open()
             || self.overlay
             || self.panels.open.is_some()
@@ -1164,6 +1180,7 @@ pub struct Painter {
     menu: menu::Resources,
     dialog: dialog::Resources,
     prefs: preferences::Resources,
+    mini: mini::Resources,
     /// Thumbnails by file; None means the file has no picture.
     thumbs: HashMap<PathBuf, Option<ID2D1Bitmap>>,
     /// Visible files without a thumbnail yet, collected while painting.
@@ -1204,6 +1221,7 @@ impl Painter {
             menu: menu::Resources::new(ctx, &dwrite, &fonts)?,
             dialog: dialog::Resources::new(ctx, &factory, &dwrite, &fonts)?,
             prefs: preferences::Resources::new(ctx, &dwrite, &fonts)?,
+            mini: mini::Resources::new(ctx, &dwrite, &fonts)?,
             captions: crate::captions::CaptionRenderer::new(ctx, &dwrite, Some(&fonts))?,
             stats_text: {
                 let f = text_format(
@@ -1291,7 +1309,13 @@ impl Painter {
     }
 
     /// Lays out the library page; it needs DirectWrite to measure the breadcrumb.
-    pub fn library_layout(&self, width: f32, height: f32, browse: &Browse, card: bool) -> Layout {
+    pub fn library_layout(
+        &self,
+        width: f32,
+        height: f32,
+        browse: &Browse,
+        card: Option<bool>,
+    ) -> Layout {
         browse::layout(self, width, height, browse, card)
     }
 
@@ -1315,8 +1339,10 @@ impl Painter {
     }
 
     fn paint_page(&mut self, ctx: &ID2D1DeviceContext5, s: &Scene) -> Result<()> {
-        if s.layout.page == Page::Library {
-            return self.paint_library(ctx, s);
+        match s.layout.page {
+            Page::Library => return self.paint_library(ctx, s),
+            Page::Mini => return self.paint_mini(ctx, s),
+            Page::Player => {}
         }
         let rt: &ID2D1RenderTarget = ctx;
         let l = s.layout;
@@ -1386,7 +1412,7 @@ impl Painter {
         }
         // Fullscreen hide-UI mode shows the video edge to edge, without rounded corners.
         let radius = match l.page {
-            Page::Library => 4.0,
+            Page::Library | Page::Mini => 4.0,
             Page::Player if l.video.l <= 0.0 => 0.0,
             Page::Player => VIDEO_RADIUS,
         };
