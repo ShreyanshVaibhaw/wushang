@@ -659,7 +659,7 @@ mod tests {
                     sparse: false,
                 }])),
                 shared.clone(),
-                player::Role::Main(None),
+                player::Role::Main(Vec::new()),
             ),
         ]
     }

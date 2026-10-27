@@ -23,6 +23,7 @@ mod record;
 mod render;
 mod session;
 mod snapshot;
+mod stream;
 mod subs;
 mod tags;
 mod thumbs;
@@ -224,6 +225,9 @@ struct App {
     capture_devices: Arc<Mutex<Vec<capture::Device>>>,
     /// The conversion running, one at a time.
     converting: Option<convert::Job>,
+    /// The HTTP server players connect to while streaming out, and where its errors come back.
+    stream_server: Option<stream::Server>,
+    stream_control: Option<record::Control>,
 }
 
 struct Opening {
@@ -452,18 +456,58 @@ impl App {
 
     /// Shows how the last recording ended, once its file is closed.
     fn take_recordings(&mut self) {
-        let Some(control) = &self.record_control else {
+        if let Some(control) = &self.record_control {
+            let done = std::mem::take(&mut control.lock().unwrap().done);
+            for result in done {
+                let line = match result {
+                    Ok(path) => format!("Recording saved to {}", path.display()),
+                    Err(e) => format!("Can't record: {e}"),
+                };
+                self.notice = Some((line, Instant::now()));
+                UI.with_borrow_mut(|ui| ui.dirty = true);
+            }
+        }
+        if let Some(control) = &self.stream_control {
+            let done = std::mem::take(&mut control.lock().unwrap().done);
+            for e in done.into_iter().filter_map(Result::err) {
+                self.notice = Some((format!("Can't stream: {e}"), Instant::now()));
+                UI.with_borrow_mut(|ui| ui.dirty = true);
+            }
+        }
+        // The stream ended with its media, or failed: let the players go.
+        if self.stream_server.is_some() && !self.session.as_ref().is_some_and(Session::streaming) {
+            self.stream_server = None;
+        }
+    }
+
+    /// Starts streaming the open media to other devices over HTTP, or stops.
+    fn toggle_stream(&mut self) {
+        self.take_recordings();
+        let Some(session) = &self.session else {
             return;
         };
-        let done = std::mem::take(&mut control.lock().unwrap().done);
-        for result in done {
-            let line = match result {
-                Ok(path) => format!("Recording saved to {}", path.display()),
-                Err(e) => format!("Can't record: {e}"),
-            };
-            self.notice = Some((line, Instant::now()));
-            UI.with_borrow_mut(|ui| ui.dirty = true);
+        if session.streaming() {
+            session.set_streaming(None);
+            self.stream_server = None;
+            self.notice = Some(("Streaming stopped".to_owned(), Instant::now()));
+            return;
         }
+        // Every network interface, so other devices reach it; Windows may ask to let it through.
+        let server = match stream::Server::start(std::net::Ipv4Addr::UNSPECIFIED.into()) {
+            Ok(server) => server,
+            Err(e) => {
+                self.notice = Some((format!("Can't stream ({e})"), Instant::now()));
+                return;
+            }
+        };
+        session.set_streaming(Some(server.broadcast.clone()));
+        self.stream_control = Some(session.stream_control());
+        let line = format!(
+            "Streaming at {}: open it in a player on another device",
+            server.url()
+        );
+        self.notice = Some((line, Instant::now()));
+        self.stream_server = Some(server);
     }
 
     fn stop(&mut self) {
@@ -600,6 +644,10 @@ impl App {
             eq_preamp: eq.preamp - dsp::PREAMP_UNITY_DB,
             two_pass: eq.two_pass,
             recording: self.session.as_ref().is_some_and(Session::recording),
+            // The address to open, and how many players have it open.
+            streaming: (self.stream_server.as_ref())
+                .filter(|_| self.session.as_ref().is_some_and(Session::streaming))
+                .map(|s| (s.url(), s.broadcast.players())),
             stereo: StereoMode::ALL
                 .iter()
                 .position(|m| *m == effects.stereo())
@@ -1133,6 +1181,8 @@ fn run() -> Result<(), Box<dyn Error>> {
         record_control: None,
         capture_devices: Arc::default(),
         converting: None,
+        stream_server: None,
+        stream_control: None,
     };
     refresh_devices(&app.capture_devices);
     app.queue.set_repeat(REPEAT[settings.repeat.min(2)]);
@@ -2024,6 +2074,23 @@ fn menu_action(app: &mut App, hwnd: HWND, action: MenuAction) {
         MenuAction::OpenNetwork => open_dialog(app, Dialog::Address(NetKind::Stream)),
         MenuAction::Snapshot => WANT_SNAPSHOT.set(true),
         MenuAction::Record => app.toggle_record(),
+        MenuAction::Stream => app.toggle_stream(),
+        MenuAction::StreamFile(path) => {
+            if app.session.as_ref().is_none_or(|s| s.path != path) {
+                let place = UI.with_borrow(|ui| ui.browse.place.clone());
+                let mut queue = app.library.media_in(&place);
+                if !queue.contains(&path) {
+                    queue = vec![path.clone()];
+                }
+                if !app.play(&path, queue) {
+                    return;
+                }
+                show_player();
+            }
+            if !app.session.as_ref().is_some_and(Session::streaming) {
+                app.toggle_stream();
+            }
+        }
         MenuAction::Convert(path, target) => app.convert(&path, target),
         MenuAction::ConvertOpen => {
             if let Some(path) = app.session.as_ref().map(|s| s.path.clone())

@@ -76,6 +76,10 @@ pub enum MenuAction {
     Snapshot,
     /// Starts recording what plays, or stops.
     Record,
+    /// Starts streaming what plays to other devices, or stops.
+    Stream,
+    /// Plays a file and streams it.
+    StreamFile(PathBuf),
     /// Plays a capture device: its address and its name.
     OpenCapture(String, String),
     /// Converts a file into an MP4 or an MP3.
@@ -965,6 +969,23 @@ pub fn player_menu(d: &PanelData, paused: bool) -> Vec<Item> {
         )
         .icon(Icon::Record)
         .key("R"),
+        match &d.streaming {
+            None => Item::new("Stream to Other Devices", MenuAction::Stream),
+            // The address to open elsewhere, shown while it serves.
+            Some((url, players)) => Item::submenu(
+                "Streaming",
+                vec![
+                    Item::off(url.clone()),
+                    Item::off(match players {
+                        0 => "No players yet".to_owned(),
+                        1 => "1 player connected".to_owned(),
+                        n => format!("{n} players connected"),
+                    }),
+                    Item::new("Stop Streaming", MenuAction::Stream),
+                ],
+            ),
+        }
+        .icon(Icon::Network),
         Item::divider(),
         Item::new("Hide UI", MenuAction::HideUi)
             .icon(Icon::HideUi)
@@ -1085,8 +1106,7 @@ fn file_menu(path: &Path, playlists: &[String], within: Option<&str>) -> Vec<Ite
         Item::new("Play", MenuAction::Play(path.to_owned())).icon(Icon::Play),
         Item::new("Mark as Watched", MenuAction::MarkWatched(path.to_owned())).icon(Icon::Watched),
         Item::new("Favorite", MenuAction::Favorite(path.to_owned())).icon(Icon::Heart),
-        // ponytail: streaming out needs a server side (an HTTP or RTSP output); VLC's sout has one.
-        Item::off("Stream").icon(Icon::Network),
+        Item::new("Stream", MenuAction::StreamFile(path.to_owned())).icon(Icon::Network),
         Item::submenu("Convert", convert_menu(path)).icon(Icon::Convert),
         Item::new("Add to Queue", MenuAction::AddToQueue(one())).icon(Icon::Queue),
         Item::submenu("Add to Playlist", add).icon(Icon::Playlist),

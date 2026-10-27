@@ -59,7 +59,7 @@ The title bar has minimize, maximize, fullscreen and close, and dragging it move
 While playing, the bars hide after 3 seconds without mouse movement and the video fills the window inside a 10 px rounded frame; moving the mouse brings them back.
 The "…" button opens the main menu from the design: open files, open a folder, recent files, settings profiles, keyboard shortcuts, Customize Player, Settings and About.
 Right-clicking the video opens the player menu: play, stop, previous, next, hide the controls, the mini player, and submenus for speed and sleep timer, video tracks and transforms, audio tracks, stereo mode and output device, subtitles, the settings tabs, the queue, and opening media.
-Items for features myvlc doesn't have (discs, streaming out) are shown dimmed.
+Items for features myvlc doesn't have (discs) are shown dimmed.
 
 The playlist button opens the queue panel from the design, in the settings panel's place, with three tabs:
 
@@ -156,6 +156,15 @@ Feeds and the directory load over WinHTTP on a background thread, so the window 
 "Open Capture Device" in the "..." menu lists the cameras, capture cards and microphones DirectShow sees, and the screen.
 Picking one plays it live, and Record saves it like any other media.
 The list is gathered in the background and again each time the menu opens, so a camera plugged in later shows up.
+
+### Streaming to other devices
+
+"Stream to Other Devices" in the player menu, or "Stream" in a file's right-click menu, serves what plays over HTTP as MPEG-TS, copied without re-encoding, to any number of players on the network: VLC, mpv, Kodi or a TV opens the address the corner shows, like `http://192.168.1.101:8080/`.
+While it runs, the player menu's "Streaming" submenu shows that address, how many players are connected, and Stop Streaming; the stream also stops with its media.
+Like a recording it follows playback, so pausing or seeking here pauses or moves the stream.
+H.264 and HEVC get their parameter sets repeated before every keyframe, so a player that connects midway starts playing at the next one.
+MPEG-TS can't carry VP9, AV1 or the lossless audio formats; such media says so, and converting it to MP4 first works.
+Windows may ask once whether to let myvlc through its firewall, since other devices connect to it.
 
 ### Converting
 

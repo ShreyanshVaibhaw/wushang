@@ -60,6 +60,8 @@ pub struct PanelData {
     pub two_pass: bool,
     /// The open file is being recorded.
     pub recording: bool,
+    /// While streaming out: the address players open, and how many have it open.
+    pub streaming: Option<(String, usize)>,
     /// Index into `STEREO`.
     pub stereo: usize,
     /// 0 none, 1 horizontal, 2 vertical.

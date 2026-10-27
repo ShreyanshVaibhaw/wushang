@@ -500,25 +500,26 @@ pub fn spawn_demuxer(
     shared: Arc<Shared>,
     role: Role,
 ) -> JoinHandle<()> {
-    let (follower, record) = match role {
-        Role::Main(record) => (false, record),
-        Role::Follower => (true, None),
+    let (follower, copies) = match role {
+        Role::Main(copies) => (false, copies),
+        Role::Follower => (true, Vec::new()),
     };
     // Read before the thread starts, which may be after the seek that selects this file's track.
     let mut followed = shared.serial.load(Relaxed);
     thread::spawn(move || {
         let mut eof = false;
-        let mut recorder: Option<record::Recorder> = None;
-        // Where playback is in the input, for the recorder; the clock is unknown just after a
+        // A recording and a stream, each running or not.
+        let mut recorders: Vec<Option<record::Recorder>> = copies.iter().map(|_| None).collect();
+        // Where playback is in the input, for the recorders; the clock is unknown just after a
         // seek, and the last value stands in.
         let mut playhead = 0.0;
         while !shared.quitting() {
-            if let Some(control) = &record {
-                playhead = shared.clock.get().unwrap_or(playhead);
-                if record::sync(&mut recorder, control, &input, playhead) {
+            playhead = shared.clock.get().unwrap_or(playhead);
+            for (control, recorder) in copies.iter().zip(&mut recorders) {
+                if record::sync(recorder, control, &input, playhead) {
                     shared.seek_by(0.0);
                 }
-                if let Some(r) = &mut recorder {
+                if let Some(r) = recorder {
                     r.play_to(playhead);
                 }
             }
@@ -556,7 +557,7 @@ pub fn spawn_demuxer(
                 if !follower {
                     shared.clock.invalidate();
                 }
-                if let Some(r) = &mut recorder {
+                for r in recorders.iter_mut().flatten() {
                     r.seeked();
                 }
                 eof = false;
@@ -577,7 +578,7 @@ pub fn spawn_demuxer(
             let mut packet = ff::Packet::empty();
             match packet.read(&mut input) {
                 Ok(()) => {
-                    if let Some(r) = &mut recorder {
+                    for r in recorders.iter_mut().flatten() {
                         r.push(&packet);
                     }
                     let routes = routes.lock().unwrap();
@@ -597,8 +598,8 @@ pub fn spawn_demuxer(
             }
         }
         // The media closed, at its end (the recording ends with it, as in VLC) or before.
-        if let Some(control) = &record {
-            record::stop(&mut recorder, control, playhead);
+        for (control, recorder) in copies.iter().zip(&mut recorders) {
+            record::stop(recorder, control, playhead);
         }
     })
 }
@@ -606,7 +607,8 @@ pub fn spawn_demuxer(
 /// Which demuxer a thread is: the open file's, which owns seeks and can record, or a second
 /// file's (an external audio track) that follows its seeks.
 pub enum Role {
-    Main(Option<record::Control>),
+    /// With the controls of its copies: recording and streaming out.
+    Main(Vec<record::Control>),
     Follower,
 }
 

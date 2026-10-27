@@ -166,8 +166,9 @@ pub struct Session {
     initial_subtitles: Option<SubtitleStream>,
     /// Set on drop, so a network read that hangs gives up and the demuxer can be joined.
     cancel: Arc<AtomicBool>,
-    /// Asks the demuxer to record, and hears back when a recording is done.
+    /// Ask the demuxer to record or stream out, and hear back when that ends.
     record: record::Control,
+    stream: record::Control,
 }
 
 impl Session {
@@ -333,6 +334,7 @@ impl Session {
             initial_subtitles: None,
             cancel,
             record: record::Control::default(),
+            stream: record::Control::default(),
         };
         if let Some(stream) = video {
             let decoder = session.open_video(stream)?;
@@ -355,7 +357,7 @@ impl Session {
             input,
             session.routes.clone(),
             shared.clone(),
-            player::Role::Main(Some(session.record.clone())),
+            player::Role::Main(vec![session.record.clone(), session.stream.clone()]),
         ));
         Ok(session)
     }
@@ -664,16 +666,30 @@ impl Session {
 
     /// Records from here on into `path`, or stops recording with None.
     pub fn set_recording(&self, path: Option<PathBuf>) {
-        self.record.lock().unwrap().want = path;
+        self.record.lock().unwrap().want = path.map(record::Sink::File);
     }
 
     pub fn recording(&self) -> bool {
         self.record.lock().unwrap().want.is_some()
     }
 
-    /// The control the demuxer reports finished recordings through, which outlives the session.
+    /// Streams out to `broadcast`'s players from here on, or stops with None.
+    pub fn set_streaming(&self, broadcast: Option<Arc<crate::stream::Broadcast>>) {
+        self.stream.lock().unwrap().want = broadcast.map(record::Sink::Stream);
+    }
+
+    pub fn streaming(&self) -> bool {
+        self.stream.lock().unwrap().want.is_some()
+    }
+
+    /// The controls the demuxer reports through (recording, streaming), which outlive the
+    /// session.
     pub fn record_control(&self) -> record::Control {
         self.record.clone()
+    }
+
+    pub fn stream_control(&self) -> record::Control {
+        self.stream.clone()
     }
 
     /// Start in seconds and title of each chapter, read when the file opened.
