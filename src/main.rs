@@ -444,6 +444,27 @@ impl App {
                     self.show_external(Some(i));
                 }
             }
+            PanelAction::AddAudioFile => {
+                let filters = [
+                    ("Audio files", file_spec(library::AUDIO_EXTS)),
+                    ("Video files", file_spec(library::VIDEO_EXTS)),
+                    ("All files", "*.*".to_owned()),
+                ];
+                let Some(path) = pick_files(hwnd, &filters, false).pop() else {
+                    return;
+                };
+                let Some(session) = self.session.as_mut() else {
+                    return;
+                };
+                match session.add_audio_file(&path) {
+                    Ok(stream) => {
+                        let audio = session.tracks(TrackKind::Audio);
+                        let i = audio.iter().position(|t| t.stream == stream);
+                        self.select_track(TrackTab::Audio, i);
+                    }
+                    Err(e) => eprintln!("audio: {e}"),
+                }
+            }
             PanelAction::SelectDevice(i) => {
                 // The list starts with the system default, which also follows Windows' choice.
                 let name = (i > 0).then(|| self.devices.get(i)).flatten();
@@ -2119,15 +2140,20 @@ fn add_files_to_playlist(app: &mut App, hwnd: HWND, name: &str) {
     UI.with_borrow_mut(|ui| ui.browse.stale = true);
 }
 
+/// "*.a;*.b" for a file picker filter.
+fn file_spec(exts: &[&str]) -> String {
+    exts.iter()
+        .map(|e| format!("*.{e}"))
+        .collect::<Vec<_>>()
+        .join(";")
+}
+
 /// The system file picker for video and audio files, several at once.
 fn pick_media_files(hwnd: HWND) -> Vec<PathBuf> {
-    let spec = |exts: &[&str]| {
-        exts.iter()
-            .map(|e| format!("*.{e}"))
-            .collect::<Vec<_>>()
-            .join(";")
-    };
-    let (video, audio) = (spec(library::VIDEO_EXTS), spec(library::AUDIO_EXTS));
+    let (video, audio) = (
+        file_spec(library::VIDEO_EXTS),
+        file_spec(library::AUDIO_EXTS),
+    );
     let filters = [
         ("Media files", format!("{video};{audio}")),
         ("Video files", video),

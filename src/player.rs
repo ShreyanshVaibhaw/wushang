@@ -479,28 +479,55 @@ pub type Routes = Arc<Mutex<Vec<Route>>>;
 
 /// Reads packets and routes them by stream index. Also performs seeks, since only this thread
 /// touches the format context.
+///
+/// A `follower` reads a second file played alongside, like an external audio track. It leaves
+/// seek requests to the main demuxer and seeks its own file after each one, to the same target
+/// and under the same serial, so its decoder flushes and drops stale samples like the others.
 pub fn spawn_demuxer(
     mut input: ff::format::context::Input,
     routes: Routes,
     shared: Arc<Shared>,
+    follower: bool,
 ) -> JoinHandle<()> {
+    // Read before the thread starts, which may be after the seek that selects this file's track.
+    let mut followed = shared.serial.load(Relaxed);
     thread::spawn(move || {
         let mut eof = false;
         while !shared.quitting() {
-            if let Some(target) = shared.take_seek() {
+            let target = if follower {
+                let now = shared.serial.load(Relaxed);
+                (now != followed).then(|| {
+                    followed = now;
+                    shared.seek_floor()
+                })
+            } else {
+                shared.take_seek()
+            };
+            if let Some(target) = target {
                 // Lands on the keyframe at or before the target; the decoders skip up to the target.
                 let ts = (target.max(0.0) * f64::from(ffi::AV_TIME_BASE)) as i64;
-                if let Err(e) = input.seek(ts, ..ts + 1) {
+                let played = routes.lock().unwrap().first().map(|r| r.stream);
+                let sought = match played.filter(|_| follower) {
+                    Some(stream) => seek_stream(&mut input, stream, ts),
+                    None => input.seek(ts, ..ts + 1),
+                };
+                if let Err(e) = sought {
                     eprintln!("seek to {target:.1}s failed: {e}");
                     continue;
                 }
-                shared.seek_floor.store(target.max(0.0).to_bits(), Relaxed);
-                let serial = shared.serial.fetch_add(1, Relaxed) + 1;
+                let serial = if follower {
+                    followed
+                } else {
+                    shared.seek_floor.store(target.max(0.0).to_bits(), Relaxed);
+                    shared.serial.fetch_add(1, Relaxed) + 1
+                };
                 for r in routes.lock().unwrap().iter() {
                     r.queue.clear();
                     r.queue.push(Msg::Flush(serial));
                 }
-                shared.clock.invalidate();
+                if !follower {
+                    shared.clock.invalidate();
+                }
                 eof = false;
             }
 
@@ -534,6 +561,27 @@ pub fn spawn_demuxer(
             }
         }
     })
+}
+
+/// Seeks `input` to the keyframe of `stream` at or before `ts` (in `AV_TIME_BASE` units). A file
+/// with video otherwise seeks on that video's keyframes, which can be seconds before `ts`.
+fn seek_stream(
+    input: &mut ff::format::context::Input,
+    stream: usize,
+    ts: i64,
+) -> Result<(), ff::Error> {
+    unsafe {
+        let ctx = input.as_mut_ptr();
+        let base = ffi::AVRational {
+            num: 1,
+            den: ffi::AV_TIME_BASE,
+        };
+        let ts = ffi::av_rescale_q(ts, base, (**(*ctx).streams.add(stream)).time_base);
+        match ffi::avformat_seek_file(ctx, stream as i32, i64::MIN, ts, ts, 0) {
+            e if e < 0 => Err(ff::Error::from(e)),
+            _ => Ok(()),
+        }
+    }
 }
 
 /// `decoder`'s stream reopened for software decoding on every core (libdav1d for AV1).

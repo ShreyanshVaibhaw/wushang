@@ -85,6 +85,7 @@ pub enum PanelAction {
     SelectTrack(TrackTab, Option<usize>),
     SelectExternal(Option<usize>),
     AddSubtitleFile,
+    AddAudioFile,
     SelectDevice(usize),
     RefreshDevices,
     SetSpeed(f32),

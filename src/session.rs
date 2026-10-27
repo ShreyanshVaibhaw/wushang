@@ -56,6 +56,17 @@ struct Decoder {
     thread: JoinHandle<()>,
 }
 
+/// An audio file played alongside the open one, like VLC's "Add audio track". Its streams
+/// are numbered from `EXTERNAL` * (its place in `Session::externals` + 1), so they never meet
+/// the open file's own stream numbers.
+struct External {
+    path: PathBuf,
+    routes: Routes,
+    demuxer: JoinHandle<()>,
+}
+
+const EXTERNAL: usize = 1 << 16;
+
 /// Which tracks a file starts with, from Settings.
 #[derive(Clone, Debug)]
 pub struct TrackChoice {
@@ -96,6 +107,7 @@ pub struct Session {
     codecs: HashMap<usize, Codec>,
     routes: Routes,
     demuxer: Option<JoinHandle<()>>,
+    externals: Vec<External>,
     video_track: Option<Decoder>,
     audio_track: Option<Decoder>,
     subtitle_track: Option<(usize, Arc<PacketQueue>)>,
@@ -220,6 +232,7 @@ impl Session {
             codecs,
             routes: Arc::new(Mutex::new(Vec::new())),
             demuxer: None,
+            externals: Vec::new(),
             video_track: None,
             audio_track: None,
             subtitle_track: None,
@@ -246,6 +259,7 @@ impl Session {
             input,
             session.routes.clone(),
             shared.clone(),
+            false,
         ));
         Ok(session)
     }
@@ -380,7 +394,8 @@ impl Session {
     }
 
     fn route(&self, stream: usize, queue: &Arc<PacketQueue>, sparse: bool) {
-        self.routes.lock().unwrap().push(Route {
+        let (routes, stream) = self.routes_for(stream);
+        routes.lock().unwrap().push(Route {
             stream,
             queue: queue.clone(),
             sparse,
@@ -388,7 +403,90 @@ impl Session {
     }
 
     fn unroute(&self, stream: usize) {
-        self.routes.lock().unwrap().retain(|r| r.stream != stream);
+        let (routes, stream) = self.routes_for(stream);
+        routes.lock().unwrap().retain(|r| r.stream != stream);
+    }
+
+    /// The demuxer routes carrying `stream`, and its number in that demuxer's file.
+    fn routes_for(&self, stream: usize) -> (&Routes, usize) {
+        match (stream / EXTERNAL).checked_sub(1) {
+            Some(n) => (&self.externals[n].routes, stream % EXTERNAL),
+            None => (&self.routes, stream),
+        }
+    }
+
+    /// Adds the audio tracks of the file at `path` to the audio track list, played in sync
+    /// with the open file from its own demuxer. Returns the first new track's stream.
+    pub fn add_audio_file(&mut self, path: &Path) -> Result<usize, String> {
+        // Added before: its first track. Every added file has at least one.
+        if let Some(n) = self.externals.iter().position(|e| e.path == path) {
+            let audio = self.tracks(TrackKind::Audio).iter();
+            let first = audio.map(|t| t.stream).find(|s| s / EXTERNAL == n + 1);
+            return first.ok_or_else(|| format!("{path:?} has no audio track"));
+        }
+        let base = EXTERNAL * (self.externals.len() + 1);
+        let input = ff::format::input(path).map_err(|e| format!("cannot open {path:?}: {e}"))?;
+        let name = path
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned();
+        let mut added = Vec::new();
+        let mut titles = Vec::new();
+        for stream in input.streams() {
+            let parameters = stream.parameters();
+            if parameters.medium() != ff::media::Type::Audio
+                || parameters.id() == ff::codec::Id::None
+            {
+                continue;
+            }
+            let metadata = stream.metadata();
+            let tag = |key: &str| {
+                metadata
+                    .get(key)
+                    .map(str::trim)
+                    .filter(|v| !v.is_empty())
+                    .map(str::to_owned)
+            };
+            titles.push(tag("title"));
+            added.push(TrackInfo {
+                stream: base + stream.index(),
+                label: String::new(),
+                language: tag("language").filter(|l| !l.eq_ignore_ascii_case("und")),
+                codec: parameters.id().name().to_owned(),
+                default: false,
+            });
+            self.codecs.insert(
+                base + stream.index(),
+                Codec {
+                    parameters: parameters.clone(),
+                    time_base: stream.time_base(),
+                    frame_rate: stream.avg_frame_rate(),
+                },
+            );
+        }
+        let Some(first) = added.first().map(|t| t.stream) else {
+            return Err(format!("{name} has no audio track"));
+        };
+        // One track goes by the file's name; several also say which one they are.
+        label_tracks(&mut added, &titles);
+        let several = added.len() > 1;
+        for t in &mut added {
+            t.label = if several {
+                format!("{name} - {}", t.label)
+            } else {
+                name.clone()
+            };
+        }
+        self.tracks[TrackKind::Audio as usize].extend(added);
+        let routes: Routes = Arc::new(Mutex::new(Vec::new()));
+        let demuxer = player::spawn_demuxer(input, routes.clone(), self.shared.clone(), true);
+        self.externals.push(External {
+            path: path.to_owned(),
+            routes,
+            demuxer,
+        });
+        Ok(first)
     }
 }
 
@@ -494,7 +592,14 @@ impl Drop for Session {
         self.shared.stopping.store(true, Relaxed);
         let decoders = [self.video_track.take(), self.audio_track.take()];
         let threads = decoders.into_iter().flatten().map(|d| d.thread);
-        for t in self.demuxer.take().into_iter().chain(threads) {
+        let externals = self.externals.drain(..).map(|e| e.demuxer);
+        for t in self
+            .demuxer
+            .take()
+            .into_iter()
+            .chain(externals)
+            .chain(threads)
+        {
             _ = t.join();
         }
         if let Some((_, packets)) = self.subtitle_track.take() {
@@ -943,6 +1048,46 @@ mod tests {
             assert!(p.shared.audio_done.load(Relaxed));
         }
         assert!(p.shared.video_done.load(Relaxed));
+    }
+
+    #[test]
+    fn plays_an_external_audio_file_in_sync() {
+        let data = Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata");
+        let mut p = Player::start();
+        assert!(p.advances(0.3), "playback never started");
+
+        let external = data.join("test_60s.mp4");
+        let stream = p.session().add_audio_file(&external).unwrap();
+        assert!(stream >= EXTERNAL);
+        let track = p.session().tracks(TrackKind::Audio).last().unwrap().clone();
+        assert_eq!(
+            (track.stream, track.label.as_str()),
+            (stream, "test_60s.mp4")
+        );
+        // Adding it again finds the same track; a file without sound adds nothing.
+        assert_eq!(p.session().add_audio_file(&external), Ok(stream));
+        assert!(
+            p.session()
+                .add_audio_file(&data.join("test_60s_noaudio.mp4"))
+                .is_err()
+        );
+        assert_eq!(p.session().tracks(TrackKind::Audio).len(), 3);
+
+        within(
+            Duration::from_secs(10),
+            "switching to the external file",
+            || p.session().select(TrackKind::Audio, Some(stream)).unwrap(),
+        );
+        assert_eq!(p.session().selected(TrackKind::Audio), Some(stream));
+        assert!(p.advances(0.3), "stalled on the external audio");
+        // A seek reaches the external file's demuxer too, and both play on from there.
+        p.shared.seek_to(1.5);
+        assert!(p.advances(0.3), "stalled after seeking");
+        // Audio restarts with the whole frame holding the target, a few ms early.
+        assert!(p.position() >= 1.4, "seek went to {:.2}", p.position());
+
+        p.session().select(TrackKind::Audio, Some(ENGLISH)).unwrap();
+        assert!(p.advances(0.3), "stalled after switching back");
     }
 
     #[test]

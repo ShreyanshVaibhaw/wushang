@@ -846,6 +846,8 @@ pub fn player_menu(d: &PanelData, paused: bool) -> Vec<Item> {
         })
         .collect();
     let audio = vec![
+        Item::new("Add Audio File...", panel(PanelAction::AddAudioFile)),
+        Item::divider(),
         Item::submenu(
             "Audio Track",
             tracks(TrackTab::Audio, &d.audio_tracks, d.audio_selected),

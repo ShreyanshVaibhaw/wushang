@@ -46,6 +46,8 @@ struct Span {
     frames: usize,
     start: f64,
     end: f64,
+    /// The seek these samples belong to; see the callback.
+    serial: u64,
 }
 
 impl Ring {
@@ -120,6 +122,7 @@ impl AudioRing {
                         frames,
                         start,
                         end,
+                        serial,
                     });
                 }
                 return;
@@ -275,6 +278,16 @@ impl Device {
             move |out, info| {
                 // ponytail: a mutex in the audio callback; move to a lock-free ring if it ever glitches.
                 let mut ring = feed.state.lock().unwrap();
+                // A seek made what is queued stale, and the decoder's flush hasn't reached it yet
+                // (sooner or later for a second file's demuxer). Playing it would also restart
+                // the clock the seek just stopped, at the old position.
+                if ring
+                    .spans
+                    .front()
+                    .is_some_and(|s| s.serial != shared.serial.load(Relaxed))
+                {
+                    ring.clear();
+                }
                 let n = if shared.paused.load(Relaxed) {
                     0
                 } else {
@@ -584,6 +597,7 @@ mod tests {
                 frames: 4800,
                 start: 10.0,
                 end: 10.15,
+                serial: 0,
             }]),
             format: None,
             generation: 0,
@@ -645,6 +659,7 @@ mod tests {
                     sparse: false,
                 }])),
                 shared.clone(),
+                false,
             ),
         ]
     }
