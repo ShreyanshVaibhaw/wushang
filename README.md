@@ -74,6 +74,7 @@ The playlist button opens the queue panel from the design, in the settings panel
 
 The audio and subtitle buttons open the track popup from the design: video, audio and subtitle tracks (with names like "English" from the file's language tags), the output device, and external subtitle files, with + to load one by hand.
 A subtitle file with the same name as the video, next to it or in a "Subs" folder, loads on its own, as in VLC.
+Old subtitle files in a Windows code page instead of UTF-8 are read in the right one: a language tag such as `film.ru.srt` names it, and otherwise myvlc tries the Western, Central European, Cyrillic, Greek, Turkish, Hebrew, Arabic, Baltic, Japanese, Chinese and Korean code pages and keeps the one whose text reads like real words.
 The gear opens the settings panel, with four tabs:
 
 - Playback: speed from 0.25x to 2x without changing pitch, a sleep timer, and playback statistics over the video.
@@ -322,7 +323,7 @@ Opening the audio device took 1.2 to 3.5 s in these runs, and playback starts mo
 Each of these is marked with a `ponytail:` comment in the code, along with the upgrade path.
 
 - ASS and SSA subtitles show as plain centred text: positioning, colours, style-sheet italics and karaoke are ignored (libass would add them).
-- Subtitle files in a code page other than UTF-8 or Windows-1252 don't load.
+- Without a language tag, traditional Chinese (Big5) subtitles read as simplified (GBK), and Turkish or Baltic ones as Western, since the same bytes are valid in both.
 - Contrast and saturation go up to 2x, like VLC's adjust filter; brightness and hue use the GPU's full range.
 - BT.2020 and HDR video show with BT.709/601 colours.
 - Software frames reach the GPU as 8-bit NV12, so 10-bit video loses its extra precision there, and 4K60 10-bit H.264 drops frames on a laptop CPU.

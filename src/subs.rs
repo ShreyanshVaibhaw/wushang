@@ -174,6 +174,13 @@ pub fn load_external(path: &Path) -> Result<Arc<Cues>, String> {
         .ok_or_else(|| format!("no subtitles in {path:?}"))?;
     let index = stream.index();
     let mut decoder = Decoder::open(stream.parameters(), f64::from(stream.time_base()))?;
+    // The whole file says far more about its code page than one cue does.
+    if decoder.plain_text
+        && let Ok(text) = std::fs::read(path)
+    {
+        let language = crate::codepage::language_of(path);
+        decoder.code_page = Some(crate::codepage::detect(&text, language.as_deref()));
+    }
     let cues = Cues::default();
     loop {
         let mut packet = ff::Packet::empty();
@@ -263,6 +270,8 @@ struct Decoder {
     hold: f64,
     /// Text codecs whose packets may arrive in a legacy code page instead of UTF-8.
     plain_text: bool,
+    /// The code page of a whole file's text, guessed up front; None guesses per packet.
+    code_page: Option<u32>,
 }
 
 impl Decoder {
@@ -287,17 +296,18 @@ impl Decoder {
             },
             // mov_text packets carry binary style records after the text.
             plain_text: text && id != ff::codec::Id::MOV_TEXT,
+            code_page: None,
         })
     }
 
     fn decode(&mut self, packet: &ff::Packet, cues: &Cues) {
-        // libavcodec rejects text that isn't UTF-8, and many old .srt files are Windows-1252.
-        // ponytail: other code pages (Cyrillic 1251, Shift-JIS...) still fail; detect the
-        // encoding (or build FFmpeg with iconv and set sub_charenc) if those files turn up.
+        // libavcodec rejects text that isn't UTF-8, and many old .srt files are in a Windows
+        // code page instead.
         let recoded;
         let packet = match packet.data() {
             Some(data) if self.plain_text && std::str::from_utf8(data).is_err() => {
-                recoded = recode_cp1252(packet, data);
+                let cp = (self.code_page).unwrap_or_else(|| crate::codepage::detect(data, None));
+                recoded = recode(packet, data, cp);
                 &recoded
             }
             _ => packet,
@@ -409,23 +419,10 @@ impl Drop for Subtitle {
     }
 }
 
-/// A copy of `packet` with its text converted from Windows-1252 to UTF-8.
-fn recode_cp1252(packet: &ff::Packet, data: &[u8]) -> ff::Packet {
-    // 0x80-0x9F differ from Latin-1: curly quotes, dashes, the euro sign. The rest maps directly.
-    const HIGH: [char; 32] = [
-        '\u{20AC}', '\u{81}', '\u{201A}', '\u{192}', '\u{201E}', '\u{2026}', '\u{2020}',
-        '\u{2021}', '\u{2C6}', '\u{2030}', '\u{160}', '\u{2039}', '\u{152}', '\u{8D}', '\u{17D}',
-        '\u{8F}', '\u{90}', '\u{2018}', '\u{2019}', '\u{201C}', '\u{201D}', '\u{2022}', '\u{2013}',
-        '\u{2014}', '\u{2DC}', '\u{2122}', '\u{161}', '\u{203A}', '\u{153}', '\u{9D}', '\u{17E}',
-        '\u{178}',
-    ];
-    let text: String = data
-        .iter()
-        .map(|&b| match b {
-            0x80..=0x9F => HIGH[usize::from(b - 0x80)],
-            _ => char::from(b),
-        })
-        .collect();
+/// A copy of `packet` with its text converted from code page `cp` to UTF-8.
+fn recode(packet: &ff::Packet, data: &[u8], cp: u32) -> ff::Packet {
+    let text = crate::codepage::decode(data, cp, false)
+        .unwrap_or_else(|| String::from_utf8_lossy(data).into_owned());
     let mut out = ff::Packet::copy(text.as_bytes());
     out.set_pts(packet.pts());
     out.set_dts(packet.dts());
@@ -669,6 +666,24 @@ mod tests {
             true,
         );
         assert!(cues.active(0.5).len() == 1 && cues.active(1.0).len() == 1);
+    }
+
+    #[test]
+    fn loads_cyrillic_srt() {
+        let dir = temp_dir("srt-1251");
+        let path = dir.join("movie.srt");
+        // "Привет, мир!" and "До свидания." in Windows-1251.
+        let srt = b"1\r\n00:00:01,000 --> 00:00:02,000\r\n\xcf\xf0\xe8\xe2\xe5\xf2, \xec\xe8\xf0!\r\n\r\n2\r\n00:00:03,000 --> 00:00:04,000\r\n\xc4\xee \xf1\xe2\xe8\xe4\xe0\xed\xe8\xff.\r\n\r\n";
+        std::fs::write(&path, srt).unwrap();
+        let cues = load_external(&path).unwrap();
+        assert_eq!(
+            text(&cues.active(1.5)[0]),
+            &vec![vec![span("Привет, мир!", false, false)]]
+        );
+        assert_eq!(
+            text(&cues.active(3.5)[0]),
+            &vec![vec![span("До свидания.", false, false)]]
+        );
     }
 
     #[test]

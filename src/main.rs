@@ -7,6 +7,7 @@
 mod audio;
 mod bookmarks;
 mod captions;
+mod codepage;
 mod dsp;
 mod library;
 mod nv12;
