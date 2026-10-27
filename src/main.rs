@@ -22,6 +22,7 @@ mod snapshot;
 mod subs;
 mod tags;
 mod thumbs;
+mod tonemap;
 mod ui;
 
 use std::cell::RefCell;

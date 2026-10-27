@@ -210,6 +210,11 @@ pub struct Renderer {
     upload: Option<Upload>,
     /// For a software frame that reaches the renderer in another format than NV12.
     nv12: crate::nv12::Nv12,
+    /// HDR10 frames land here as RGB before Direct2D tone maps them.
+    wide: Option<Wide>,
+    tonemap: Option<crate::tonemap::ToneMap>,
+    /// Set once that path failed; such frames then go straight to the target.
+    no_wide: std::cell::Cell<bool>,
     /// Set once an adjustment the GPU can't do has been reported.
     warned: bool,
 }
@@ -267,6 +272,9 @@ impl Renderer {
                 processor: None,
                 upload: None,
                 nv12: Default::default(),
+                wide: None,
+                tonemap: None,
+                no_wide: Default::default(),
                 warned: false,
             })
         }
@@ -459,15 +467,18 @@ impl Renderer {
                 let texture =
                     ID3D11Texture2D::from_raw_borrowed(&texture).ok_or("frame has no texture")?;
                 let slice = (*raw).data[1] as usize as u32;
-                (texture.clone(), slice, ycbcr_space(frame))
+                (texture.clone(), slice, colors(frame))
             }
         } else {
-            let (texture, space) = self.upload(frame)?;
-            (texture, 0, space)
+            let (texture, colors) = self.upload(frame)?;
+            (texture, 0, colors)
         };
         let mut desc = D3D11_TEXTURE2D_DESC::default();
         unsafe { texture.GetDesc(&mut desc) };
         let (w, h) = (frame.width(), frame.height());
+        // HDR10 frames go to RGB in a texture of their own first, then through Direct2D's colour
+        // effects into `target`.
+        let wide = self.wide_target(input_space.dxgi, size);
         self.ensure_processor(w, h, desc.Format, size)?;
         let p = self.processor.as_ref().unwrap();
 
@@ -527,12 +538,18 @@ impl Renderer {
                 &input_desc,
                 Some(&mut input),
             )?;
-            self.video_device.CreateVideoProcessorOutputView(
-                target,
+            let made = self.video_device.CreateVideoProcessorOutputView(
+                wide.as_ref().unwrap_or(target),
                 &p.enumerator,
                 &output_desc,
                 Some(&mut output),
-            )?;
+            );
+            if let Err(e) = made {
+                if wide.is_some() {
+                    self.give_up_wide(&e);
+                }
+                return Err(e.into());
+            }
         }
         let output = output.ok_or("no output view")?;
 
@@ -547,7 +564,7 @@ impl Renderer {
             pInputSurface: ManuallyDrop::new(input),
             ..Default::default()
         }];
-        let (vc, vp) = (&self.video_context, &p.processor);
+        let (vc, vc1, vp) = (&self.video_context, &self.video_context1, &p.processor);
         let result = locked(&self.lock, || unsafe {
             // Stream state persists on the processor, so every setting is written on every blit.
             if p.rotation {
@@ -584,13 +601,118 @@ impl Renderer {
             // Only the video area; Direct2D paints everything outside it.
             vc.VideoProcessorSetOutputTargetRect(vp, true, Some(&area));
             vc.VideoProcessorSetOutputBackgroundColor(vp, false, &BLACK);
-            vc.VideoProcessorSetStreamColorSpace(vp, 0, &input_space);
-            vc.VideoProcessorSetOutputColorSpace(vp, &RGB_FULL);
+            // The newer call knows BT.2020, PQ and HLG; the old one only BT.601 and BT.709.
+            match vc1 {
+                Some(vc1) => {
+                    vc1.VideoProcessorSetStreamColorSpace1(vp, 0, input_space.dxgi);
+                    // HDR10 only changes from YCbCr to RGB here; see `is_wide`.
+                    let output = if wide.is_some() {
+                        DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020
+                    } else {
+                        DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709
+                    };
+                    vc1.VideoProcessorSetOutputColorSpace1(vp, output);
+                }
+                None => {
+                    vc.VideoProcessorSetStreamColorSpace(vp, 0, &input_space.legacy);
+                    vc.VideoProcessorSetOutputColorSpace(vp, &RGB_FULL);
+                }
+            }
             vc.VideoProcessorBlt(vp, &output, 0, &streams)
         });
         unsafe { ManuallyDrop::drop(&mut streams[0].pInputSurface) };
         result?;
+        if wide.is_some()
+            && let Err(e) = self.draw_wide(target, area, hdr_peak(frame))
+        {
+            self.give_up_wide(&*e);
+            return Err(e);
+        }
         Ok(Some(dest))
+    }
+
+    /// After a failure of the HDR10 path, frames go straight to the target: one lost frame
+    /// rather than a stream that never shows.
+    fn give_up_wide(&self, e: &dyn std::fmt::Display) {
+        eprintln!("video: no HDR tone mapping ({e}); the video processor maps HDR10 itself");
+        self.no_wide.set(true);
+    }
+
+    /// The HDR10 texture for a frame in `space`, when it is HDR10 and that path works.
+    fn wide_target(
+        &mut self,
+        space: DXGI_COLOR_SPACE_TYPE,
+        size: (u32, u32),
+    ) -> Option<ID3D11Texture2D> {
+        if !is_wide(space) || self.video_context1.is_none() || self.no_wide.get() {
+            return None;
+        }
+        let ready = (|| -> Result<()> {
+            if self.tonemap.is_none() {
+                self.tonemap = Some(crate::tonemap::ToneMap::new(&self.d2d)?);
+            }
+            if self.wide.as_ref().is_none_or(|w| w.size != size) {
+                self.wide = Some(Wide::new(&self.device, &self.d2d, size)?);
+            }
+            Ok(())
+        })();
+        if let Err(e) = ready {
+            self.give_up_wide(&e);
+            return None;
+        }
+        self.wide.as_ref().map(|w| w.texture.clone())
+    }
+
+    /// Draws the area of the HDR10 texture, whose brightest light is `peak` nits, through the
+    /// colour effects into `target`.
+    fn draw_wide(&self, target: &ID3D11Texture2D, area: RECT, peak: f32) -> Result<()> {
+        let (Some(wide), Some(tonemap)) = (&self.wide, &self.tonemap) else {
+            return Ok(());
+        };
+        let image = tonemap.apply(&wide.bitmap, peak)?;
+        unsafe {
+            let props = D2D1_BITMAP_PROPERTIES1 {
+                pixelFormat: D2D1_PIXEL_FORMAT {
+                    format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                    alphaMode: D2D1_ALPHA_MODE_IGNORE,
+                },
+                dpiX: 96.0,
+                dpiY: 96.0,
+                bitmapOptions: D2D1_BITMAP_OPTIONS_TARGET | D2D1_BITMAP_OPTIONS_CANNOT_DRAW,
+                ..Default::default()
+            };
+            let out = self
+                .d2d
+                .CreateBitmapFromDxgiSurface(&target.cast::<IDXGISurface>()?, Some(&props))?;
+            let rect = D2D_RECT_F {
+                left: area.left as f32,
+                top: area.top as f32,
+                right: area.right as f32,
+                bottom: area.bottom as f32,
+            };
+            let d2d = &self.d2d;
+            locked(&self.lock, || -> Result<()> {
+                d2d.SetTarget(&out);
+                // Pixels: the texture and the target are the same size.
+                d2d.SetDpi(96.0, 96.0);
+                d2d.BeginDraw();
+                // The area of the image lands at the same place in the target.
+                let corner = windows_numerics::Vector2 {
+                    X: rect.left,
+                    Y: rect.top,
+                };
+                d2d.DrawImage(
+                    &image,
+                    Some(&corner),
+                    Some(&rect),
+                    D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR,
+                    D2D1_COMPOSITE_MODE_SOURCE_COPY,
+                );
+                let ended = d2d.EndDraw(None, None);
+                d2d.SetTarget(None);
+                Ok(ended?)
+            })
+        }
     }
 
     fn ensure_processor(
@@ -643,11 +765,8 @@ impl Renderer {
         Ok(())
     }
 
-    /// Copies a software frame to the GPU as NV12; returns the texture and its colour space.
-    fn upload(
-        &mut self,
-        frame: &ff::frame::Video,
-    ) -> Result<(ID3D11Texture2D, D3D11_VIDEO_PROCESSOR_COLOR_SPACE)> {
+    /// Copies a software frame to the GPU as NV12; returns the texture and its colours.
+    fn upload(&mut self, frame: &ff::frame::Video) -> Result<(ID3D11Texture2D, Colors)> {
         let converted;
         let nv12 = if frame.format() == Pixel::NV12 {
             frame
@@ -718,7 +837,7 @@ impl Renderer {
             }
             Ok(())
         })?;
-        Ok((u.texture.clone(), ycbcr_space(nv12)))
+        Ok((u.texture.clone(), colors(nv12)))
     }
 }
 
@@ -732,12 +851,152 @@ fn to_pixels(r: Rect) -> RECT {
 }
 
 /// Untagged HD video is BT.709 by convention and SD is BT.601, the same guess VLC and mpv make.
-/// ponytail: BT.2020/HDR maps to BT.601 here; it needs ID3D11VideoContext1 colour spaces.
 pub fn is_bt709(frame: &ff::frame::Video) -> bool {
     match frame.color_space() {
         ff::color::Space::BT709 => true,
         ff::color::Space::Unspecified => frame.height() >= 720,
         _ => false,
+    }
+}
+
+/// The 10-bit texture HDR10 frames are converted into, still PQ-encoded in BT.2020, and the
+/// Direct2D bitmap on it.
+struct Wide {
+    size: (u32, u32),
+    texture: ID3D11Texture2D,
+    bitmap: ID2D1Bitmap1,
+}
+
+impl Wide {
+    fn new(device: &ID3D11Device, d2d: &ID2D1DeviceContext5, size: (u32, u32)) -> Result<Self> {
+        let desc = D3D11_TEXTURE2D_DESC {
+            Width: size.0,
+            Height: size.1,
+            MipLevels: 1,
+            ArraySize: 1,
+            Format: DXGI_FORMAT_R10G10B10A2_UNORM,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Usage: D3D11_USAGE_DEFAULT,
+            BindFlags: (D3D11_BIND_RENDER_TARGET.0 | D3D11_BIND_SHADER_RESOURCE.0) as u32,
+            ..Default::default()
+        };
+        let mut texture = None;
+        unsafe {
+            device.CreateTexture2D(&desc, None, Some(&mut texture))?;
+            let texture: ID3D11Texture2D = texture.ok_or("no HDR10 texture")?;
+            let props = D2D1_BITMAP_PROPERTIES1 {
+                pixelFormat: D2D1_PIXEL_FORMAT {
+                    format: DXGI_FORMAT_R10G10B10A2_UNORM,
+                    alphaMode: D2D1_ALPHA_MODE_IGNORE,
+                },
+                dpiX: 96.0,
+                dpiY: 96.0,
+                ..Default::default()
+            };
+            let bitmap =
+                d2d.CreateBitmapFromDxgiSurface(&texture.cast::<IDXGISurface>()?, Some(&props))?;
+            Ok(Wide {
+                size,
+                texture,
+                bitmap,
+            })
+        }
+    }
+}
+
+/// HDR10: PQ needs tone mapping that video processors either lack or do badly (this laptop's
+/// Intel one washes it out), so it goes through Direct2D's effects instead.
+fn is_wide(space: DXGI_COLOR_SPACE_TYPE) -> bool {
+    space == DXGI_COLOR_SPACE_YCBCR_STUDIO_G2084_LEFT_P2020
+}
+
+/// libavutil's AVContentLightMetadata (CTA-861.3), which the bindings leave out.
+#[repr(C)]
+struct ContentLight {
+    #[allow(non_snake_case)]
+    MaxCLL: u32,
+    #[allow(non_snake_case)]
+    MaxFALL: u32,
+}
+
+/// libavutil's AVMasteringDisplayMetadata (SMPTE ST 2086), which the bindings leave out.
+#[repr(C)]
+struct MasteringDisplay {
+    display_primaries: [[ffi::AVRational; 2]; 3],
+    white_point: [ffi::AVRational; 2],
+    min_luminance: ffi::AVRational,
+    max_luminance: ffi::AVRational,
+    has_primaries: i32,
+    has_luminance: i32,
+}
+
+/// The brightest light of a PQ frame in nits, for the tone map: the stream's MaxCLL, else its
+/// mastering display's peak, else 1000.
+fn hdr_peak(frame: &ff::frame::Video) -> f32 {
+    use ffi::AVFrameSideDataType::*;
+    unsafe {
+        let light = ffi::av_frame_get_side_data(frame.as_ptr(), AV_FRAME_DATA_CONTENT_LIGHT_LEVEL);
+        if !light.is_null() {
+            let m = &*((*light).data as *const ContentLight);
+            if m.MaxCLL > 0 {
+                return m.MaxCLL as f32;
+            }
+        }
+        let display =
+            ffi::av_frame_get_side_data(frame.as_ptr(), AV_FRAME_DATA_MASTERING_DISPLAY_METADATA);
+        if !display.is_null() {
+            let m = &*((*display).data as *const MasteringDisplay);
+            if m.has_luminance != 0 && m.max_luminance.den > 0 {
+                return m.max_luminance.num as f32 / m.max_luminance.den as f32;
+            }
+        }
+    }
+    1000.0
+}
+
+/// A frame's colours for the video processor, in the old and the new form.
+struct Colors {
+    legacy: D3D11_VIDEO_PROCESSOR_COLOR_SPACE,
+    dxgi: DXGI_COLOR_SPACE_TYPE,
+}
+
+fn colors(frame: &ff::frame::Video) -> Colors {
+    Colors {
+        legacy: ycbcr_space(frame),
+        dxgi: dxgi_space(frame),
+    }
+}
+
+/// The frame's matrix, range, transfer and primaries as DXGI names them. PQ (HDR10) is BT.2020
+/// by definition; DXGI has no full-range PQ, which no real stream uses.
+///
+/// Video processors support few BT.2020 spaces (Intel: PQ, and SDR with top-left chroma), so
+/// SDR BT.2020 is described with top-left chroma, a half-pixel shift of the colour planes at
+/// most. HLG goes the same way: it was designed to look right on SDR BT.2020 screens.
+// ponytail: HLG highlights then clip; tone map it like PQ where a driver converts HLG.
+fn dxgi_space(frame: &ff::frame::Video) -> DXGI_COLOR_SPACE_TYPE {
+    use ff::color::{Primaries, Space, TransferCharacteristic as Transfer};
+    let full = frame.color_range() == ff::color::Range::JPEG;
+    let pick = |studio, full_range| if full { full_range } else { studio };
+    let bt2020 = matches!(frame.color_space(), Space::BT2020NCL | Space::BT2020CL)
+        || frame.color_primaries() == Primaries::BT2020;
+    match frame.color_transfer_characteristic() {
+        Transfer::SMPTE2084 => DXGI_COLOR_SPACE_YCBCR_STUDIO_G2084_LEFT_P2020,
+        _ if bt2020 => pick(
+            DXGI_COLOR_SPACE_YCBCR_STUDIO_G22_TOPLEFT_P2020,
+            DXGI_COLOR_SPACE_YCBCR_FULL_G22_LEFT_P2020,
+        ),
+        _ if is_bt709(frame) => pick(
+            DXGI_COLOR_SPACE_YCBCR_STUDIO_G22_LEFT_P709,
+            DXGI_COLOR_SPACE_YCBCR_FULL_G22_LEFT_P709,
+        ),
+        _ => pick(
+            DXGI_COLOR_SPACE_YCBCR_STUDIO_G22_LEFT_P601,
+            DXGI_COLOR_SPACE_YCBCR_FULL_G22_LEFT_P601,
+        ),
     }
 }
 

@@ -250,6 +250,13 @@ A stream the GPU turns down after all, such as 10-bit H.264, which no GPU decode
 The decoder thread repacks software frames to NV12 with swscale, splitting each frame across the cores, so the render thread only copies them to the GPU.
 On the test laptop a 4K60 10-bit H.264 clip went from 90 dropped frames of 300 to about 50; the rest is the CPU's limit for decoding and repacking at once.
 
+HDR10 (PQ) video gets tone mapped to the SDR screen, because video processors either can't do it or wash it out (the test laptop's Intel one does).
+The video processor only converts such a frame from YCbCr to RGB, still PQ-encoded in BT.2020, which every driver that supports HDR displays can do.
+Direct2D's colour effects do the rest ([src/tonemap.rs](src/tonemap.rs)): PQ to linear light, a tone curve per channel, then sRGB.
+The curve leaves everything up to three quarters of HDR's reference white (203 nits) as it is and rolls the highlights above it off into the rest of SDR's range, up to the stream's MaxCLL.
+On test clips with a known answer, the result is within a few levels of 255 of the exact conversion, and a 4K60 HDR10 clip plays with 2 of 240 frames dropped.
+BT.709 and BT.601 video is unchanged by this.
+
 The render loop runs above normal priority, as VLC's video output thread does.
 While the window is dragged or resized, Windows runs a message loop of its own until the mouse lets go; a timer then runs the render loop's passes from the window procedure, so the video keeps playing.
 A pass that fails (a lost frame) is logged and skipped rather than closing the player.
@@ -327,7 +334,8 @@ Each of these is marked with a `ponytail:` comment in the code, along with the u
 - ASS and SSA subtitles show as plain centred text: positioning, colours, style-sheet italics and karaoke are ignored (libass would add them).
 - Without a language tag, traditional Chinese (Big5) subtitles read as simplified (GBK), and Turkish or Baltic ones as Western, since the same bytes are valid in both.
 - Contrast and saturation go up to 2x, like VLC's adjust filter; brightness and hue use the GPU's full range.
-- BT.2020 and HDR video show with BT.709/601 colours.
+- HDR10 is always tone mapped to SDR, even on an HDR screen; there is no HDR output.
+- SDR BT.2020 and HLG go through the video processor's own conversion, which on the test laptop's Intel GPU leaves saturated colours paler than they should be, and HLG's highlights clip.
 - Software frames reach the GPU as 8-bit NV12, so 10-bit video loses its extra precision there, and 4K60 10-bit H.264 drops frames on a laptop CPU.
 - Audio devices must mix in f32, which every WASAPI shared-mode device seen so far does.
 - The audio callback takes a mutex.
