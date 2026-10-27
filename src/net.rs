@@ -5,9 +5,6 @@
 //! A stream is stored as a `PathBuf` holding its URL wherever the rest of the app
 //! expects a file path; [`is_url_path`] tells the two apart.
 
-// ponytail: nothing calls this yet; drop the allow once the Network page and stream playback do.
-#![allow(dead_code)]
-
 use std::path::Path;
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::thread;
@@ -22,10 +19,8 @@ const RADIO_DIRECTORY: &str = "https://de1.api.radio-browser.info/xml/stations/t
 const MAX_FETCH: usize = 4 << 20;
 
 /// The schemes FFmpeg can open as a stream here, and that the slim build carries protocols for.
-const SCHEMES: [&str; 13] = [
-    "http", "https", "rtsp", "rtmp", "rtmps", "mms", "mmsh", "udp", "rtp", "srt", "tcp", "ftp",
-    "ftps",
-];
+/// See `scripts/build-ffmpeg.sh`: rtmp, mms, srt and ftp would need more of FFmpeg.
+const SCHEMES: [&str; 6] = ["http", "https", "rtsp", "udp", "rtp", "tcp"];
 
 /// Which shelf of the Network page a saved address sits on.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -207,6 +202,26 @@ fn decode_entities(s: &str) -> String {
     }
     out.push_str(rest);
     out
+}
+
+/// A feed's date as a day: RSS's "Mon, 26 Oct 2026 08:00:00 GMT" is "26 Oct 2026", Atom's
+/// "2026-10-26T08:00:00Z" is "2026-10-26". Anything else stays as the feed wrote it.
+pub fn short_date(date: &str) -> String {
+    let date = date.trim();
+    if let Some((day, _)) = date.split_once('T')
+        && day.len() == 10
+        && day.as_bytes()[4] == b'-'
+    {
+        return day.to_owned();
+    }
+    let after_weekday = date.split_once(", ").map_or(date, |(_, rest)| rest);
+    let words: Vec<&str> = after_weekday.split_whitespace().collect();
+    match words[..] {
+        [day, month, year, ..] if day.parse::<u8>().is_ok() && year.parse::<u16>().is_ok() => {
+            format!("{day} {month} {year}")
+        }
+        _ => date.to_owned(),
+    }
 }
 
 /// One playable podcast episode.
@@ -677,6 +692,14 @@ mod tests {
                 .episodes
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn feed_dates_shorten_to_the_day() {
+        assert_eq!(short_date("Mon, 26 Oct 2026 08:00:00 GMT"), "26 Oct 2026");
+        assert_eq!(short_date("6 Oct 2026 08:00 +0000"), "6 Oct 2026");
+        assert_eq!(short_date("2026-10-20T04:00:00Z"), "2026-10-20");
+        assert_eq!(short_date("sometime last week"), "sometime last week");
     }
 
     #[test]

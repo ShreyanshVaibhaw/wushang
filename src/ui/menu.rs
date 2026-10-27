@@ -13,6 +13,7 @@ use super::browse::SortMode;
 use super::panels::{ASPECT, CROP, PanelAction, PanelData, SLEEP, STEREO, SettingsTab, ZOOM};
 use super::*;
 use crate::library::{Entry, Place};
+use crate::net::{NetKind, is_url_path};
 
 const ROW: f32 = 48.0;
 /// Space between the frame and the first and last rows, and the rows' inset from the sides.
@@ -48,6 +49,7 @@ const DIM: f32 = 0.4;
 pub enum MenuAction {
     /// Pick files to play; the first plays and the rest follow it.
     OpenFiles,
+    OpenNetwork,
     /// Pick a folder and play its media in order.
     OpenFolder,
     /// A file from Open Recent: plays it with its folder as the queue.
@@ -92,6 +94,10 @@ pub enum MenuAction {
     GoToSource(PathBuf),
     /// Picks a subtitle file and plays the file with it.
     AddSubtitleTo(PathBuf),
+    /// Picks an audio file and plays the file with its sound.
+    AddAudioTo(PathBuf),
+    /// Takes a saved stream or podcast off the Network page.
+    ForgetAddress(NetKind, String),
     /// The properties of a file or folder.
     Properties(PathBuf),
     MarkWatched(PathBuf),
@@ -722,11 +728,11 @@ pub fn main_menu(recent: &[PathBuf], profiles: &[String], profile: &str) -> Vec<
         Item::new("Open Folder", MenuAction::OpenFolder)
             .icon(Icon::Folder)
             .key("Ctrl + F"),
-        // ponytail: streams, discs, capture devices and converting need FFmpeg's network
-        // protocols, devices and muxers, which the slim build leaves out; build with them first.
-        Item::off("Open Network Stream")
+        Item::new("Open Network Stream", MenuAction::OpenNetwork)
             .icon(Icon::Network)
             .key("Ctrl + N"),
+        // ponytail: discs, capture devices and converting need FFmpeg's devices and muxers,
+        // which the slim build leaves out; build with them first.
         Item::off("Open Disc").icon(Icon::Disc).key("Ctrl + D"),
         Item::off("Open Capture Device")
             .icon(Icon::Capture)
@@ -937,27 +943,50 @@ pub fn player_menu(d: &PanelData, paused: bool) -> Vec<Item> {
     ]
 }
 
-/// The context menu of a library entry: files, folders and playlists have their own. `playlists`
-/// fills "Add to Playlist"; `items` are a playlist's files; `within` is the playlist page the
-/// entry is on, which adds "Remove from Playlist".
+/// The context menu of a library entry: files, streams, folders and playlists have their own.
+/// `playlists` fills "Add to Playlist"; `items` are a playlist's files; `place` is the page the
+/// entry is on: a playlist page adds "Remove from Playlist", the Network page "Remove".
 pub fn entry_menu(
     entry: &Entry,
     playlists: &[String],
     items: &[PathBuf],
-    within: Option<&str>,
+    place: &Place,
 ) -> Option<(Kind, Vec<Item>)> {
+    let within = match place {
+        Place::Playlist(name) => Some(name.as_str()),
+        _ => None,
+    };
     match entry {
+        Entry::Media { path, .. } if is_url_path(path) => {
+            let saved = *place == Place::Network;
+            Some((Kind::File, stream_menu(path, playlists, saved)))
+        }
         Entry::Media { path, .. } => Some((Kind::File, file_menu(path, playlists, within))),
         Entry::Folder {
             place: Place::Playlist(name),
             ..
         } => Some((Kind::Playlist, playlist_menu(name, items))),
+        Entry::Folder {
+            place: Place::Podcast(url),
+            ..
+        } => {
+            let forget = MenuAction::ForgetAddress(NetKind::Podcast, url.clone());
+            Some((
+                Kind::Folder,
+                vec![Item::new("Remove Podcast", forget).icon(Icon::Delete)],
+            ))
+        }
+        Entry::Folder {
+            place: Place::Podcasts | Place::Radio,
+            ..
+        } => None,
         Entry::Folder { place, .. } => Some((Kind::Folder, folder_menu(place))),
         Entry::Header { .. } | Entry::Action { .. } => None,
     }
 }
 
-fn file_menu(path: &Path, playlists: &[String], within: Option<&str>) -> Vec<Item> {
+/// "Add to Playlist"'s submenu for `path`.
+fn add_to_playlist(path: &Path, playlists: &[String]) -> Vec<Item> {
     let one = || vec![path.to_owned()];
     let mut add: Vec<Item> = playlists
         .iter()
@@ -967,6 +996,31 @@ fn file_menu(path: &Path, playlists: &[String], within: Option<&str>) -> Vec<Ite
         add.push(Item::divider());
     }
     add.push(Item::new("New Playlist...", MenuAction::NewPlaylist(one())));
+    add
+}
+
+/// A stream address: no file to show, probe or mark watched. A `saved` one can be removed.
+fn stream_menu(path: &Path, playlists: &[String], saved: bool) -> Vec<Item> {
+    let mut items = vec![
+        Item::new("Play", MenuAction::Play(path.to_owned())).icon(Icon::Play),
+        Item::new(
+            "Add to Queue",
+            MenuAction::AddToQueue(vec![path.to_owned()]),
+        )
+        .icon(Icon::Queue),
+        Item::submenu("Add to Playlist", add_to_playlist(path, playlists)).icon(Icon::Playlist),
+    ];
+    if saved {
+        let url = path.to_string_lossy().into_owned();
+        let forget = MenuAction::ForgetAddress(NetKind::Stream, url);
+        items.push(Item::new("Remove", forget).icon(Icon::Delete));
+    }
+    items
+}
+
+fn file_menu(path: &Path, playlists: &[String], within: Option<&str>) -> Vec<Item> {
+    let one = || vec![path.to_owned()];
+    let add = add_to_playlist(path, playlists);
     let mut items = vec![
         Item::new("Play", MenuAction::Play(path.to_owned())).icon(Icon::Play),
         Item::new("Mark as Watched", MenuAction::MarkWatched(path.to_owned())).icon(Icon::Watched),
@@ -987,8 +1041,7 @@ fn file_menu(path: &Path, playlists: &[String], within: Option<&str>) -> Vec<Ite
             MenuAction::AddSubtitleTo(path.to_owned()),
         )
         .icon(Icon::Subtitle),
-        // ponytail: an external audio track needs a second demuxer feeding the audio decoder.
-        Item::off("Add Audio Tracks").icon(Icon::Audio),
+        Item::new("Add Audio Tracks", MenuAction::AddAudioTo(path.to_owned())).icon(Icon::Audio),
         Item::new(
             "Properties & Metadata",
             MenuAction::Properties(path.to_owned()),
@@ -1014,7 +1067,11 @@ pub fn queue_menu(
     playlists: &[String],
 ) -> Vec<Item> {
     use crate::ui::queue::QueueAction;
-    let mut items = file_menu(path, playlists, None);
+    let mut items = if is_url_path(path) {
+        stream_menu(path, playlists, false)
+    } else {
+        file_menu(path, playlists, None)
+    };
     items[0].action = Some(MenuAction::Queue(QueueAction::Play(i)));
     if let Some(add) = items.iter_mut().find(|item| item.label == "Add to Queue") {
         *add = Item::new(

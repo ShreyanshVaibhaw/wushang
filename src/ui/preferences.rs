@@ -3,7 +3,7 @@
 //! copy of `Prefs`; each change goes out whole as [`PrefsAction::Changed`], and main.rs applies
 //! and saves it.
 //!
-//! Only settings myvlc acts on are listed. Network, Recording and Extensions have none yet and
+//! Only settings myvlc acts on are listed. Recording and Extensions have none yet and
 //! show dimmed, like the panels' disabled rows. General has the design's theme and accent rows
 //! but not its interface language, as there is only English. The design's (i) marks are left
 //! out, as there is nothing behind them. Sizes are DIPs from the 1046x864 frames. On a short window the
@@ -98,6 +98,7 @@ impl Category {
             Category::Audio => "Audio Defaults",
             Category::Subtitles => "Subtitle Defaults",
             Category::Library => "Playlists, Folders & Files",
+            Category::Network => "Network Settings",
             Category::Performance => "Performance Settings",
             Category::General => "Global Settings",
             _ => "Settings",
@@ -106,10 +107,7 @@ impl Category {
 
     /// Whether myvlc has anything to set here.
     fn enabled(self) -> bool {
-        !matches!(
-            self,
-            Category::Network | Category::Recording | Category::Extensions
-        )
+        !matches!(self, Category::Recording | Category::Extensions)
     }
 
     fn icon(self) -> usize {
@@ -176,6 +174,8 @@ pub enum Ctl {
     Shadow,
     ShowHidden,
     HwDecoding,
+    NetReconnect,
+    NetTimeout,
 }
 
 const SPEED_TICKS: [&str; 8] = ["0.25", "0.5", "0.75", "1", "1.25", "1.5", "1.75", "2"];
@@ -233,6 +233,7 @@ impl Ctl {
             Ctl::Bold => p.sub_bold,
             Ctl::Shadow => p.sub_shadow,
             Ctl::ShowHidden => p.show_hidden,
+            Ctl::NetReconnect => p.net_reconnect,
             _ => return None,
         })
     }
@@ -253,6 +254,7 @@ impl Ctl {
             Ctl::Bold => &mut p.sub_bold,
             Ctl::Shadow => &mut p.sub_shadow,
             Ctl::ShowHidden => &mut p.show_hidden,
+            Ctl::NetReconnect => &mut p.net_reconnect,
             _ => return,
         };
         *f = on;
@@ -344,6 +346,7 @@ impl Ctl {
             }
             Ctl::Outline => labels(prefs::OUTLINE),
             Ctl::HwDecoding => HW.iter().map(|s| (*s).to_owned()).collect(),
+            Ctl::NetTimeout => labels(prefs::NET_TIMEOUT),
             _ => return None,
         })
     }
@@ -391,6 +394,9 @@ impl Ctl {
             Ctl::OutlineColor => colour(p.outline_color),
             Ctl::Outline => Some(p.outline),
             Ctl::HwDecoding => Some(usize::from(!p.hw_decoding)),
+            Ctl::NetTimeout => {
+                (prefs::NET_TIMEOUT.iter()).position(|c| c.0.parse::<u32>() == Ok(p.net_timeout))
+            }
             _ => None,
         }
     }
@@ -455,6 +461,11 @@ impl Ctl {
             }
             Ctl::Outline => p.outline = i,
             Ctl::HwDecoding => p.hw_decoding = i == 0,
+            Ctl::NetTimeout => {
+                if let Some(Ok(s)) = prefs::NET_TIMEOUT.get(i).map(|c| c.0.parse()) {
+                    p.net_timeout = s;
+                }
+            }
             _ => {}
         }
     }
@@ -972,7 +983,12 @@ impl Builder<'_> {
                 self.section("Decoding");
                 self.choice("Hardware-accelerated decoding", Ctl::HwDecoding);
             }
-            Category::Network | Category::Recording | Category::Extensions => {}
+            Category::Network => {
+                self.section("Streams");
+                self.toggle("Reconnect when a stream drops", Ctl::NetReconnect);
+                self.choice("Give up on a stalled connection after", Ctl::NetTimeout);
+            }
+            Category::Recording | Category::Extensions => {}
         }
     }
 }
@@ -1949,8 +1965,8 @@ mod tests {
         assert!(p.two_pass);
         // Disabled categories can't be picked.
         let g = ui.layout.preferences.as_ref().unwrap();
-        let (network, item) = g.items[9];
-        assert_eq!(network, Category::Network);
+        let (recording, item) = g.items[11];
+        assert_eq!(recording, Category::Recording);
         let (cx, cy) = centre(item);
         let hit = g.hit(g.origin.0 + cx * g.scale, g.origin.1 + cy * g.scale);
         assert_eq!(hit, Target::Body);

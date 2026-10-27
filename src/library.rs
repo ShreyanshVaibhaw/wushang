@@ -15,6 +15,8 @@ use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering::Relaxed;
 use std::{env, fs, io};
 
+use crate::net::{self, Feed, NetKind, Station};
+
 pub const VIDEO_EXTS: &[&str] = &[
     "mp4", "m4v", "mkv", "webm", "avi", "mov", "wmv", "flv", "ts", "m2ts", "mts", "mpg", "mpeg",
     "ogv", "3gp",
@@ -81,6 +83,11 @@ pub enum Place {
     Network,
     Playlists,
     Recent,
+    /// The podcast feeds subscribed to, and one feed's episodes by its address.
+    Podcasts,
+    Podcast(String),
+    /// The radio directory.
+    Radio,
     /// A folder under a Videos or Music root.
     Folder(Section, PathBuf),
     Songs,
@@ -106,7 +113,7 @@ impl Place {
             | Place::Artist(_)
             | Place::Genres
             | Place::Genre(_) => Section::Music,
-            Place::Network => Section::Network,
+            Place::Network | Place::Podcasts | Place::Podcast(_) | Place::Radio => Section::Network,
             Place::Playlists | Place::Playlist(_) => Section::Playlists,
             Place::Recent => Section::Recent,
             Place::Folder(section, _) => *section,
@@ -125,9 +132,19 @@ pub enum Action {
     AddFolder(Section),
     CreatePlaylist,
     AddNetworkStream,
-    Podcasts,
-    Radio,
+    AddPodcast,
 }
+
+/// A stream or podcast feed saved on the Network page.
+#[derive(Clone, PartialEq, Debug)]
+pub struct Address {
+    pub kind: NetKind,
+    pub url: String,
+    pub name: String,
+}
+
+/// A podcast feed or the radio directory as last fetched: None while the fetch runs.
+pub type Fetched<T> = Option<Result<T, String>>;
 
 #[derive(Clone, PartialEq, Debug)]
 pub enum Entry {
@@ -218,6 +235,12 @@ pub struct Library {
     // run finishes; save it next to state.txt if that wait shows.
     tracks: Vec<Track>,
     track_at: HashMap<PathBuf, usize>,
+    /// Saved streams and podcast feeds, most recent first.
+    addresses: Vec<Address>,
+    /// Feeds and the radio directory fetched this run, by feed address; they change too often
+    /// to keep. Missing (None for stations) until first asked for.
+    feeds: HashMap<String, Fetched<Feed>>,
+    stations: Option<Fetched<Vec<Station>>>,
 }
 
 impl Library {
@@ -248,6 +271,9 @@ impl Library {
             favorites: Vec::new(),
             tracks: Vec::new(),
             track_at: HashMap::new(),
+            addresses: Vec::new(),
+            feeds: HashMap::new(),
+            stations: None,
         };
         match fs::read(dir.join(STATE_FILE)) {
             Ok(bytes) => lib.parse(&String::from_utf8_lossy(&bytes)),
@@ -313,6 +339,20 @@ impl Library {
                 ["thumb", name, p] if check_name(name).is_ok() && !p.is_empty() => {
                     self.thumbnails.insert(name.into(), p.into());
                 }
+                ["address", kind, url, name] if net::is_url(url) => {
+                    if let Some(kind) = NetKind::from_key(kind)
+                        && !self
+                            .addresses
+                            .iter()
+                            .any(|a| a.kind == kind && a.url == url)
+                    {
+                        self.addresses.push(Address {
+                            kind,
+                            url: url.into(),
+                            name: name.into(),
+                        });
+                    }
+                }
                 ["favorite", p] if !p.is_empty() => {
                     let p = PathBuf::from(p);
                     if !self.favorites.contains(&p) {
@@ -355,6 +395,10 @@ impl Library {
         }
         for p in self.favorites.iter().filter_map(|p| p.to_str()) {
             writeln!(out, "favorite\t{p}").unwrap();
+        }
+        for a in &self.addresses {
+            let name = a.name.replace(['\t', '\n', '\r'], " ");
+            writeln!(out, "address\t{}\t{}\t{name}", a.kind.key(), a.url).unwrap();
         }
         fs::create_dir_all(&self.dir)?;
         let tmp = self.dir.join("state.txt.tmp");
@@ -428,11 +472,44 @@ impl Library {
                 }
                 out
             }
-            Place::Network => vec![
-                action("Add Network Stream", Action::AddNetworkStream),
-                action("Podcasts", Action::Podcasts),
-                action("Radio", Action::Radio),
-            ],
+            Place::Network => {
+                let mut out = vec![
+                    action("Add Network Stream", Action::AddNetworkStream),
+                    folder("Podcasts", Place::Podcasts),
+                    folder("Radio", Place::Radio),
+                ];
+                for a in self.addresses_of(NetKind::Stream) {
+                    let path = PathBuf::from(&a.url);
+                    out.push(media(&path, a.name.clone(), net::host_of(&a.url), None));
+                }
+                out
+            }
+            Place::Podcasts => {
+                let mut out = vec![action("Add Podcast", Action::AddPodcast)];
+                for a in self.addresses_of(NetKind::Podcast) {
+                    out.push(folder(&a.name, Place::Podcast(a.url.clone())));
+                }
+                out
+            }
+            Place::Podcast(url) => match self.feeds.get(url) {
+                Some(Some(Ok(feed))) => (feed.episodes.iter())
+                    .map(|e| stream_media(&e.url, &e.title, e.date.as_deref().map(net::short_date)))
+                    .collect(),
+                Some(Some(Err(e))) => vec![notice(e)],
+                _ => vec![notice("Loading episodes...")],
+            },
+            Place::Radio => match &self.stations {
+                Some(Some(Ok(stations))) => (stations.iter())
+                    .map(|s| {
+                        let about = [s.tags.split(',').next().unwrap_or(""), &s.country];
+                        let about: Vec<&str> =
+                            about.into_iter().filter(|t| !t.is_empty()).collect();
+                        stream_media(&s.url, &s.name, Some(about.join(" - ")))
+                    })
+                    .collect(),
+                Some(Some(Err(e))) => vec![notice(e)],
+                _ => vec![notice("Loading stations...")],
+            },
             Place::Playlists => {
                 let mut out = vec![action("Create playlist", Action::CreatePlaylist)];
                 for name in self.playlists() {
@@ -523,15 +600,18 @@ impl Library {
                 out.extend(entries);
             }
         };
+        // A file deleted or on a drive since unplugged would only show a blank card.
         let of_kind = |kind| {
             let recent = self.recent.iter();
             recent.filter(move |r| media_kind(&r.path) == Some(kind))
         };
 
+        // A video deleted, or on a drive since unplugged, would only show a blank thumbnail.
         let watching = of_kind(MediaKind::Video)
             .filter(|r| {
                 r.fraction()
                     .is_some_and(|f| (RESUME_FROM..FINISHED_AT).contains(&f))
+                    && r.path.exists()
             })
             .take(HOME_RECENT)
             .map(|r| self.file_media(&r.path))
@@ -628,9 +708,91 @@ impl Library {
                 out.push(crumb(x, place.clone()));
             }
             Place::Playlist(name) => out.push(crumb(name, place.clone())),
+            Place::Podcasts => out.push(crumb("Podcasts", Place::Podcasts)),
+            Place::Podcast(url) => {
+                out.push(crumb("Podcasts", Place::Podcasts));
+                out.push(crumb(
+                    &self.address_name(NetKind::Podcast, url),
+                    place.clone(),
+                ));
+            }
+            Place::Radio => out.push(crumb("Radio", Place::Radio)),
             _ => {}
         }
         out
+    }
+
+    /// Saved addresses of one kind, most recent first.
+    pub fn addresses_of(&self, kind: NetKind) -> impl Iterator<Item = &Address> {
+        self.addresses.iter().filter(move |a| a.kind == kind)
+    }
+
+    /// Saves `url`, or moves it to the front with its new `name`.
+    pub fn add_address(&mut self, kind: NetKind, url: &str, name: &str) {
+        self.remove_address(kind, url);
+        let address = Address {
+            kind,
+            url: url.into(),
+            name: name.into(),
+        };
+        self.addresses.insert(0, address);
+    }
+
+    pub fn remove_address(&mut self, kind: NetKind, url: &str) {
+        self.addresses.retain(|a| a.kind != kind || a.url != url);
+    }
+
+    /// The saved name of an address, else one made from the address.
+    pub fn address_name(&self, kind: NetKind, url: &str) -> String {
+        (self.addresses_of(kind).find(|a| a.url == url))
+            .map_or_else(|| net::url_name(url), |a| a.name.clone())
+    }
+
+    /// Whether `place` shows something not fetched yet, and so needs a fetch.
+    pub fn wants_fetch(&self, place: &Place) -> bool {
+        match place {
+            Place::Podcast(url) => !self.feeds.contains_key(url),
+            Place::Radio => self.stations.is_none(),
+            _ => false,
+        }
+    }
+
+    /// Marks a fetch as running, so `wants_fetch` asks only once.
+    pub fn fetching(&mut self, place: &Place) {
+        match place {
+            Place::Podcast(url) => _ = self.feeds.insert(url.clone(), None),
+            Place::Radio => self.stations = Some(None),
+            _ => {}
+        }
+    }
+
+    /// A feed fetch finished. A feed whose title is known now gets it as its name.
+    pub fn feed_fetched(&mut self, url: &str, result: Result<Feed, String>) {
+        if let Ok(feed) = &result
+            && !feed.title.is_empty()
+            && let Some(a) =
+                (self.addresses.iter_mut()).find(|a| a.kind == NetKind::Podcast && a.url == url)
+        {
+            a.name = feed.title.clone();
+        }
+        self.feeds.insert(url.into(), Some(result));
+    }
+
+    pub fn stations_fetched(&mut self, result: Result<Vec<Station>, String>) {
+        self.stations = Some(Some(result));
+    }
+
+    /// Forgets a fetch of `place` that failed, so showing it again tries again.
+    // ponytail: a feed fetched fine stays as it was until the next run; refetch on every
+    // visit if new episodes should show sooner.
+    pub fn retry_failed(&mut self, place: &Place) {
+        match place {
+            Place::Podcast(url) if matches!(self.feeds.get(url), Some(Some(Err(_)))) => {
+                self.feeds.remove(url);
+            }
+            Place::Radio if matches!(self.stations, Some(Some(Err(_)))) => self.stations = None,
+            _ => {}
+        }
     }
 
     /// The playable files of a place in display order (the play queue for next and previous).
@@ -1038,6 +1200,27 @@ fn media(path: &Path, label: String, subtitle: Option<String>, album: Option<Str
     }
 }
 
+/// A podcast episode or radio station: played from its address, listed as audio.
+fn stream_media(url: &str, title: &str, subtitle: Option<String>) -> Entry {
+    Entry::Media {
+        label: title.into(),
+        path: PathBuf::from(url),
+        kind: MediaKind::Audio,
+        subtitle: subtitle.filter(|s| !s.is_empty()),
+        album: None,
+        progress: None,
+        finished: false,
+    }
+}
+
+/// A line in place of a list that isn't there: still loading, or why it failed.
+fn notice(text: &str) -> Entry {
+    Entry::Header {
+        label: text.into(),
+        more: None,
+    }
+}
+
 fn track_media(t: &Track) -> Entry {
     let title = t.title.clone().unwrap_or_else(|| stem_of(&t.path));
     media(&t.path, title, t.artist.clone(), t.album.clone())
@@ -1056,8 +1239,12 @@ fn stem_of(path: &Path) -> String {
         .map_or_else(|| name_of(path), |n| n.to_string_lossy().into_owned())
 }
 
-/// Absolute form of `path`, so lookups match however the file was opened.
-fn abs(path: &Path) -> PathBuf {
+/// Absolute form of `path`, so lookups match however the file was opened. A stream address
+/// stays as it is; Windows would read it as a relative path with backslashes.
+pub fn abs(path: &Path) -> PathBuf {
+    if crate::net::is_url_path(path) {
+        return path.to_path_buf();
+    }
     std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
@@ -1516,6 +1703,7 @@ mod tests {
         let root = tmp.0.join("Videos");
         let clip = tmp.touch(r"Videos\Show\ep1.mp4");
         tmp.touch(r"Videos\Gone\x.mp4");
+        tmp.touch(r"Videos\half.mp4");
         let mut lib = Library::open(&tmp.0.join("state"), false);
         lib.add_root(Section::Videos, root.clone());
         lib.create_playlist("Mix").unwrap();
@@ -1558,11 +1746,64 @@ mod tests {
     }
 
     #[test]
+    fn network_pages_keep_streams_and_feeds() {
+        let tmp = TempDir::new();
+        let mut lib = Library::open(&tmp.0.join("state"), false);
+        let feed = "https://example.com/feed.xml";
+        lib.add_address(NetKind::Stream, "https://example.com/live.m3u8", "Live");
+        lib.add_address(NetKind::Podcast, feed, "example.com");
+        lib.add_address(NetKind::Stream, "udp://239.0.0.1:1234", "Multicast");
+        lib.save().unwrap();
+
+        let mut lib = Library::open(&tmp.0.join("state"), false);
+        let network = lib.entries(&Place::Network);
+        assert_eq!(
+            labels(&network),
+            "Add Network Stream|Podcasts|Radio|Multicast|Live"
+        );
+        // A feed lists its episodes once fetched, and takes the feed's title as its name.
+        assert!(lib.wants_fetch(&Place::Podcast(feed.into())));
+        lib.fetching(&Place::Podcast(feed.into()));
+        assert!(!lib.wants_fetch(&Place::Podcast(feed.into())));
+        let episodes = net::parse_feed(
+            r#"<rss><channel><title>Cast</title><item><title>One</title>
+            <enclosure url="one.mp3"/><pubDate>Mon, 26 Oct 2026 08:00:00 GMT</pubDate></item>
+            </channel></rss>"#,
+            feed,
+        );
+        lib.feed_fetched(feed, Ok(episodes));
+        assert_eq!(labels(&lib.entries(&Place::Podcasts)), "Add Podcast|Cast");
+        let page = lib.entries(&Place::Podcast(feed.into()));
+        let Entry::Media { path, subtitle, .. } = &page[0] else {
+            panic!("an episode")
+        };
+        assert_eq!(path, Path::new("https://example.com/one.mp3"));
+        assert_eq!(subtitle.as_deref(), Some("26 Oct 2026"));
+        // A failed directory fetch is tried again when the page shows again.
+        lib.fetching(&Place::Radio);
+        lib.stations_fetched(Err("offline".into()));
+        assert_eq!(labels(&lib.entries(&Place::Radio)), "offline");
+        lib.retry_failed(&Place::Radio);
+        assert!(lib.wants_fetch(&Place::Radio));
+
+        lib.remove_address(NetKind::Stream, "udp://239.0.0.1:1234");
+        assert_eq!(lib.entries(&Place::Network).len(), 4);
+    }
+
+    #[test]
+    fn stream_addresses_stay_as_given() {
+        let url = Path::new("https://example.com/live/index.m3u8");
+        assert_eq!(abs(url), url);
+        assert!(abs(Path::new("clip.mp4")).is_absolute());
+    }
+
+    #[test]
     fn home_sections_from_recent_data() {
         let tmp = TempDir::new();
         let root = tmp.0.join("Videos");
         tmp.touch(r"Videos\Alpha\x.mp4");
         tmp.touch(r"Videos\Beta\x.mp4");
+        tmp.touch(r"Videos\half.mp4");
         let mut lib = Library::open(&tmp.0.join("state"), false);
         lib.add_root(Section::Videos, root.clone());
         let v = |n: &str| root.join(n);

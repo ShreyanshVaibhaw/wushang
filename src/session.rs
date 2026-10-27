@@ -5,6 +5,7 @@
 use std::collections::HashMap;
 use std::error::Error;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering::Relaxed;
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -12,6 +13,7 @@ use std::thread::JoinHandle;
 use ffmpeg_next as ff;
 
 use crate::audio;
+use crate::net;
 use crate::player::{self, FrameQueue, HwDevice, PacketQueue, Route, Routes, Shared};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -67,6 +69,52 @@ struct External {
 
 const EXTERNAL: usize = 1 << 16;
 
+/// How stream addresses open, from Settings' Network page.
+#[derive(Clone, Copy, Debug)]
+pub struct NetOptions {
+    /// Seconds a connection may stall before it counts as dead.
+    pub timeout: u32,
+    /// Reconnect when the connection drops, as long as the server comes back within the timeout.
+    pub reconnect: bool,
+}
+
+/// Opens the container at `path`: a file, or a stream address (`net::is_url_path`), which
+/// connects and probes first and so can take seconds. Setting `cancel` makes FFmpeg give up at
+/// once, then and on any read later that hangs on the network.
+pub fn open_input(
+    path: &Path,
+    options: NetOptions,
+    cancel: &Arc<AtomicBool>,
+) -> Result<ff::format::context::Input, String> {
+    if !net::is_url_path(path) {
+        return ff::format::input(path).map_err(|e| format!("cannot open {path:?}: {e}"));
+    }
+    let url = path.to_string_lossy();
+    let micros = (u64::from(options.timeout) * 1_000_000).to_string();
+    let mut dict = ff::Dictionary::new();
+    // Any protocol: a read that stalls this long fails. tcp, http, rtsp and udp also take it
+    // as their connect and socket timeout.
+    dict.set("rw_timeout", &micros);
+    dict.set("timeout", &micros);
+    dict.set("user_agent", concat!("myvlc/", env!("CARGO_PKG_VERSION")));
+    if options.reconnect {
+        // http: reconnect on drops and errors, backing off up to the timeout; HLS retries a
+        // segment instead of skipping it.
+        for (key, value) in [
+            ("reconnect", "1"),
+            ("reconnect_streamed", "1"),
+            ("reconnect_on_network_error", "1"),
+            ("seg_max_retry", "5"),
+        ] {
+            dict.set(key, value);
+        }
+        dict.set("reconnect_delay_max", &options.timeout.to_string());
+    }
+    let cancel = cancel.clone();
+    ff::format::input_with_interrupt_and_dictionary(path, move || cancel.load(Relaxed), dict)
+        .map_err(|e| format!("cannot open {}: {e}", net::redact(&url)))
+}
+
 /// Which tracks a file starts with, from Settings.
 #[derive(Clone, Debug)]
 pub struct TrackChoice {
@@ -112,10 +160,12 @@ pub struct Session {
     audio_track: Option<Decoder>,
     subtitle_track: Option<(usize, Arc<PacketQueue>)>,
     initial_subtitles: Option<SubtitleStream>,
+    /// Set on drop, so a network read that hangs gives up and the demuxer can be joined.
+    cancel: Arc<AtomicBool>,
 }
 
 impl Session {
-    /// Opens `path` and starts playing it, from `start` seconds if given.
+    /// Opens the file at `path` and starts playing it, from `start` seconds if given.
     pub fn open(
         path: &Path,
         start: Option<f64>,
@@ -124,7 +174,27 @@ impl Session {
         hw: Option<&HwDevice>,
         audio: &Arc<audio::Device>,
     ) -> Result<Session, Box<dyn Error>> {
-        let input = ff::format::input(path).map_err(|e| format!("cannot open {path:?}: {e}"))?;
+        let cancel = Arc::new(AtomicBool::new(false));
+        let options = NetOptions {
+            timeout: 15,
+            reconnect: true,
+        };
+        let input = open_input(path, options, &cancel)?;
+        Session::open_with(input, cancel, path, start, choice, shared, hw, audio)
+    }
+
+    /// Starts playing `input`, opened from `path` by `open_input` with `cancel`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn open_with(
+        input: ff::format::context::Input,
+        cancel: Arc<AtomicBool>,
+        path: &Path,
+        start: Option<f64>,
+        choice: &TrackChoice,
+        shared: &Arc<Shared>,
+        hw: Option<&HwDevice>,
+        audio: &Arc<audio::Device>,
+    ) -> Result<Session, Box<dyn Error>> {
         shared.reset();
         let duration = if input.duration() > 0 {
             input.duration() as f64 / f64::from(ff::ffi::AV_TIME_BASE)
@@ -210,18 +280,32 @@ impl Session {
                 .or(forced_subtitles)
         };
 
-        let mut session = Session {
-            path: path.to_owned(),
-            frames: Arc::new(FrameQueue::default()),
-            title: path
+        let url = net::is_url_path(path).then(|| path.to_string_lossy().into_owned());
+        let title = match &url {
+            // A stream's own title ("icy-name" for radio) beats its address.
+            Some(url) => (input.metadata().get("icy-name"))
+                .or(input.metadata().get("title"))
+                .map(str::trim)
+                .filter(|t| !t.is_empty())
+                .map_or_else(|| net::url_name(url), str::to_owned),
+            None => path
                 .file_stem()
                 .unwrap_or(path.as_os_str())
                 .to_string_lossy()
                 .replace('_', " "),
-            folder: path
+        };
+        let folder = match &url {
+            Some(url) => net::host_of(url).unwrap_or_default(),
+            None => path
                 .parent()
                 .and_then(|p| p.file_name())
                 .map_or_else(String::new, |f| f.to_string_lossy().into_owned()),
+        };
+        let mut session = Session {
+            path: path.to_owned(),
+            frames: Arc::new(FrameQueue::default()),
+            title,
+            folder,
             duration,
             video_size: None,
             chapters,
@@ -237,6 +321,7 @@ impl Session {
             audio_track: None,
             subtitle_track: None,
             initial_subtitles: None,
+            cancel,
         };
         if let Some(stream) = video {
             let decoder = session.open_video(stream)?;
@@ -590,6 +675,7 @@ fn read_chapters(input: &ff::format::context::Input) -> Vec<(f64, String)> {
 impl Drop for Session {
     fn drop(&mut self) {
         self.shared.stopping.store(true, Relaxed);
+        self.cancel.store(true, Relaxed);
         let decoders = [self.video_track.take(), self.audio_track.take()];
         let threads = decoders.into_iter().flatten().map(|d| d.thread);
         let externals = self.externals.drain(..).map(|e| e.demuxer);

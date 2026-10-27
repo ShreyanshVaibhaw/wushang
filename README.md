@@ -59,7 +59,7 @@ The title bar has minimize, maximize, fullscreen and close, and dragging it move
 While playing, the bars hide after 3 seconds without mouse movement and the video fills the window inside a 10 px rounded frame; moving the mouse brings them back.
 The "…" button opens the main menu from the design: open files, open a folder, recent files, settings profiles, keyboard shortcuts, Customize Player, Settings and About.
 Right-clicking the video opens the player menu: play, stop, previous, next, hide the controls, the mini player, and submenus for speed and sleep timer, video tracks and transforms, audio tracks, stereo mode and output device, subtitles, the settings tabs, the queue, and opening media.
-Items for features myvlc doesn't have (network streams, discs, capture devices, converting, recording) are shown dimmed.
+Items for features myvlc doesn't have (discs, capture devices, converting, recording) are shown dimmed.
 
 The playlist button opens the queue panel from the design, in the settings panel's place, with three tabs:
 
@@ -136,10 +136,22 @@ The progress bar seeks with a click or a drag.
 The queue button opens the queue above the video, in the design's style, with sort, remove and add; the window grows upward to make room.
 Esc or Ctrl+M also leaves the mini player window.
 
+### Network
+
+Ctrl+N, "Open Network Stream" in the "..." menu, or "Add Network Stream" on the Network page asks for an address and plays it: http, https, HLS (`.m3u8`), RTSP, UDP or RTP.
+A bare host like `example.com/live.m3u8` gets `http://` in front, as in VLC, and `myvlc <address>` plays one from the command line.
+The address stays on the Network page; right-clicking it offers Remove.
+A stream connects in the background while the player says "Connecting to ...", and if it can't play, the corner says so before the library comes back.
+A live stream, which has no end, shows "Live" in place of its length.
+Podcasts takes an RSS or Atom feed and lists its episodes, newest as the feed orders them, under the feed's own title; right-clicking a podcast removes it.
+Radio lists the 100 most voted stations of the community [Radio Browser](https://www.radio-browser.info) directory, with their genre and country.
+Episodes and stations play with the name the page shows, and next and previous move through the page.
+Feeds and the directory load over WinHTTP on a background thread, so the window never waits on them.
+
 ### Settings
 
 Ctrl+P or Settings in the "..." menu opens the Settings window from the design's "Settings" frames: categories on the left, their options on the right, and a search box that finds an option in any category.
-Every option it lists does something; the design's categories with nothing behind them yet (Network, Recording, Extensions) are dimmed.
+Every option it lists does something; the design's categories with nothing behind them yet (Recording, Extensions) are dimmed.
 Changes apply at once and are kept in `settings.txt` next to the library state.
 
 - General: dark, light or system theme, and the accent colour.
@@ -156,6 +168,7 @@ Changes apply at once and are kept in `settings.txt` next to the library state.
   "Custom" is the last equalizer tuned by hand in the panel, kept while a preset plays.
 - Subtitles: on or off, the preferred language, loading subtitle files on their own, and their size, weight, colour, opacity, outline and shadow.
 - Library: show hidden files and folders.
+- Network: reconnect when a stream drops, and how long a stalled connection may wait (15 seconds by default).
 - Performance: turn off GPU decoding.
 
 The equalizer, stereo mode, subtitle size, repeat and shuffle chosen in the panels are kept the same way.
@@ -195,13 +208,14 @@ SRC=/mnt/d/tools/src/ffmpeg-9.0.2 DAV1D_SRC=/mnt/d/tools/src/dav1d-1.5.4 \
   bash scripts/build-ffmpeg.sh
 ```
 
-It builds only the file protocol, 33 demuxers, 20 parsers, 50 decoders and the D3D11VA hwaccels, plus libswresample and libswscale.
+It builds the file protocol and the network ones a player opens (http, https, tcp, udp, rtp, with TLS from Windows' Schannel), 36 demuxers (HLS and RTSP among them), 20 parsers, 50 decoders and the D3D11VA hwaccels, plus libswresample and libswscale.
 The subtitle decoders (SRT, ASS/SSA, WebVTT, MP4 text, MicroDVD, SubViewer, SAMI, DVD, DVB and PGS) and their file demuxers add 78 KB.
 zlib, linked statically into `avformat-63.dll` (43 KB more), lets the Matroska reader open tracks stored zlib-compressed, which mkvmerge does to subtitles by default; without it those files log "Unsupported encoding type" and their subtitles are lost.
 One of the decoders is libdav1d, linked statically into `avcodec-63.dll`, so AV1 plays in software on GPUs without AV1 support.
-Encoders, muxers, filters, devices, networking and the command-line programs are left out.
+Encoders, muxers, filters, devices and the command-line programs are left out.
+Networking adds 286 KB to `avformat-63.dll`, which then also imports `WS2_32`, `Secur32`, `CRYPT32` and `ncrypt`.
 x86 assembly stays on, so software decoding is as fast as in a full build.
-The DLLs import only `KERNEL32`, `msvcrt` and `bcrypt`.
+Apart from that, the DLLs import only `KERNEL32`, `msvcrt` and `bcrypt`.
 
 ## How it works
 
@@ -298,7 +312,7 @@ The memory, CPU and startup rows were measured before libdav1d was added to the 
 
 | | Full (BtbN LGPL) | Slim, with libdav1d |
 |---|---|---|
-| Five FFmpeg DLLs on disk | 114.4 MB | 13.9 MB (11.8 MB without libdav1d) |
+| Five FFmpeg DLLs on disk | 114.4 MB | 14.3 MB (12.1 MB without libdav1d) |
 | `avcodec-63.dll` | 86.9 MB | 9.9 MB (7.9 MB without libdav1d) |
 | H.264: private memory / working set | 88.8 / 88.2 MB | 79.1 / 82.2 MB |
 | HEVC: private memory / working set | 98.2 / 94.9 MB | 88.6 / 89.1 MB |
@@ -341,10 +355,10 @@ Each of these is marked with a `ponytail:` comment in the code, along with the u
 - Software frames reach the GPU as 8-bit NV12, so 10-bit video loses its extra precision there, and 4K60 10-bit H.264 drops frames on a laptop CPU.
 - Audio devices must mix in f32, which every WASAPI shared-mode device seen so far does.
 - The audio callback takes a mutex.
-- Network read errors end playback instead of retrying.
+- A dropped stream reconnects only where FFmpeg does it (http and HLS); RTSP and UDP end when the connection does.
+- A podcast feed is fetched once per run, so new episodes show after a restart.
 - A video stream that fails its first 60 packets counts as undecodable, and playback goes on with audio only.
 - Thumbnails stay in memory for the whole run, about 350 KB each.
-- Network, Podcasts and Radio do nothing.
 - The folder picker is modal, so the video pauses on screen while it is open (audio keeps playing).
 
 ## Licence of the build

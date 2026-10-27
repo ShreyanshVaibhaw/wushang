@@ -75,6 +75,7 @@ use bookmarks::Bookmarks;
 use captions::CaptionStyle;
 use dsp::{EQ_PRESETS, StereoMode};
 use library::{Entry, Library, MediaKind, Place, Section, Track};
+use net::NetKind;
 use player::{HwDevice, Shared, VideoFrame};
 use prefs::Prefs;
 use queue::{Queue, Repeat};
@@ -206,6 +207,20 @@ struct App {
     notice: Option<(String, Instant)>,
     /// Lines for the notice from other threads, such as the snapshot writer.
     notices: (mpsc::Sender<String>, mpsc::Receiver<String>),
+    /// A stream address connecting on a thread of its own, so the window never waits on it.
+    opening: Option<Opening>,
+    /// Podcast feeds and the radio directory, fetched in the background.
+    fetcher: net::Fetcher,
+    /// The library page shown last, to notice when the Network pages are entered.
+    shown_place: Option<Place>,
+    /// Names for stream addresses played from a library page: a station or episode name.
+    stream_titles: HashMap<PathBuf, String>,
+}
+
+struct Opening {
+    path: PathBuf,
+    ready: mpsc::Receiver<Result<ff::format::context::Input, String>>,
+    cancel: Arc<AtomicBool>,
 }
 
 impl App {
@@ -220,9 +235,39 @@ impl App {
         self.open(path)
     }
 
-    /// Opens `path` from where it was left, keeping the queue as it is.
+    /// Opens `path` from where it was left, keeping the queue as it is. A stream address
+    /// connects in the background and starts playing once it answers.
     fn open(&mut self, path: &Path) -> bool {
         self.stop();
+        let p = prefs();
+        let options = session::NetOptions {
+            timeout: p.net_timeout,
+            reconnect: p.net_reconnect,
+        };
+        let cancel = Arc::new(AtomicBool::new(false));
+        if net::is_url_path(path) {
+            let (done, ready) = mpsc::channel();
+            let (url, flag) = (path.to_owned(), cancel.clone());
+            thread::spawn(move || _ = done.send(session::open_input(&url, options, &flag)));
+            let host = net::host_of(&path.to_string_lossy()).unwrap_or_default();
+            self.notice = Some((format!("Connecting to {host}..."), Instant::now()));
+            self.opening = Some(Opening {
+                path: path.to_owned(),
+                ready,
+                cancel,
+            });
+            return true;
+        }
+        let input = session::open_input(path, options, &cancel);
+        self.start(path, input.map(|input| (input, cancel)))
+    }
+
+    /// Starts playing what `open` opened at `path`.
+    fn start(
+        &mut self,
+        path: &Path,
+        input: Result<(ff::format::context::Input, Arc<AtomicBool>), String>,
+    ) -> bool {
         let p = prefs();
         let start = if p.resume == 0 {
             self.library.resume_position(path)
@@ -235,8 +280,23 @@ impl App {
             subtitles: p.subtitles,
         };
         let hw = self.hw.as_ref().filter(|_| p.hw_decoding);
-        match Session::open(path, start, &choice, &self.shared, hw, &self.audio) {
-            Ok(s) => {
+        let opened = input.map_err(Into::into).and_then(|(input, cancel)| {
+            Session::open_with(
+                input,
+                cancel,
+                path,
+                start,
+                &choice,
+                &self.shared,
+                hw,
+                &self.audio,
+            )
+        });
+        match opened {
+            Ok(mut s) => {
+                if let Some(title) = self.stream_titles.get(path) {
+                    s.title = title.clone();
+                }
                 if s.duration > 0.0 {
                     self.durations.insert(path.to_owned(), s.duration);
                 }
@@ -259,6 +319,11 @@ impl App {
             }
             Err(e) => {
                 eprintln!("myvlc: {e}");
+                if net::is_url_path(path) {
+                    let host = net::host_of(&path.to_string_lossy()).unwrap_or_default();
+                    self.notice =
+                        Some((format!("Can't play the stream from {host}"), Instant::now()));
+                }
                 false
             }
         }
@@ -266,6 +331,9 @@ impl App {
 
     /// Plays a file opened from outside the library, queued with the rest of its folder.
     fn play_file(&mut self, path: &Path) -> bool {
+        if net::is_url_path(path) {
+            return self.play(path, vec![path.to_owned()]);
+        }
         let queue = path.parent().map_or_else(Vec::new, |dir| {
             self.library
                 .media_in(&Place::Folder(section_of(path), dir.to_owned()))
@@ -274,6 +342,9 @@ impl App {
     }
 
     fn stop(&mut self) {
+        if let Some(o) = self.opening.take() {
+            o.cancel.store(true, Relaxed);
+        }
         self.record();
         self.current = None;
         self.session = None;
@@ -444,27 +515,7 @@ impl App {
                     self.show_external(Some(i));
                 }
             }
-            PanelAction::AddAudioFile => {
-                let filters = [
-                    ("Audio files", file_spec(library::AUDIO_EXTS)),
-                    ("Video files", file_spec(library::VIDEO_EXTS)),
-                    ("All files", "*.*".to_owned()),
-                ];
-                let Some(path) = pick_files(hwnd, &filters, false).pop() else {
-                    return;
-                };
-                let Some(session) = self.session.as_mut() else {
-                    return;
-                };
-                match session.add_audio_file(&path) {
-                    Ok(stream) => {
-                        let audio = session.tracks(TrackKind::Audio);
-                        let i = audio.iter().position(|t| t.stream == stream);
-                        self.select_track(TrackTab::Audio, i);
-                    }
-                    Err(e) => eprintln!("audio: {e}"),
-                }
-            }
+            PanelAction::AddAudioFile => add_audio_file(self, hwnd),
             PanelAction::SelectDevice(i) => {
                 // The list starts with the system default, which also follows Windows' choice.
                 let name = (i > 0).then(|| self.devices.get(i)).flatten();
@@ -653,7 +704,7 @@ impl App {
             .collect();
         // The recent list keeps absolute paths; the queue keeps them as listed.
         self.watched = (self.queue.items().iter())
-            .filter(|p| std::path::absolute(p).is_ok_and(|a| finished.contains(&a)))
+            .filter(|p| finished.contains(&library::abs(p)))
             .cloned()
             .collect();
     }
@@ -864,7 +915,7 @@ fn section_of(path: &Path) -> Section {
 
 fn run() -> Result<(), Box<dyn Error>> {
     let started = Instant::now();
-    const USAGE: &str = "usage: myvlc [--sw] [--play-and-exit] [file]";
+    const USAGE: &str = "usage: myvlc [--sw] [--play-and-exit] [file or stream address]";
     let mut software = false;
     let mut play_and_exit = false;
     let mut path = None;
@@ -884,6 +935,8 @@ fn run() -> Result<(), Box<dyn Error>> {
     }
 
     ff::init()?;
+    // Sets up Winsock and TLS once, instead of on every stream opened.
+    unsafe { ff::ffi::avformat_network_init() };
     ff::util::log::set_level(ff::util::log::Level::Error);
     // The folder picker is a COM object.
     unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED).ok()? };
@@ -946,6 +999,10 @@ fn run() -> Result<(), Box<dyn Error>> {
         profiles: profiles::Profiles::load(&Library::default_dir()),
         notice: None,
         notices: mpsc::channel(),
+        opening: None,
+        fetcher: net::Fetcher::new(),
+        shown_place: None,
+        stream_titles: HashMap::new(),
     };
     app.queue.set_repeat(REPEAT[settings.repeat.min(2)]);
     app.queue.set_shuffle(settings.shuffle);
@@ -1125,14 +1182,23 @@ fn run() -> Result<(), Box<dyn Error>> {
         if WANT_SNAPSHOT.take() {
             take_snapshot(&app, &mut renderer);
         }
+        fetch_network(&mut app);
+        if let Some(input) = app.opening.as_ref().and_then(|o| o.ready.try_recv().ok()) {
+            let o = app.opening.take().unwrap();
+            app.notice = None;
+            app.start(&o.path, input.map(|input| (input, o.cancel)));
+            UI.with_borrow_mut(|ui| ui.dirty = true);
+        }
         if let Some(text) = app.notices.1.try_iter().last() {
             app.notice = Some((text, Instant::now()));
             UI.with_borrow_mut(|ui| ui.dirty = true);
         }
-        if app
-            .notice
-            .as_ref()
-            .is_some_and(|(_, at)| at.elapsed() > NOTICE_FOR)
+        // "Connecting..." stays until the stream answers.
+        if app.opening.is_none()
+            && app
+                .notice
+                .as_ref()
+                .is_some_and(|(_, at)| at.elapsed() > NOTICE_FOR)
         {
             app.notice = None;
             UI.with_borrow_mut(|ui| ui.dirty = true);
@@ -1282,8 +1348,10 @@ fn run() -> Result<(), Box<dyn Error>> {
         let queue_data = UI.with_borrow(|ui| ui.queue.open).then(|| app.queue_data());
         let needs_paint = UI.with_borrow_mut(|ui| {
             // Nothing to show on the player page once playback ends or fails, unless its bars
-            // are being customized.
-            if app.session.is_none() && ui.customize.is_none() {
+            // are being customized. A stream connecting, or the notice saying why it couldn't,
+            // keeps it up.
+            let waiting = app.opening.is_some() || app.notice.is_some();
+            if app.session.is_none() && !waiting && ui.customize.is_none() {
                 ui.show(Page::Library);
             }
             ui.menu_tick();
@@ -1403,6 +1471,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                     hover: ui.hover,
                     position: ui.seek_preview().map_or(last_position, |f| f * duration),
                     duration,
+                    live: duration <= 0.0 && session.is_some_and(|s| net::is_url_path(&s.path)),
                     paused,
                     volume: shared.volume(),
                     muted: shared.muted.load(Relaxed),
@@ -1612,6 +1681,15 @@ fn handle(app: &mut App, hwnd: HWND, hit: Hit) {
                         app.library.record_playlist_play(name);
                     }
                     let queue = app.library.media_in(&place);
+                    // Streams have no tags to name them by; the page's names do, for the whole
+                    // queue.
+                    if net::is_url_path(&path) {
+                        for entry in app.library.entries(&place) {
+                            if let Entry::Media { path, label, .. } = entry {
+                                app.stream_titles.insert(path, label);
+                            }
+                        }
+                    }
                     if app.play(&path, queue) {
                         UI.with_borrow_mut(|ui| ui.show(Page::Player));
                     }
@@ -1619,8 +1697,12 @@ fn handle(app: &mut App, hwnd: HWND, hit: Hit) {
                 Entry::Action { action, .. } => match action {
                     library::Action::AddFolder(section) => add_folder(app, hwnd, section),
                     library::Action::CreatePlaylist => create_playlist(app),
-                    // ponytail: network streams, podcasts and radio arrive with networking.
-                    _ => {}
+                    library::Action::AddNetworkStream => {
+                        open_dialog(app, Dialog::Address(NetKind::Stream));
+                    }
+                    library::Action::AddPodcast => {
+                        open_dialog(app, Dialog::Address(NetKind::Podcast))
+                    }
                 },
             }
         }
@@ -1710,11 +1792,8 @@ fn open_menu(app: &mut App, hit: Hit, at: (f32, f32)) {
                 } => app.library.playlist_items(name),
                 _ => Vec::new(),
             };
-            let within = UI.with_borrow(|ui| match &ui.browse.place {
-                Place::Playlist(name) => Some(name.clone()),
-                _ => None,
-            });
-            match menu::entry_menu(&entry, &app.library.playlists(), &items, within.as_deref()) {
+            let place = UI.with_borrow(|ui| ui.browse.place.clone());
+            match menu::entry_menu(&entry, &app.library.playlists(), &items, &place) {
                 Some(menu) => menu,
                 None => return,
             }
@@ -1799,6 +1878,7 @@ fn menu_action(app: &mut App, hwnd: HWND, action: MenuAction) {
             }
         }
         MenuAction::NewProfile => open_dialog(app, Dialog::NewProfile),
+        MenuAction::OpenNetwork => open_dialog(app, Dialog::Address(NetKind::Stream)),
         MenuAction::Snapshot => WANT_SNAPSHOT.set(true),
         MenuAction::Panel(a) => app.apply(hwnd, a),
         MenuAction::Queue(a) => {
@@ -1841,6 +1921,30 @@ fn menu_action(app: &mut App, hwnd: HWND, action: MenuAction) {
             }
         }
         MenuAction::AddSubtitleTo(path) => add_subtitle_to(app, hwnd, &path),
+        MenuAction::AddAudioTo(path) => {
+            if app.session.as_ref().is_none_or(|s| s.path != path) {
+                let place = UI.with_borrow(|ui| ui.browse.place.clone());
+                let mut queue = app.library.media_in(&place);
+                if !queue.contains(&path) {
+                    queue = vec![path.clone()];
+                }
+                if !app.play(&path, queue) {
+                    return;
+                }
+                show_player();
+            }
+            add_audio_file(app, hwnd);
+        }
+        MenuAction::ForgetAddress(kind, url) => {
+            app.library.remove_address(kind, &url);
+            app.library_changed = true;
+            UI.with_borrow_mut(|ui| {
+                if ui.browse.place == Place::Podcast(url) {
+                    ui.browse.go(Place::Podcasts);
+                }
+                ui.browse.stale = true;
+            });
+        }
         MenuAction::AddFolder(section) => add_folder(app, hwnd, section),
         MenuAction::Resync => UI.with_borrow_mut(|ui| ui.browse.stale = true),
         MenuAction::PlayPlaylist(name) => play_playlist(app, &name, false),
@@ -1903,6 +2007,29 @@ fn toggle_favorite(app: &mut App, path: &Path) {
     app.library.set_favorite(path, !favorite);
     app.library_changed = true;
     UI.with_borrow_mut(|ui| ui.browse.stale = true);
+}
+
+/// Picks an audio file and plays its sound with the open file, as a track of its own.
+fn add_audio_file(app: &mut App, hwnd: HWND) {
+    let filters = [
+        ("Audio files", file_spec(library::AUDIO_EXTS)),
+        ("Video files", file_spec(library::VIDEO_EXTS)),
+        ("All files", "*.*".to_owned()),
+    ];
+    let Some(path) = pick_files(hwnd, &filters, false).pop() else {
+        return;
+    };
+    let Some(session) = app.session.as_mut() else {
+        return;
+    };
+    match session.add_audio_file(&path) {
+        Ok(stream) => {
+            let audio = session.tracks(TrackKind::Audio);
+            let i = audio.iter().position(|t| t.stream == stream);
+            app.select_track(TrackTab::Audio, i);
+        }
+        Err(e) => eprintln!("audio: {e}"),
+    }
 }
 
 /// Picks a subtitle file for `path` and shows it: on the open file, or on `path` once it plays.
@@ -2015,6 +2142,27 @@ fn apply_dialog(app: &mut App, hwnd: HWND, action: DialogAction) {
         _ => format!("Can't save the playlist: {e}"),
     };
     match action {
+        DialogAction::OpenAddress(kind, typed) => match net::normalize_url(&typed) {
+            Err(e) => UI.with_borrow_mut(|ui| ui.dialog_error(e)),
+            Ok(url) => {
+                UI.with_borrow_mut(Ui::close_dialog);
+                let name = app.library.address_name(kind, &url);
+                app.library.add_address(kind, &url, &name);
+                app.library_changed = true;
+                UI.with_borrow_mut(|ui| ui.browse.stale = true);
+                if kind == NetKind::Podcast {
+                    UI.with_borrow_mut(|ui| {
+                        ui.browse.go(Place::Podcast(url));
+                        ui.show(Page::Library);
+                    });
+                } else {
+                    let path = PathBuf::from(url);
+                    if app.play(&path, vec![path.clone()]) {
+                        UI.with_borrow_mut(|ui| ui.show(Page::Player));
+                    }
+                }
+            }
+        },
         DialogAction::DeletePlaylist(name) => {
             if let Err(e) = app.library.delete_playlist(&name) {
                 eprintln!("library: cannot delete {name}: {e}");
@@ -2921,6 +3069,38 @@ fn use_tool(app: &mut App, hwnd: HWND, item: ui::ToolItem) {
     }
 }
 
+/// Fetches the podcast feed or radio directory the library page shows, and takes in what
+/// finished. Entering one of those pages again retries a fetch that failed.
+fn fetch_network(app: &mut App) {
+    let place = UI.with_borrow(|ui| ui.browse.place.clone());
+    if app.shown_place.as_ref() != Some(&place) {
+        app.library.retry_failed(&place);
+        app.shown_place = Some(place.clone());
+    }
+    if app.library.wants_fetch(&place) {
+        app.library.fetching(&place);
+        let timeout = Duration::from_secs(prefs().net_timeout.into());
+        match &place {
+            Place::Podcast(url) => app.fetcher.feed(url, timeout),
+            _ => app.fetcher.stations(timeout),
+        }
+    }
+    let ready = app.fetcher.take_ready();
+    for fetched in &ready {
+        match fetched {
+            net::Fetched::Feed { feed, result } => {
+                app.library.feed_fetched(feed, result.clone());
+                // The feed's own title replaces the address as its name.
+                app.library_changed = true;
+            }
+            net::Fetched::Stations(result) => app.library.stations_fetched(result.clone()),
+        }
+    }
+    if !ready.is_empty() {
+        UI.with_borrow_mut(|ui| ui.browse.stale = true);
+    }
+}
+
 /// How long a notice stays over the video.
 const NOTICE_FOR: Duration = Duration::from_secs(3);
 
@@ -3011,6 +3191,7 @@ fn on_key(hwnd: HWND, shared: &Shared, key: VIRTUAL_KEY) {
     let menu = |action| act(hwnd, shared, Some(Action::Menu(action)));
     let shortcut = match key {
         VK_O if ctrl => Some(MenuAction::OpenFiles),
+        VK_N if ctrl => Some(MenuAction::OpenNetwork),
         VK_F if ctrl => Some(MenuAction::OpenFolder),
         VK_P if ctrl => Some(MenuAction::Preferences(Category::Playback)),
         VK_Q if ctrl => Some(MenuAction::Quit),

@@ -951,6 +951,8 @@ pub struct Scene<'a> {
     /// Seconds.
     pub position: f64,
     pub duration: f64,
+    /// A stream with no end, like radio: its length reads "Live".
+    pub live: bool,
     pub paused: bool,
     pub volume: f32,
     pub muted: bool,
@@ -1645,7 +1647,12 @@ impl Painter {
         let l = s.layout;
         unsafe {
             self.text(rt, &clock_text(s.position), &self.times, l.current);
-            self.text(rt, &clock_text(s.duration), &self.times, l.duration);
+            let total = if s.live {
+                "Live".to_owned()
+            } else {
+                clock_text(s.duration)
+            };
+            self.text(rt, &total, &self.times, l.duration);
             // Seek bar: dark track, a played section and an orange handle at its end.
             let t = l.track;
             rt.FillRoundedRectangle(&rounded(t, 6.0), &self.track);

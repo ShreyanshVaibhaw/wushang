@@ -1294,16 +1294,27 @@ impl Painter {
                                 if known.is_none() {
                                     self.wanted.push(path.clone());
                                 }
+                                // Streams never get a picture; they show the Network glyph.
+                                let stream = crate::net::is_url_path(path);
                                 let audio = *kind == MediaKind::Audio;
-                                let fill = if audio { &self.lib.panel } else { &self.black };
+                                let fill = if audio || stream {
+                                    &self.lib.panel
+                                } else {
+                                    &self.black
+                                };
                                 rt.FillRoundedRectangle(&rounded(tile.thumb, radius), fill);
-                                if audio {
+                                if audio || stream {
                                     let (cx, cy) = (
                                         (tile.thumb.l + tile.thumb.r) / 2.0,
                                         (tile.thumb.t + tile.thumb.b) / 2.0,
                                     );
                                     let scale = if grid { 2.0 } else { 1.0 };
-                                    self.icon_scaled(ctx, &self.icons.music, cx, cy, scale);
+                                    let icon = if stream {
+                                        &self.icons.network
+                                    } else {
+                                        &self.icons.music
+                                    };
+                                    self.icon_scaled(ctx, icon, cx, cy, scale);
                                 }
                             }
                         }

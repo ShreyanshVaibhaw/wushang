@@ -104,7 +104,7 @@ impl Bookmarks {
 /// Files are keyed by absolute path, so a file opened from the command line by a relative
 /// path finds its bookmarks too.
 fn key(path: &Path) -> PathBuf {
-    std::path::absolute(path).unwrap_or_else(|_| path.to_owned())
+    crate::library::abs(path)
 }
 
 fn parse(text: &str) -> Vec<Bookmark> {

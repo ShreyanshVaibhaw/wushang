@@ -551,7 +551,9 @@ pub fn spawn_demuxer(
                         r.queue.push(Msg::Packet(packet));
                     }
                 }
-                // ponytail: any read error ends the stream; retry transient errors if network sources matter.
+                // A live stream with nothing to read yet; reconnecting after real drops happens
+                // inside FFmpeg (see `session::open_input`), so any other error ends the stream.
+                Err(ff::Error::Other { errno }) if errno == ffi::EAGAIN => thread::sleep(POLL / 2),
                 Err(_) => {
                     for r in routes.lock().unwrap().iter() {
                         r.queue.push(Msg::Eof);

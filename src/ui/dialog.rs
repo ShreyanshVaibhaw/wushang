@@ -10,6 +10,7 @@ use std::ops::Range;
 use std::path::{Path, PathBuf};
 
 use super::*;
+use crate::net::NetKind;
 use windows::Win32::Foundation::{GENERIC_READ, GlobalFree, HANDLE, HGLOBAL};
 use windows::Win32::Graphics::Imaging::*;
 use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance};
@@ -38,6 +39,8 @@ pub enum Dialog {
     DeletePlaylist(String),
     /// Names a new settings profile.
     NewProfile,
+    /// Asks for a stream to play, or a podcast feed to add.
+    Address(NetKind),
 }
 
 /// What the open dialog asks main.rs to do.
@@ -64,6 +67,9 @@ pub enum DialogAction {
     /// Add the profile and switch to it; on success close the dialog, else report with
     /// [`Ui::dialog_error`].
     CreateProfile(String),
+    /// Play the stream or add the feed at the typed address; on success close the dialog, else
+    /// report with [`Ui::dialog_error`].
+    OpenAddress(NetKind, String),
 }
 
 /// What a click lands on.
@@ -124,7 +130,7 @@ const FG_BUTTON_OFF: u32 = 0x606060;
 /// The keys main.rs handles, for the Keyboard Shortcuts dialog.
 // ponytail: a copy of on_key and the menus' accelerators; one table both read would keep them
 // in step.
-const SHORTCUTS: [(&str, &str); 21] = [
+const SHORTCUTS: [(&str, &str); 22] = [
     ("Space", "Play or pause"),
     ("Left / Right", "Skip back or forward (Settings > Controls)"),
     (
@@ -144,6 +150,7 @@ const SHORTCUTS: [(&str, &str); 21] = [
     ("Shift + S", "Snapshot, saved in Pictures\\myvlc"),
     ("Ctrl + O", "Open files"),
     ("Ctrl + F", "Open a folder"),
+    ("Ctrl + N", "Open a network stream"),
     ("Ctrl + P", "Settings"),
     ("Ctrl + M", "Mini player, and back"),
     ("Ctrl + I", "Properties of the file playing or pointed at"),
@@ -362,7 +369,11 @@ impl State {
             Dialog::NewPlaylist { files } => state.add_files(files),
             Dialog::RenamePlaylist(name) => state.field = TextField::new(&name),
             Dialog::Properties(path) => state.rows = properties(&path),
-            Dialog::About | Dialog::Shortcuts | Dialog::DeletePlaylist(_) | Dialog::NewProfile => {}
+            Dialog::About
+            | Dialog::Shortcuts
+            | Dialog::DeletePlaylist(_)
+            | Dialog::NewProfile
+            | Dialog::Address(_) => {}
         }
         state
     }
@@ -376,26 +387,34 @@ impl State {
             Dialog::Properties(_) => "Properties",
             Dialog::DeletePlaylist(_) => "Delete Playlist",
             Dialog::NewProfile => "New Profile",
+            Dialog::Address(NetKind::Podcast) => "Add Podcast",
+            Dialog::Address(_) => "Open Network Stream",
         }
     }
 
     pub fn has_field(&self) -> bool {
         matches!(
             self.dialog,
-            Dialog::NewPlaylist { .. } | Dialog::RenamePlaylist(_) | Dialog::NewProfile
+            Dialog::NewPlaylist { .. }
+                | Dialog::RenamePlaylist(_)
+                | Dialog::NewProfile
+                | Dialog::Address(_)
         )
     }
 
-    /// The trimmed name, when it can be saved.
+    /// The trimmed name, when it can be saved. An address is checked by main.rs on Save, since
+    /// one half typed always looks wrong.
     fn name(&self) -> Option<&str> {
         let name = self.field.text.trim();
-        (!name.is_empty() && crate::library::check_name(name).is_ok()).then_some(name)
+        let address = matches!(self.dialog, Dialog::Address(_));
+        (!name.is_empty() && (address || crate::library::check_name(name).is_ok())).then_some(name)
     }
 
     /// The live complaint about the typed name, before main.rs ever sees it.
     fn name_error(&self) -> Option<&'static str> {
         let name = self.field.text.trim();
-        (!name.is_empty() && crate::library::check_name(name).is_err())
+        let address = matches!(self.dialog, Dialog::Address(_));
+        (!name.is_empty() && !address && crate::library::check_name(name).is_err())
             .then_some("A name can't use < > : \" / \\ | ? *, end with a dot, or be a device name.")
     }
 
@@ -470,6 +489,7 @@ impl State {
                 thumbnail: self.thumbnail.clone().filter(|_| self.thumbnail_picked),
             },
             Dialog::NewProfile => DialogAction::CreateProfile(name),
+            Dialog::Address(kind) => DialogAction::OpenAddress(*kind, name),
             _ => return None,
         })
     }
@@ -809,6 +829,7 @@ impl Painter {
             Dialog::Properties(_) => 640.0,
             Dialog::About | Dialog::Shortcuts => 600.0,
             Dialog::DeletePlaylist(_) | Dialog::NewProfile => 520.0,
+            Dialog::Address(_) => 600.0,
         };
         let mut b = Builder {
             w,
@@ -824,6 +845,7 @@ impl Painter {
                 self.playlist_parts(&mut b, &mut g, d)
             }
             Dialog::NewProfile => self.profile_parts(&mut b, &mut g, d),
+            Dialog::Address(kind) => self.address_parts(&mut b, &mut g, d, *kind),
             Dialog::About => about_parts(&mut b),
             Dialog::Shortcuts => {
                 let mut y = TITLE_H + 14.0;
@@ -984,6 +1006,34 @@ impl Painter {
             field.b + FOOTER_GAP,
             Some((Target::Cancel, "Cancel")),
             "Save",
+            d.name().is_some(),
+        )
+    }
+
+    /// Open Network Stream and Add Podcast: the address field; returns the height.
+    fn address_parts(&self, b: &mut Builder, g: &mut Geometry, d: &State, kind: NetKind) -> f32 {
+        let w = b.w;
+        let (heading, help, button) = match kind {
+            NetKind::Podcast => ("Feed Address", "The podcast's RSS or Atom feed.", "Add"),
+            _ => (
+                "Network Address",
+                "http, https, HLS (.m3u8), RTSP, UDP or RTP. It's kept on the Network page.",
+                "Play",
+            ),
+        };
+        b.text(heading, Style::Heading, PAD, 87.0, w - PAD);
+        b.text(help, Style::Help, PAD, 117.0, w - PAD);
+        let field = Rect::new(PAD, 154.0, w - PAD, 188.0);
+        b.parts.push(Part::Field(field));
+        b.target(Target::Field, field);
+        if let Some(e) = &d.error {
+            b.text(e.as_str(), Style::Error, PAD, 201.0, w - PAD);
+        }
+        self.field_stops(g, d, field);
+        b.footer(
+            field.b + FOOTER_GAP,
+            Some((Target::Cancel, "Cancel")),
+            button,
             d.name().is_some(),
         )
     }
@@ -1684,6 +1734,8 @@ impl Painter {
             if f.text.is_empty() {
                 let example = match d.dialog {
                     Dialog::NewProfile => "e.g., Late Night",
+                    Dialog::Address(NetKind::Podcast) => "e.g., https://example.com/feed.xml",
+                    Dialog::Address(_) => "e.g., https://example.com/live.m3u8",
                     _ => "e.g., Favorite Videos",
                 };
                 self.say(rt, example, &r.field_text, area, &r.placeholder_fg);
