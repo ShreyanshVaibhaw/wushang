@@ -35,6 +35,9 @@ pub const MAX_VOLUME: f32 = 2.0;
 /// Video packets that may fail before the first frame until the stream counts as undecodable,
 /// about two seconds at 30 fps.
 const GIVE_UP_AFTER: u32 = 60;
+/// Failed packets before the first frame after which a stream opened for the GPU is tried in
+/// software instead; a few, so one corrupt packet at the start doesn't cost the GPU.
+const FALLBACK_AFTER: u32 = 8;
 
 /// Playback position in seconds. The audio callback drives it; without audio, the first video
 /// frame starts it and it runs on the system clock.
@@ -427,8 +430,7 @@ pub fn open_video_decoder(
     let id = parameters.id();
     // libavcodec prefers libdav1d for AV1, and libdav1d never uses the GPU. Take FFmpeg's own AV1
     // decoder when the GPU has an AV1 profile; otherwise keep libdav1d and give it every core.
-    // ponytail: an AV1 stream the GPU profile rejects (12-bit, 4:4:4) then gets no video;
-    // reopen with libdav1d if those files turn up.
+    // A stream the GPU then turns down is reopened in software by the decoder thread.
     let (codec, hw) = match hw {
         Some(device) if id == ff::codec::Id::AV1 && device.decodes_av1() => {
             (ff::decoder::find_by_name("av1"), hw)
@@ -447,8 +449,8 @@ pub fn open_video_decoder(
                 (*raw).get_format = Some(prefer_d3d11);
                 (*raw).extra_hw_frames = EXTRA_HW_FRAMES;
             }
-            // ponytail: the hardware path decodes on one thread to keep the surface pool small, so a
-            // stream that falls back to software from there is single-threaded too. Reopen if it matters.
+            // The hardware path decodes on one thread to keep the surface pool small; software
+            // takes every core.
             None => (*raw).thread_count = 0,
         }
     }
@@ -534,6 +536,12 @@ pub fn spawn_demuxer(
     })
 }
 
+/// `decoder`'s stream reopened for software decoding on every core (libdav1d for AV1).
+fn software_decoder(decoder: &ff::decoder::Video) -> Option<ff::decoder::Video> {
+    let time_base = unsafe { (*decoder.as_ptr()).pkt_timebase }.into();
+    open_video_decoder(ff::codec::Parameters::from(decoder), time_base, None).ok()
+}
+
 pub fn spawn_video_decoder(
     mut decoder: ff::decoder::Video,
     time_base: f64,
@@ -547,6 +555,21 @@ pub fn spawn_video_decoder(
         let mut next_pts = 0.0;
         let mut format = None;
         let mut failures = 0;
+        let mut nv12 = crate::nv12::Nv12::default();
+        // Opened for the GPU. If the GPU turns the stream down, libavcodec falls back to
+        // software on one thread, or (FFmpeg's own AV1 decoder) can't decode it at all; either
+        // way the stream is reopened in software and decoded again from the last seek.
+        let mut gpu = unsafe { !(*decoder.as_ptr()).hw_device_ctx.is_null() };
+        let to_software = |decoder: &mut ff::decoder::Video, gpu: &mut bool| {
+            *gpu = false;
+            let Some(software) = software_decoder(decoder) else {
+                return false;
+            };
+            *decoder = software;
+            eprintln!("video: reopened in software on every core");
+            shared.seek_to(shared.seek_floor());
+            true
+        };
         while !shared.quitting() && !packets.closed() {
             let msg = packets.pop();
             // An undecodable stream is still drained, so the demuxer and the audio carry on.
@@ -571,6 +594,12 @@ pub fn spawn_video_decoder(
                 let mut frame = ff::frame::Video::empty();
                 match decoder.receive_frame(&mut frame) {
                     Ok(()) => {
+                        if gpu
+                            && frame.format() != ff::format::Pixel::D3D11
+                            && to_software(&mut decoder, &mut gpu)
+                        {
+                            break;
+                        }
                         if format != Some(frame.format()) {
                             format = Some(frame.format());
                             match frame.format() {
@@ -586,6 +615,17 @@ pub fn spawn_video_decoder(
                         if pts + frame_duration / 2.0 < shared.seek_floor() {
                             continue;
                         }
+                        // Software frames are repacked for the GPU here, off the render thread.
+                        let frame = match frame.format() {
+                            ff::format::Pixel::D3D11 => frame,
+                            _ => match nv12.convert(&frame) {
+                                Ok(f) => f,
+                                Err(e) => {
+                                    eprintln!("video: cannot repack a frame ({e})");
+                                    continue;
+                                }
+                            },
+                        };
                         frames.push(VideoFrame { frame, pts, serial }, &shared, &packets);
                     }
                     Err(ff::Error::Eof) => {
@@ -606,6 +646,10 @@ pub fn spawn_video_decoder(
             // GPU decoder, for example), so stop feeding it and let the audio play on.
             if failed && format.is_none() {
                 failures += 1;
+                if gpu && failures == FALLBACK_AFTER && to_software(&mut decoder, &mut gpu) {
+                    failures = 0;
+                    continue;
+                }
                 if failures == GIVE_UP_AFTER {
                     eprintln!(
                         "video: cannot decode this stream on this machine, playing audio only"

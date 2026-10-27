@@ -181,16 +181,13 @@ struct Processor {
     filters: [Option<D3D11_VIDEO_PROCESSOR_FILTER_RANGE>; 4],
 }
 
-/// Software frames go to the GPU as NV12, so the video processor converts them to RGB and applies
-/// the colour filters exactly as for hardware frames. Drivers skip those filters on RGB input.
+/// Software frames go to the GPU as NV12 (see `nv12`), so the video processor converts them to
+/// RGB and applies the colour filters exactly as for hardware frames.
 struct Upload {
-    key: (Pixel, u32, u32),
-    scaler: ff::software::scaling::Context,
-    nv12: ff::frame::Video,
+    size: (u32, u32),
     /// CPU-writable copy, then the texture the video processor reads.
     staging: ID3D11Texture2D,
     texture: ID3D11Texture2D,
-    space: D3D11_VIDEO_PROCESSOR_COLOR_SPACE,
 }
 
 pub struct Renderer {
@@ -211,6 +208,8 @@ pub struct Renderer {
     size: (u32, u32),
     processor: Option<Processor>,
     upload: Option<Upload>,
+    /// For a software frame that reaches the renderer in another format than NV12.
+    nv12: crate::nv12::Nv12,
     /// Set once an adjustment the GPU can't do has been reported.
     warned: bool,
 }
@@ -267,6 +266,7 @@ impl Renderer {
                 size,
                 processor: None,
                 upload: None,
+                nv12: Default::default(),
                 warned: false,
             })
         }
@@ -643,52 +643,22 @@ impl Renderer {
         Ok(())
     }
 
-    /// Repacks a software frame into NV12 on the GPU; returns the texture and its colour space.
+    /// Copies a software frame to the GPU as NV12; returns the texture and its colour space.
     fn upload(
         &mut self,
         frame: &ff::frame::Video,
     ) -> Result<(ID3D11Texture2D, D3D11_VIDEO_PROCESSOR_COLOR_SPACE)> {
-        let key = (frame.format(), frame.width(), frame.height());
+        let converted;
+        let nv12 = if frame.format() == Pixel::NV12 {
+            frame
+        } else {
+            converted = self.nv12.convert(frame)?;
+            &converted
+        };
+        let size = (nv12.width(), nv12.height());
         // NV12 textures need even sizes; the source rect never reads the padding.
-        let (tex_w, tex_h) = ((key.1 + 1) & !1, (key.2 + 1) & !1);
-        if self.upload.as_ref().is_none_or(|u| u.key != key) {
-            let (format, w, h) = key;
-            let flags = ff::software::scaling::Flags::BILINEAR;
-            let mut scaler =
-                ff::software::scaling::Context::get(format, w, h, Pixel::NV12, w, h, flags)?;
-            let rgb = unsafe {
-                let desc = ffi::av_pix_fmt_desc_get(format.into());
-                !desc.is_null() && (*desc).flags & ffi::AV_PIX_FMT_FLAG_RGB as u64 != 0
-            };
-            // YUV keeps its matrix and range, so swscale only repacks the planes. RGB sources
-            // become BT.709 studio range, and the video processor is told so.
-            let (space, full_range, matrix) = if rgb {
-                let space = D3D11_VIDEO_PROCESSOR_COLOR_SPACE {
-                    _bitfield: (1 << 2) | (1 << 4),
-                };
-                (space, 0, ffi::SWS_CS_ITU709)
-            } else {
-                let full = frame.color_range() == ff::color::Range::JPEG;
-                let matrix = if is_bt709(frame) {
-                    ffi::SWS_CS_ITU709
-                } else {
-                    ffi::SWS_CS_DEFAULT
-                };
-                (ycbcr_space(frame), i32::from(full), matrix)
-            };
-            unsafe {
-                let coefficients = ffi::sws_getCoefficients(matrix);
-                ffi::sws_setColorspaceDetails(
-                    scaler.as_mut_ptr(),
-                    coefficients,
-                    if rgb { 1 } else { full_range },
-                    coefficients,
-                    full_range,
-                    0,
-                    1 << 16,
-                    1 << 16,
-                );
-            }
+        let (tex_w, tex_h) = ((size.0 + 1) & !1, (size.1 + 1) & !1);
+        if self.upload.as_ref().is_none_or(|u| u.size != size) {
             let mut desc = D3D11_TEXTURE2D_DESC {
                 Width: tex_w,
                 Height: tex_h,
@@ -715,18 +685,14 @@ impl Renderer {
                     .CreateTexture2D(&desc, None, Some(&mut staging))?;
             }
             self.upload = Some(Upload {
-                key,
-                scaler,
-                nv12: ff::frame::Video::empty(),
+                size,
                 staging: staging.ok_or("no staging texture")?,
                 texture: texture.ok_or("no upload texture")?,
-                space,
             });
         }
-        let u = self.upload.as_mut().unwrap();
-        u.scaler.run(frame, &mut u.nv12)?;
-        let (w, h) = (key.1 as usize, key.2 as usize);
-        let (ctx, nv12) = (&self.context, &u.nv12);
+        let u = self.upload.as_ref().unwrap();
+        let (w, h) = (size.0 as usize, size.1 as usize);
+        let ctx = &self.context;
         // ponytail: one staging texture, so Map may wait for the previous copy; use two if a profile shows it.
         locked(&self.lock, || -> Result<()> {
             unsafe {
@@ -752,7 +718,7 @@ impl Renderer {
             }
             Ok(())
         })?;
-        Ok((u.texture.clone(), u.space))
+        Ok((u.texture.clone(), ycbcr_space(nv12)))
     }
 }
 
@@ -767,7 +733,7 @@ fn to_pixels(r: Rect) -> RECT {
 
 /// Untagged HD video is BT.709 by convention and SD is BT.601, the same guess VLC and mpv make.
 /// ponytail: BT.2020/HDR maps to BT.601 here; it needs ID3D11VideoContext1 colour spaces.
-fn is_bt709(frame: &ff::frame::Video) -> bool {
+pub fn is_bt709(frame: &ff::frame::Video) -> bool {
     match frame.color_space() {
         ff::color::Space::BT709 => true,
         ff::color::Space::Unspecified => frame.height() >= 720,

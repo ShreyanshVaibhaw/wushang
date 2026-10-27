@@ -245,6 +245,10 @@ AV1 needs one extra decision, because libavcodec always prefers libdav1d, which 
 myvlc asks the GPU for an AV1 decoder profile first.
 If it has one, FFmpeg's own AV1 decoder runs on D3D11VA like every other codec; if not, libdav1d decodes on every CPU core.
 
+A stream the GPU turns down after all, such as 10-bit H.264, which no GPU decodes, or a 4:4:4 AV1, is reopened in software on every core (libdav1d for AV1) and decoded again from the last keyframe.
+The decoder thread repacks software frames to NV12 with swscale, splitting each frame across the cores, so the render thread only copies them to the GPU.
+On the test laptop a 4K60 10-bit H.264 clip went from 90 dropped frames of 300 to about 50; the rest is the CPU's limit for decoding and repacking at once.
+
 The render loop runs above normal priority, as VLC's video output thread does.
 At normal priority, libdav1d's bursts across all cores made it wake up about 40 ms late and skip frames.
 
@@ -321,14 +325,13 @@ Each of these is marked with a `ponytail:` comment in the code, along with the u
 - Subtitle files in a code page other than UTF-8 or Windows-1252 don't load.
 - Contrast and saturation go up to 2x, like VLC's adjust filter; brightness and hue use the GPU's full range.
 - BT.2020 and HDR video show with BT.709/601 colours.
-- If the GPU can't decode a stream, the software fallback runs on one thread.
+- Software frames reach the GPU as 8-bit NV12, so 10-bit video loses its extra precision there, and 4K60 10-bit H.264 drops frames on a laptop CPU.
 - Audio devices must mix in f32, which every WASAPI shared-mode device seen so far does.
 - The audio callback takes a mutex.
 - Settings keep equalizer presets, not hand-tuned bands, so a custom equalizer starts off next time.
 - Network read errors end playback instead of retrying.
 - Video freezes while you drag the window edge, because Windows runs a modal resize loop.
   Audio keeps playing.
-- An AV1 stream that the GPU's AV1 profile rejects (12-bit, 4:4:4) gets no video instead of falling back to libdav1d.
 - A video stream that fails its first 60 packets counts as undecodable, and playback goes on with audio only.
 - Thumbnails stay in memory for the whole run, about 350 KB each.
 - Network, Podcasts and Radio do nothing.

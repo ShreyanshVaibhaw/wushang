@@ -9,6 +9,7 @@ mod bookmarks;
 mod captions;
 mod dsp;
 mod library;
+mod nv12;
 mod player;
 mod prefs;
 mod probe;
