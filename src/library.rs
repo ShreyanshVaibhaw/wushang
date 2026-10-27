@@ -145,6 +145,8 @@ pub enum Entry {
         path: PathBuf,
         kind: MediaKind,
         subtitle: Option<String>,
+        /// From the music index, for the album sorts.
+        album: Option<String>,
         /// Watched fraction, 0..1, when the file has been played.
         progress: Option<f32>,
         /// Watched 95% or more.
@@ -458,7 +460,10 @@ impl Library {
             Place::Songs => {
                 let mut out: Vec<Entry> = if self.tracks.is_empty() {
                     let files = self.music_files();
-                    files.iter().map(|p| media(p, stem_of(p), None)).collect()
+                    files
+                        .iter()
+                        .map(|p| media(p, stem_of(p), None, None))
+                        .collect()
                 } else {
                     self.tracks.iter().map(track_media).collect()
                 };
@@ -537,7 +542,7 @@ impl Library {
             .take(HOME_RECENT)
             .map(|r| match self.track(&r.path) {
                 Some(t) => track_media(t),
-                None => media(&r.path, stem_of(&r.path), None),
+                None => media(&r.path, stem_of(&r.path), None, None),
             })
             .collect();
         section("Listen Again", Place::Recent, listened);
@@ -949,10 +954,16 @@ impl Library {
         self.track_at.get(path).map(|&i| &self.tracks[i])
     }
 
-    /// A file shown by name, with its artist when the music index knows it.
+    /// A file shown by name, with its artist and album when the music index knows them.
     fn file_media(&self, path: &Path) -> Entry {
-        let artist = self.track(path).and_then(|t| t.artist.clone());
-        media(path, name_of(path), artist)
+        let track = self.track(path);
+        let artist = track.and_then(|t| t.artist.clone());
+        media(
+            path,
+            name_of(path),
+            artist,
+            track.and_then(|t| t.album.clone()),
+        )
     }
 
     /// The root section a folder belongs to.
@@ -1015,12 +1026,13 @@ fn crumb(label: &str, place: Place) -> Crumb {
     }
 }
 
-fn media(path: &Path, label: String, subtitle: Option<String>) -> Entry {
+fn media(path: &Path, label: String, subtitle: Option<String>, album: Option<String>) -> Entry {
     Entry::Media {
         label,
         path: path.to_path_buf(),
         kind: media_kind(path).unwrap_or(MediaKind::Video),
         subtitle,
+        album,
         progress: None,
         finished: false,
     }
@@ -1028,7 +1040,7 @@ fn media(path: &Path, label: String, subtitle: Option<String>) -> Entry {
 
 fn track_media(t: &Track) -> Entry {
     let title = t.title.clone().unwrap_or_else(|| stem_of(&t.path));
-    media(&t.path, title, t.artist.clone())
+    media(&t.path, title, t.artist.clone(), t.album.clone())
 }
 
 /// The file or folder name, or the whole path for a drive root like `D:\`.

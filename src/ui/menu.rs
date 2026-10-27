@@ -1073,20 +1073,20 @@ fn playlist_menu(name: &str, items: &[PathBuf]) -> Vec<Item> {
 }
 
 /// The sorting options, the current one checked. The artist sorts need files with artists.
-pub fn sort_menu(current: SortMode, artists: bool) -> Vec<Item> {
-    let mut items: Vec<Item> = SortMode::ALL
+pub fn sort_menu(current: SortMode, artists: bool, albums: bool) -> Vec<Item> {
+    SortMode::ALL
         .iter()
         .map(|&m| {
-            let artist = matches!(m, SortMode::ArtistAz | SortMode::ArtistZa);
+            let usable = match m {
+                SortMode::ArtistAz | SortMode::ArtistZa => artists,
+                SortMode::AlbumAz | SortMode::AlbumZa => albums,
+                _ => true,
+            };
             Item::new(m.label(), MenuAction::Sort(m))
                 .checked(m == current)
-                .enabled(artists || !artist)
+                .enabled(usable)
         })
-        .collect();
-    // ponytail: library entries carry no album; add it to Entry::Media to sort by it.
-    items.push(Item::off("Album A-Z"));
-    items.push(Item::off("Album Z-A"));
-    items
+        .collect()
 }
 
 /// Brushes, fonts and icons the menus use.
@@ -1428,8 +1428,9 @@ mod tests {
         assert!(!has_next(queue_menu(1, Path::new("a.mkv"), Some(1), &[])));
         assert!(!has_next(queue_menu(1, Path::new("a.mkv"), None, &[])));
 
-        let sort = sort_menu(SortMode::NewestFirst, false);
+        let sort = sort_menu(SortMode::NewestFirst, false, true);
         assert!(sort[2].checked);
         assert!(!sort[6].enabled, "artist sorts need artists");
+        assert!(sort[8].enabled && sort[9].label == "Album Z-A");
     }
 }

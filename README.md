@@ -25,7 +25,7 @@ The library page follows the redesign's library frames.
 The sidebar has Home, Videos, Music, Network, Playlists and Recent, plus "Add item", which adds a folder through the system folder picker.
 On first run Videos and Music start with your Windows Videos and Music folders.
 Folders open in place, with back and forward arrows and a breadcrumb that shortens to "..." when the window is narrow.
-The header shows the item count, the sort menu (unwatched or watched first, newest or oldest, title or artist; the orange dot means it isn't title A-Z), grid or list view, and a search box that filters the page as you type.
+The header shows the item count, the sort menu (unwatched or watched first, newest or oldest, title, artist or album; the orange dot means it isn't title A-Z), grid or list view, and a search box that filters the page as you type.
 Thumbnails come from a frame at 10% of each video, and audio files show their embedded cover.
 A bar under a thumbnail shows how much of it you watched, and finished files are dimmed.
 Music also has Songs, Albums, Artists and Genres, built from the files' tags.

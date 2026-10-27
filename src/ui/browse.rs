@@ -62,10 +62,12 @@ pub enum SortMode {
     TitleZa,
     ArtistAz,
     ArtistZa,
+    AlbumAz,
+    AlbumZa,
 }
 
 impl SortMode {
-    pub const ALL: [SortMode; 8] = [
+    pub const ALL: [SortMode; 10] = [
         SortMode::UnwatchedFirst,
         SortMode::WatchedFirst,
         SortMode::NewestFirst,
@@ -74,6 +76,8 @@ impl SortMode {
         SortMode::TitleZa,
         SortMode::ArtistAz,
         SortMode::ArtistZa,
+        SortMode::AlbumAz,
+        SortMode::AlbumZa,
     ];
 
     pub fn label(self) -> &'static str {
@@ -86,6 +90,8 @@ impl SortMode {
             SortMode::TitleZa => "Title Z-A",
             SortMode::ArtistAz => "Artist A-Z",
             SortMode::ArtistZa => "Artist Z-A",
+            SortMode::AlbumAz => "Album A-Z",
+            SortMode::AlbumZa => "Album Z-A",
         }
     }
 
@@ -129,6 +135,10 @@ fn sort_entries(
         } => Some(a.to_lowercase()),
         _ => None,
     };
+    let album = |e: &Entry| match e {
+        Entry::Media { album: Some(a), .. } => Some(a.to_lowercase()),
+        _ => None,
+    };
     let folder_first = |e: &Entry| !matches!(e, Entry::Folder { .. });
     match mode {
         SortMode::TitleAz => {}
@@ -156,6 +166,15 @@ fn sort_entries(
         }),
         SortMode::ArtistZa => entries.sort_by_key(|e| {
             let a = artist(e);
+            (folder_first(e), a.is_none(), Reverse(a))
+        }),
+        // Likewise files without an album; an album's tracks keep their title order.
+        SortMode::AlbumAz => entries.sort_by_key(|e| {
+            let a = album(e);
+            (folder_first(e), a.is_none(), a)
+        }),
+        SortMode::AlbumZa => entries.sort_by_key(|e| {
+            let a = album(e);
             (folder_first(e), a.is_none(), Reverse(a))
         }),
     }
@@ -299,6 +318,11 @@ impl Browse {
                 }
             )
         })
+    }
+
+    /// Whether any file on the page has an album, for the album sorts.
+    pub fn has_albums(&self) -> bool {
+        (self.all.iter()).any(|e| matches!(e, Entry::Media { album: Some(_), .. }))
     }
 
     /// Whether the header shows "+": adding a folder or creating a playlist.
@@ -1379,6 +1403,8 @@ mod tests {
             path: PathBuf::from(name),
             kind: MediaKind::Video,
             subtitle: artist.map(Into::into),
+            // Each artist made one album, named after them backwards.
+            album: artist.map(|a| a.chars().rev().collect()),
             progress,
             finished: progress.is_some_and(|p| p >= 0.95),
         }
@@ -1430,6 +1456,9 @@ mod tests {
         // Files without an artist go last both ways.
         assert_eq!(sorted(SortMode::ArtistAz), ["d", "c", "a", "b"]);
         assert_eq!(sorted(SortMode::ArtistZa), ["d", "a", "c", "b"]);
+        // "abbA" before "deZ", and files without an album last both ways.
+        assert_eq!(sorted(SortMode::AlbumAz), ["d", "c", "a", "b"]);
+        assert_eq!(sorted(SortMode::AlbumZa), ["d", "a", "c", "b"]);
     }
 
     #[test]
@@ -1450,5 +1479,6 @@ mod tests {
         b.apply();
         assert_eq!(labels(&b.entries), ["Add", "x", "y"]);
         assert!(!b.has_artists());
+        assert!(!b.has_albums());
     }
 }

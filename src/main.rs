@@ -1544,7 +1544,10 @@ fn open_menu(app: &mut App, hit: Hit, at: (f32, f32)) {
         }
         Hit::Sort => UI.with_borrow(|ui| {
             let b = &ui.browse;
-            (Kind::Sort, menu::sort_menu(b.sort, b.has_artists()))
+            (
+                Kind::Sort,
+                menu::sort_menu(b.sort, b.has_artists(), b.has_albums()),
+            )
         }),
         Hit::Video => {
             let paused = app.shared.paused.load(Relaxed);
