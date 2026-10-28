@@ -3,11 +3,9 @@
 //! and subtitle options), opened by the gear. Both sit at the window's bottom right over the
 //! video. Sizes are DIPs measured from the design's stage-3 frames, colours sampled from them.
 //!
-//! Drawn as in the design but disabled (dimmed, no action), because myvlc can't do them yet:
-//! Show Subtitle Timeline on Seekbar, Reverse, Audio Visualizer, HDR, Resolution, Render,
-//! Subtitle Speed, Subtitle Duration Factor, Embedded Sub Format, Subtitle Font, Text and Outline
-//! Color, and the Default Preset footer. Open Advanced Settings opens the Settings window. The external tracks' pencil and
-//! the stereo "Test" button keep their design look but do nothing.
+//! HDR is drawn as in the design but disabled (dimmed, no action), because myvlc can't show HDR
+//! on an HDR screen yet. Open Advanced Settings opens the Settings window, and the footer's preset
+//! menu switches settings profiles.
 
 use super::*;
 
@@ -82,6 +80,23 @@ pub struct PanelData {
     pub show_statistics: bool,
     /// 0.5..2.
     pub sub_size: f32,
+    /// Each video track's picture size, for Resolution.
+    pub video_sizes: Vec<Option<(u32, u32)>>,
+    pub reverse: bool,
+    /// Index into `prefs::VISUALIZERS`.
+    pub visualizer: usize,
+    pub sub_timeline: bool,
+    pub sub_styles: bool,
+    /// Subtitle timing: how fast their clock runs (1 = as written), and how many times longer
+    /// each line stays (0 = as written).
+    pub sub_speed: f32,
+    pub sub_duration: f32,
+    pub sub_font: String,
+    pub sub_color: u32,
+    pub outline_color: u32,
+    /// Settings profiles, for the footer's preset menu, and the one in force.
+    pub profiles: Vec<String>,
+    pub profile: usize,
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -113,6 +128,25 @@ pub enum PanelAction {
     SetShowStatistics(bool),
     SetSubSize(f32),
     ResetVideo,
+    SetReverse(bool),
+    SetVisualizer(usize),
+    SetSubTimeline(bool),
+    /// A video track by index, None for the largest picture.
+    SetResolution(Option<usize>),
+    /// Streams what plays to the network too, or stops.
+    SetStreaming(bool),
+    /// Plays a tone on the left, then the right, through the stereo mode.
+    TestStereo,
+    SetSubSpeed(f32),
+    SetSubDuration(f32),
+    SetSubStyles(bool),
+    /// Indices into `prefs::FONTS` and `prefs::COLORS`.
+    SetSubFont(usize),
+    SetSubColor(usize),
+    SetOutlineColor(usize),
+    SetProfile(usize),
+    /// Opens the chosen external subtitle file in its editor.
+    EditSubtitle,
 }
 
 /// "1:1 Original" is the picture at its own shape, fitted to the window (VLC's normal view).
@@ -129,6 +163,19 @@ const BANDS: [&str; 10] = [
 const SPEED_TICKS: [&str; 8] = ["0.25", "0.5", "0.75", "1", "1.25", "1.5", "1.75", "2"];
 const DELAY_TICKS: [&str; 3] = ["-10 s", "0 s", "+10 s"];
 const SIZE_TICKS: [&str; 4] = ["50%", "100%", "150%", "200%"];
+const RENDER: [&str; 2] = ["Local", "Local + Stream"];
+
+/// The video track with the largest picture, which "Best Available" plays.
+pub fn best_video(sizes: &[Option<(u32, u32)>]) -> Option<usize> {
+    (0..sizes.len()).max_by_key(|&i| sizes[i].map_or(0, |(w, h)| u64::from(w) * u64::from(h)))
+}
+
+fn size_name(sizes: &[Option<(u32, u32)>], i: usize) -> String {
+    match sizes.get(i).copied().flatten() {
+        Some((w, h)) => format!("{w}x{h}"),
+        None => format!("Track {}", i + 1),
+    }
+}
 
 const W: f32 = 400.0;
 /// Gap to the window's right edge and above the control bar.
@@ -150,6 +197,7 @@ const FIELD_W: f32 = 140.0;
 const FIELD_H: f32 = 36.0;
 const LIST_ROW: f32 = 36.0;
 const LIST_PAD: f32 = 6.0;
+const LIST_MIN_W: f32 = 200.0;
 /// The open filter box: its "Collapse Settings" header, then label and slider per filter.
 const BOX_HEAD: f32 = 46.0;
 const BOX_ITEM: f32 = 75.0;
@@ -241,6 +289,21 @@ pub enum Ctl {
     SubLanguage,
     SubDelay,
     SubSize,
+    SubTimeline,
+    Reverse,
+    Visualizer,
+    Resolution,
+    Render,
+    TestStereo,
+    SubSpeed,
+    SubDuration,
+    SubStyles,
+    SubFont,
+    SubColor,
+    OutlineColor,
+    /// The footer's preset (settings profile) menu.
+    Preset,
+    EditSubtitle,
 }
 
 fn track_name(names: &[String], selected: Option<usize>) -> String {
@@ -262,7 +325,8 @@ impl Ctl {
             Ctl::AudioDelay | Ctl::SubDelay => (-10.0, 10.0, 0.0),
             Ctl::Brightness | Ctl::Contrast | Ctl::Hue | Ctl::Saturation => (-1.0, 1.0, 0.0),
             Ctl::Preamp | Ctl::Band(_) => (-20.0, 20.0, 0.0),
-            Ctl::SubSize => (0.5, 2.0, 1.0),
+            Ctl::SubSize | Ctl::SubSpeed => (0.5, 2.0, 1.0),
+            Ctl::SubDuration => (0.0, 4.0, 0.0),
             _ => return None,
         })
     }
@@ -279,6 +343,8 @@ impl Ctl {
             Ctl::Preamp => d.eq_preamp,
             Ctl::Band(i) => d.eq_bands[usize::from(i)],
             Ctl::SubSize => d.sub_size,
+            Ctl::SubSpeed => d.sub_speed,
+            Ctl::SubDuration => d.sub_duration,
             _ => 0.0,
         }
     }
@@ -296,6 +362,8 @@ impl Ctl {
             Ctl::Preamp => PanelAction::SetPreamp(round_to(v, 10.0)),
             Ctl::Band(i) => PanelAction::SetEqBand(usize::from(i), round_to(v, 10.0)),
             Ctl::SubSize => PanelAction::SetSubSize(round_to(v, 20.0)),
+            Ctl::SubSpeed => PanelAction::SetSubSpeed(round_to(v, 100.0)),
+            Ctl::SubDuration => PanelAction::SetSubDuration(round_to(v, 20.0)),
             _ => return None,
         })
     }
@@ -332,12 +400,33 @@ impl Ctl {
             Ctl::AudioTrack => tracks(&d.audio_tracks),
             Ctl::SubTrack => tracks(&d.sub_tracks),
             Ctl::EqPreset => tracks(&d.eq_presets),
+            Ctl::Visualizer => list(&crate::prefs::VISUALIZERS),
+            Ctl::Resolution => std::iter::once("Best Available".to_owned())
+                .chain((0..d.video_sizes.len()).map(|i| size_name(&d.video_sizes, i)))
+                .collect(),
+            Ctl::Render => list(&RENDER),
+            Ctl::SubFont => list(&crate::prefs::FONTS),
+            Ctl::SubColor | Ctl::OutlineColor => crate::prefs::COLORS
+                .iter()
+                .map(|c| c.1.to_owned())
+                .collect(),
+            Ctl::Preset => d.profiles.clone(),
             _ => return None,
         })
     }
 
+    /// The colour a field shows beside its value.
+    fn swatch(self, d: &PanelData) -> Option<u32> {
+        match self {
+            Ctl::SubColor => Some(d.sub_color),
+            Ctl::OutlineColor => Some(d.outline_color),
+            _ => None,
+        }
+    }
+
     fn current(self, d: &PanelData) -> Option<usize> {
         let track = |s: Option<usize>| Some(s.map_or(0, |i| i + 1));
+        let colour = |c: u32| crate::prefs::COLORS.iter().position(|(rgb, _)| *rgb == c);
         match self {
             Ctl::SleepTimer => Some(d.sleep_timer),
             Ctl::Rotate => Some((d.rotate.rem_euclid(360) / 90) as usize),
@@ -349,6 +438,14 @@ impl Ctl {
             Ctl::SubTrack => track(d.sub_selected),
             Ctl::EqPreset if d.eq_custom => None,
             Ctl::EqPreset => track(d.eq_preset),
+            Ctl::Visualizer => Some(d.visualizer),
+            Ctl::Resolution if d.video_selected == best_video(&d.video_sizes) => Some(0),
+            Ctl::Resolution => d.video_selected.map(|i| i + 1),
+            Ctl::Render => Some(usize::from(d.streaming.is_some())),
+            Ctl::SubFont => crate::prefs::FONTS.iter().position(|f| *f == d.sub_font),
+            Ctl::SubColor => colour(d.sub_color),
+            Ctl::OutlineColor => colour(d.outline_color),
+            Ctl::Preset => Some(d.profile),
             _ => None,
         }
     }
@@ -365,6 +462,13 @@ impl Ctl {
             Ctl::AudioTrack => PanelAction::SelectTrack(TrackTab::Audio, i.checked_sub(1)),
             Ctl::SubTrack => PanelAction::SelectTrack(TrackTab::Subtitles, i.checked_sub(1)),
             Ctl::EqPreset => PanelAction::SetEqPreset(i.checked_sub(1)),
+            Ctl::Visualizer => PanelAction::SetVisualizer(i),
+            Ctl::Resolution => PanelAction::SetResolution(i.checked_sub(1)),
+            Ctl::Render => PanelAction::SetStreaming(i == 1),
+            Ctl::SubFont => PanelAction::SetSubFont(i),
+            Ctl::SubColor => PanelAction::SetSubColor(i),
+            Ctl::OutlineColor => PanelAction::SetOutlineColor(i),
+            Ctl::Preset => PanelAction::SetProfile(i),
             _ => return None,
         })
     }
@@ -373,6 +477,9 @@ impl Ctl {
         match self {
             Ctl::ShowStatistics => d.show_statistics,
             Ctl::TwoPass => d.two_pass,
+            Ctl::SubTimeline => d.sub_timeline,
+            Ctl::Reverse => d.reverse,
+            Ctl::SubStyles => d.sub_styles,
             _ => false,
         }
     }
@@ -405,6 +512,11 @@ impl Ctl {
             Ctl::TwoPass => PanelAction::SetTwoPass(!d.two_pass),
             Ctl::Flip(k) => PanelAction::SetFlip(k),
             Ctl::ResetVideo => PanelAction::ResetVideo,
+            Ctl::SubTimeline => PanelAction::SetSubTimeline(!d.sub_timeline),
+            Ctl::Reverse => PanelAction::SetReverse(!d.reverse),
+            Ctl::SubStyles => PanelAction::SetSubStyles(!d.sub_styles),
+            Ctl::TestStereo => PanelAction::TestStereo,
+            Ctl::EditSubtitle => PanelAction::EditSubtitle,
             _ => return None,
         })
     }
@@ -436,6 +548,22 @@ impl Ctl {
             Ctl::EqPreset if d.eq_custom => crate::prefs::EQ_CUSTOM.into(),
             Ctl::EqPreset => track_name(&d.eq_presets, d.eq_preset),
             Ctl::SubSize => format!("{:.0}%", d.sub_size * 100.0),
+            Ctl::Visualizer => pick(&crate::prefs::VISUALIZERS, d.visualizer),
+            Ctl::Resolution => match d.video_selected {
+                Some(i) if Some(i) != best_video(&d.video_sizes) => size_name(&d.video_sizes, i),
+                _ => "Best Available".into(),
+            },
+            Ctl::Render => pick(&RENDER, usize::from(d.streaming.is_some())),
+            Ctl::SubSpeed => format!("{:.2}x", d.sub_speed),
+            Ctl::SubDuration if d.sub_duration <= 0.0 => "As Written".into(),
+            Ctl::SubDuration => format!("{:.2}x", d.sub_duration),
+            Ctl::SubFont => d.sub_font.clone(),
+            Ctl::SubColor => format!("#{:06X}", d.sub_color),
+            Ctl::OutlineColor => format!("#{:06X}", d.outline_color),
+            Ctl::Preset => match d.profiles.get(d.profile) {
+                Some(name) => format!("{name} Profile"),
+                None => "Default Preset".into(),
+            },
             _ => String::new(),
         }
     }
@@ -681,10 +809,10 @@ impl Builder<'_> {
         self.push(Kind::Choice(text), r, Some(ctl), true, false);
     }
 
-    fn icon(&mut self, glyph: Glyph, cx: f32, cy: f32, ctl: Option<Ctl>) {
+    fn icon(&mut self, glyph: Glyph, cx: f32, cy: f32, ctl: Option<Ctl>, dim: bool) {
         let r = self.rect(cx - 16.0, cy, cx + 16.0, 32.0);
-        let click = ctl.is_some();
-        self.push(Kind::Icon(glyph), r, ctl, click, false);
+        let click = ctl.is_some() && !dim;
+        self.push(Kind::Icon(glyph), r, ctl, click, dim);
     }
 
     /// "Expand Settings" for a filter group at `cy`, or its open box with `fill` placing the
@@ -732,7 +860,13 @@ fn tracks(b: &mut Builder, tab: TrackTab, d: &PanelData) -> f32 {
             b.divider(y + 34.0);
             let label = y + 66.0;
             b.label("Output Device", 28.0, label, false);
-            b.icon(Glyph::Refresh, 359.0, label, Some(Ctl::RefreshDevices));
+            b.icon(
+                Glyph::Refresh,
+                359.0,
+                label,
+                Some(Ctl::RefreshDevices),
+                false,
+            );
             y = label + 47.5 - ROW;
             for (i, name) in d.devices.iter().enumerate() {
                 y += ROW;
@@ -742,8 +876,10 @@ fn tracks(b: &mut Builder, tab: TrackTab, d: &PanelData) -> f32 {
         TrackTab::Subtitles => {
             let label = y + 64.0;
             b.label("External Tracks", 28.0, label, false);
-            b.icon(Glyph::Pencil, 315.0, label, None);
-            b.icon(Glyph::Plus, 359.0, label, Some(Ctl::AddSubtitle));
+            // The pencil opens the chosen file in an editor, so it waits for a choice.
+            let none = d.external_selected.is_none();
+            b.icon(Glyph::Pencil, 315.0, label, Some(Ctl::EditSubtitle), none);
+            b.icon(Glyph::Plus, 359.0, label, Some(Ctl::AddSubtitle), false);
             y = label + 47.5 - ROW;
             for (i, name) in d.external_subs.iter().enumerate() {
                 y += ROW;
@@ -755,9 +891,13 @@ fn tracks(b: &mut Builder, tab: TrackTab, d: &PanelData) -> f32 {
 }
 
 fn playback(b: &mut Builder) -> f32 {
-    b.toggle("Show Subtitle Timeline on Seekbar", 87.5, None);
+    b.toggle(
+        "Show Subtitle Timeline on Seekbar",
+        87.5,
+        Some(Ctl::SubTimeline),
+    );
     b.toggle("Show Statistics", 139.5, Some(Ctl::ShowStatistics));
-    b.toggle("Reverse", 191.5, None);
+    b.toggle("Reverse", 191.5, Some(Ctl::Reverse));
     b.dropdown(
         Some("Sleep Timer"),
         251.0,
@@ -767,8 +907,8 @@ fn playback(b: &mut Builder) -> f32 {
     b.dropdown(
         Some("Audio Visualizer"),
         319.0,
-        None,
-        Value::Fixed("Disabled"),
+        Some(Ctl::Visualizer),
+        Value::Live,
     );
     b.field("Speed", 386.0, Some(Ctl::Speed), Value::Live, false);
     b.slider(Some(Ctl::Speed), 433.0, PAD, W - PAD, 6, false);
@@ -800,12 +940,12 @@ fn video(b: &mut Builder) -> f32 {
     b.dropdown(
         Some("Resolution"),
         445.0,
-        None,
-        Value::Fixed("Best Available"),
+        Some(Ctl::Resolution),
+        Value::Live,
     );
     b.dropdown(Some("Aspect Ratio"), 513.0, Some(Ctl::Aspect), Value::Live);
     b.dropdown(Some("Crop"), 581.0, Some(Ctl::Crop), Value::Live);
-    b.dropdown(Some("Render"), 649.0, None, Value::Fixed("Local"));
+    b.dropdown(Some("Render"), 649.0, Some(Ctl::Render), Value::Live);
     b.divider(692.5);
     b.heading("Filters", 722.0);
     b.label("Essential", LABEL_X, 761.0, false);
@@ -843,8 +983,7 @@ fn audio(b: &mut Builder) -> f32 {
         false,
     );
     b.label("Stereo Mode", LABEL_X, 238.0, false);
-    // ponytail: "Test" has nothing to play yet; it keeps the design's look.
-    b.button("Test", 238.0, None);
+    b.button("Test", 238.0, Some(Ctl::TestStereo));
     b.dropdown(None, 297.5, Some(Ctl::Stereo), Value::Live);
     b.divider(341.0);
     b.heading("Synchronization", 372.0);
@@ -911,29 +1050,41 @@ fn subtitles(b: &mut Builder) -> f32 {
     b.field(
         "Subtitle Speed",
         404.0,
-        None,
-        Value::Fixed("1.000 fps"),
-        true,
+        Some(Ctl::SubSpeed),
+        Value::Live,
+        false,
     );
-    b.slider(None, 448.0, PAD, W - PAD, 0, false);
+    b.slider(Some(Ctl::SubSpeed), 448.0, PAD, W - PAD, 0, false);
     b.field(
         "Subtitle Duration Factor",
         493.0,
-        None,
-        Value::Fixed("0.000"),
-        true,
+        Some(Ctl::SubDuration),
+        Value::Live,
+        false,
     );
-    b.slider(None, 538.0, PAD, W - PAD, 0, false);
+    b.slider(Some(Ctl::SubDuration), 538.0, PAD, W - PAD, 0, false);
     b.divider(570.5);
     b.heading("Appearance", 601.0);
-    // Not in the design: the one appearance setting myvlc has.
+    // Not in the design: Settings' text size.
     b.field("Text Size", 646.0, Some(Ctl::SubSize), Value::Live, false);
     b.slider(Some(Ctl::SubSize), 690.0, PAD, W - PAD, 0, false);
     b.ticks(&SIZE_TICKS, 717.0, false);
-    b.toggle("Embedded Sub Format", 762.0, None);
-    b.field("Subtitle Font", 814.0, None, Value::Fixed("Inter"), true);
-    b.field("Text Color", 867.0, None, Value::Fixed("#B8B8B8"), true);
-    b.field("Outline Color", 918.0, None, Value::Fixed("#0C0C0C"), true);
+    b.toggle("Embedded Sub Format", 762.0, Some(Ctl::SubStyles));
+    b.field(
+        "Subtitle Font",
+        814.0,
+        Some(Ctl::SubFont),
+        Value::Live,
+        false,
+    );
+    b.field("Text Color", 867.0, Some(Ctl::SubColor), Value::Live, false);
+    b.field(
+        "Outline Color",
+        918.0,
+        Some(Ctl::OutlineColor),
+        Value::Live,
+        false,
+    );
     950.0
 }
 
@@ -997,10 +1148,10 @@ impl Layout {
                 let y = footer_top - frame.t;
                 let r = b.rect(PAD, y + 41.0, W - PAD, 42.0);
                 let preset = Kind::Dropdown {
-                    value: Value::Fixed("Default Preset"),
+                    value: Value::Live,
                     up: true,
                 };
-                b.push(preset, r, None, false, true);
+                b.push(preset, r, Some(Ctl::Preset), true, false);
                 let r = b.rect(PAD, y + 89.0, W - PAD, 24.0);
                 let ctl = Some(Ctl::AdvancedSettings);
                 b.push(Kind::Link("Open Advanced Settings"), r, ctl, true, false);
@@ -1010,9 +1161,8 @@ impl Layout {
         let tabs = (0..panel.tabs())
             .map(|i| tab_rect(panel, header, i))
             .collect();
-        let list = state
-            .list
-            .and_then(|ctl| self.choice_list(ctl, &rows, data, state.list_scroll));
+        let list = (state.list)
+            .and_then(|ctl| self.choice_list(ctl, &rows, &b.rows, data, state.list_scroll));
         self.panels = Geometry {
             panel: Some(panel),
             opener: state.opener,
@@ -1030,8 +1180,16 @@ impl Layout {
     }
 
     /// The open control's choices, under its field, or over it when there's no room below.
-    fn choice_list(&self, ctl: Ctl, rows: &[Row], d: &PanelData, scroll: f32) -> Option<List> {
-        let anchor = rows.iter().find(|r| r.ctl == Some(ctl) && r.click)?.r;
+    fn choice_list(
+        &self,
+        ctl: Ctl,
+        rows: &[Row],
+        footer: &[Row],
+        d: &PanelData,
+        scroll: f32,
+    ) -> Option<List> {
+        let mut all = rows.iter().chain(footer);
+        let anchor = all.find(|r| r.ctl == Some(ctl) && r.click)?.r;
         let items = ctl.options(d)?;
         let full = items.len() as f32 * LIST_ROW + 2.0 * LIST_PAD;
         let (min, max) = (TITLE_BAR + 8.0, self.height - self.tools.bar - 8.0);
@@ -1043,7 +1201,8 @@ impl Layout {
             let h = full.min(above);
             (anchor.t - 4.0 - h, h)
         };
-        let frame = Rect::new(anchor.l, t, anchor.r, t + h);
+        // A field is narrower than its longest choices; its list grows leftwards.
+        let frame = Rect::new(anchor.l.min(anchor.r - LIST_MIN_W), t, anchor.r, t + h);
         let max_scroll = (full - h).max(0.0);
         let scroll = scroll.clamp(0.0, max_scroll);
         let rows = items
@@ -1539,9 +1698,9 @@ impl Painter {
                     let tr = Rect::new(r.l + 13.0, r.t, r.r - 10.0, r.b);
                     let fg = if quiet { &p.dim } else { &p.row };
                     self.put(rt, &value_text(*value), &p.text, tr, fg);
-                    if let Some(rgb) = swatch {
+                    if let Some(rgb) = swatch.or_else(|| row.ctl.and_then(|c| c.swatch(d))) {
                         let sw = Rect::around(r.r - 17.0, cy, 18.0);
-                        p.swatch.SetColor(&color(theme::fixed(*rgb), 1.0));
+                        p.swatch.SetColor(&color(theme::fixed(rgb), 1.0));
                         rt.FillRoundedRectangle(&rounded(sw, 2.0), &p.swatch);
                         rt.DrawRoundedRectangle(&rounded(sw.inset(0.5), 2.0), &p.dim, 1.0, None);
                     }
@@ -1783,10 +1942,56 @@ mod tests {
             l.hit(1500.0 + 340.0, 61.0 + 139.5),
             Some(Hit::Popup(Target::Ctl(Ctl::ShowStatistics)))
         );
-        // Disabled rows swallow clicks without acting.
         assert_eq!(
             l.hit(1500.0 + 340.0, 61.0 + 87.5),
+            Some(Hit::Popup(Target::Ctl(Ctl::SubTimeline)))
+        );
+        // The footer's preset menu opens upwards, over the content.
+        let mut l = Layout::new(1920.0, 1080.0, true, false);
+        let state = State {
+            open: Some(Panel::Settings(SettingsTab::Playback)),
+            list: Some(Ctl::Preset),
+            ..Default::default()
+        };
+        let d = PanelData {
+            profiles: vec!["Movies".into(), "Music".into()],
+            ..data()
+        };
+        l.add_panel(&state, &d);
+        assert_eq!(
+            l.hit(1700.0, 1006.0 - 125.0 + 41.0),
+            Some(Hit::Popup(Target::Ctl(Ctl::Preset)))
+        );
+        let list = l.panels.list.as_ref().unwrap();
+        assert!(list.frame.b < 1006.0 - 125.0 + 41.0 && list.rows.len() == 2);
+
+        // Disabled rows swallow clicks without acting.
+        let l = open(Panel::Settings(SettingsTab::Video));
+        assert_eq!(
+            l.hit(1500.0 + 300.0, 61.0 + 377.0),
             Some(Hit::Popup(Target::Body))
+        );
+    }
+
+    #[test]
+    fn resolution_names_the_largest_picture_best() {
+        let sizes = [Some((1280, 720)), Some((1920, 1080)), None];
+        assert_eq!(best_video(&sizes), Some(1));
+        let d = PanelData {
+            video_sizes: sizes.to_vec(),
+            video_selected: Some(1),
+            ..data()
+        };
+        assert_eq!(Ctl::Resolution.text(&d), "Best Available");
+        assert_eq!(Ctl::Resolution.current(&d), Some(0));
+        let d = PanelData {
+            video_selected: Some(0),
+            ..d
+        };
+        assert_eq!(Ctl::Resolution.text(&d), "1280x720");
+        assert_eq!(
+            Ctl::Resolution.options(&d).unwrap(),
+            ["Best Available", "1280x720", "1920x1080", "Track 3"]
         );
     }
 

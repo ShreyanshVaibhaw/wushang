@@ -34,6 +34,15 @@ pub struct TrackInfo {
     pub language: Option<String>,
     pub codec: String,
     pub default: bool,
+    /// A video track's picture size, when the file says.
+    pub size: Option<(u32, u32)>,
+}
+
+/// A stream's picture size from its parameters, None for audio, subtitles and unknown sizes.
+fn picture_size(parameters: &ff::codec::Parameters) -> Option<(u32, u32)> {
+    // SAFETY: the parameters are valid while borrowed.
+    let p = unsafe { &*parameters.as_ptr() };
+    (p.width > 0 && p.height > 0).then_some((p.width as u32, p.height as u32))
 }
 
 /// A subtitle track's packets, for a subtitle decoder to read. The queue gets `Msg::Flush` on
@@ -266,6 +275,7 @@ impl Session {
                 language,
                 codec: parameters.id().name().to_owned(),
                 default,
+                size: picture_size(&parameters),
             });
             codecs.insert(
                 stream.index(),
@@ -576,6 +586,7 @@ impl Session {
                 language: tag("language").filter(|l| !l.eq_ignore_ascii_case("und")),
                 codec: parameters.id().name().to_owned(),
                 default: false,
+                size: picture_size(&parameters),
             });
             self.codecs.insert(
                 base + stream.index(),
@@ -1137,6 +1148,7 @@ mod tests {
             language: language.map(str::to_owned),
             codec: codec.into(),
             default: false,
+            size: None,
         };
         let mut tracks = [
             track(Some("eng"), "aac"),
@@ -1173,6 +1185,7 @@ mod tests {
             language: language.map(str::to_owned),
             codec: "aac".into(),
             default,
+            size: None,
         };
         let tracks = [
             track(1, Some("eng"), true),

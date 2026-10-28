@@ -127,7 +127,12 @@ pub struct Shared {
     pub audio_master: AtomicBool,
     /// Audio decoded and played to the end.
     pub audio_done: AtomicBool,
+    /// The last `SCOPE` mono samples sent to the speakers, and their rate, for the visualizer.
+    pub scope: Mutex<(u32, Vec<f32>)>,
 }
+
+/// Samples the visualizer sees at once, about 20 ms.
+pub const SCOPE: usize = 1024;
 
 #[derive(Default)]
 struct Seek {
@@ -153,6 +158,7 @@ impl Shared {
             video_done: AtomicBool::new(false),
             audio_master: AtomicBool::new(false),
             audio_done: AtomicBool::new(false),
+            scope: Mutex::new((0, Vec::with_capacity(SCOPE * 16))),
         }
     }
 

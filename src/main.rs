@@ -196,6 +196,14 @@ struct App {
     external_selected: Option<usize>,
     /// Positive shows subtitles later.
     sub_delay: f64,
+    /// How fast the subtitles' clock runs (1 = as written), and how many times longer each line
+    /// stays (0 = as written).
+    sub_speed: f64,
+    sub_duration: f64,
+    /// Playing backwards: the position last stepped back to, and when.
+    reverse: Option<(f64, Instant)>,
+    /// The stereo test's sound, kept while Windows plays it.
+    test_tone: Vec<u8>,
     caption: CaptionStyle,
     devices: Vec<String>,
     /// Index into the panel's sleep list, and when a timed one runs out.
@@ -302,6 +310,8 @@ impl App {
         path: &Path,
         input: Result<(ff::format::context::Input, Arc<AtomicBool>), String>,
     ) -> bool {
+        // A new file plays forwards.
+        self.reverse = None;
         // A folder's or playlist's track choices go over Settings' for its files.
         let mut p = prefs();
         let tracks = self.library.tracks_for(path);
@@ -558,6 +568,7 @@ impl App {
     }
 
     fn stop(&mut self) {
+        self.reverse = None;
         if let Some(o) = self.opening.take() {
             o.cancel.store(true, Relaxed);
         }
@@ -639,17 +650,30 @@ impl App {
 
     /// The cues to show at media time `t`.
     fn cues_at(&self, t: f64) -> Vec<subs::Cue> {
-        let t = t - self.sub_delay;
+        let t = (t - self.sub_delay) * self.sub_speed;
+        self.subtitles()
+            .map_or_else(Vec::new, |c| c.active_stretched(t, self.sub_duration))
+    }
+
+    /// The subtitle track on screen.
+    fn subtitles(&self) -> Option<&Arc<Cues>> {
         match self.external_selected {
-            Some(i) => self.external[i]
-                .1
-                .as_ref()
-                .map_or_else(Vec::new, |c| c.active(t)),
-            None => self
-                .embedded
-                .as_ref()
-                .map_or_else(Vec::new, |(_, c)| c.active(t)),
+            Some(i) => self.external[i].1.as_ref(),
+            None => self.embedded.as_ref().map(|(_, c)| c),
         }
+    }
+
+    /// Where the subtitles have lines, in media time, for the seek bar's timeline.
+    fn subtitle_spans(&self) -> Vec<(f64, f64)> {
+        let at = |t: f64| t / self.sub_speed + self.sub_delay;
+        let stretch = |(s, e): (f64, f64)| match self.sub_duration {
+            f if f > 0.0 => (s, s + (e - s) * f),
+            _ => (s, e),
+        };
+        let spans = self.subtitles().map_or_else(Vec::new, |c| c.spans());
+        (spans.into_iter().map(stretch))
+            .map(|(s, e)| (at(s), at(e)))
+            .collect()
     }
 
     /// What the tracks and settings popups show.
@@ -669,6 +693,7 @@ impl App {
         let effects = self.audio.effects();
         let eq = effects.eq();
         let current = self.audio.current_output();
+        let p = prefs();
         PanelData {
             video_tracks: labels(TrackKind::Video),
             video_selected: selected(TrackKind::Video),
@@ -730,6 +755,22 @@ impl App {
             sleep_timer: self.sleep,
             show_statistics: self.show_statistics,
             sub_size: self.caption.size_ratio / CaptionStyle::default().size_ratio,
+            video_sizes: s.map_or_else(Vec::new, |s| {
+                s.tracks(TrackKind::Video).iter().map(|t| t.size).collect()
+            }),
+            reverse: self.reverse.is_some(),
+            visualizer: p.visualizer,
+            sub_timeline: p.sub_timeline,
+            sub_styles: p.sub_styles,
+            sub_speed: self.sub_speed as f32,
+            sub_duration: self.sub_duration as f32,
+            sub_font: p.sub_font,
+            sub_color: p.sub_color,
+            outline_color: p.outline_color,
+            profiles: self.profiles.names().to_vec(),
+            profile: (self.profiles.names().iter())
+                .position(|n| n == self.profiles.current())
+                .unwrap_or(0),
         }
     }
 
@@ -816,6 +857,47 @@ impl App {
             PanelAction::SetSubSize(v) => {
                 self.caption.size_ratio = CaptionStyle::default().size_ratio * v.clamp(0.5, 2.0)
             }
+            PanelAction::SetReverse(on) => self.set_reverse(on),
+            PanelAction::SetVisualizer(i) => self.change_prefs(hwnd, |p| p.visualizer = i),
+            PanelAction::SetSubTimeline(on) => self.change_prefs(hwnd, |p| p.sub_timeline = on),
+            PanelAction::SetResolution(i) => {
+                let i = i.or_else(|| ui::panels::best_video(&self.panel_data().video_sizes));
+                if i.is_some() {
+                    self.select_track(TrackTab::Video, i);
+                }
+            }
+            PanelAction::SetStreaming(on) => {
+                if on != self.session.as_ref().is_some_and(Session::streaming) {
+                    self.toggle_stream();
+                }
+            }
+            PanelAction::TestStereo => self.test_stereo(),
+            PanelAction::SetSubSpeed(v) => self.sub_speed = f64::from(v.clamp(0.5, 2.0)),
+            PanelAction::SetSubDuration(v) => self.sub_duration = f64::from(v.clamp(0.0, 4.0)),
+            PanelAction::SetSubStyles(on) => self.change_prefs(hwnd, |p| p.sub_styles = on),
+            PanelAction::SetSubFont(i) => {
+                if let Some(font) = prefs::FONTS.get(i) {
+                    self.change_prefs(hwnd, |p| p.sub_font = (*font).to_owned());
+                }
+            }
+            PanelAction::SetSubColor(i) => {
+                if let Some((rgb, _)) = prefs::COLORS.get(i) {
+                    self.change_prefs(hwnd, |p| p.sub_color = *rgb);
+                }
+            }
+            PanelAction::SetOutlineColor(i) => {
+                if let Some((rgb, _)) = prefs::COLORS.get(i) {
+                    self.change_prefs(hwnd, |p| p.outline_color = *rgb);
+                }
+            }
+            PanelAction::SetProfile(i) => {
+                if let Some(name) = self.profiles.names().get(i).cloned()
+                    && let Err(e) = self.switch_profile(hwnd, &name, false)
+                {
+                    eprintln!("profiles: cannot switch to {name}: {e}");
+                }
+            }
+            PanelAction::EditSubtitle => self.edit_subtitle(hwnd),
         }
     }
 
@@ -1030,6 +1112,8 @@ impl App {
             }
         });
         library::SHOW_HIDDEN.store(new.show_hidden, Relaxed);
+        ass::STYLES.store(new.sub_styles, Relaxed);
+        let restyle = new.sub_styles != old.sub_styles;
         if (new.repeat, new.shuffle) != (old.repeat, old.shuffle) {
             self.queue.set_repeat(REPEAT[new.repeat.min(2)]);
             self.queue.set_shuffle(new.shuffle);
@@ -1043,6 +1127,116 @@ impl App {
         ui::theme::set(theme_of(&new));
         PREFS.set(new);
         self.prefs_changed = Some(Instant::now());
+        if restyle {
+            self.reload_subtitles();
+        }
+    }
+
+    /// Applies `change` to the settings, as the Settings window would.
+    fn change_prefs(&mut self, hwnd: HWND, change: impl FnOnce(&mut Prefs)) {
+        let mut p = prefs();
+        change(&mut p);
+        self.apply_prefs(hwnd, p);
+    }
+
+    /// Opens the subtitles on screen again, so "Embedded Sub Format" applies to them.
+    fn reload_subtitles(&mut self) {
+        for (_, cues) in &mut self.external {
+            *cues = None;
+        }
+        if let Some(i) = self.external_selected {
+            self.show_external(Some(i));
+        } else if self.embedded.is_some() {
+            let selected = self.panel_data().sub_selected;
+            self.select_track(TrackTab::Subtitles, selected);
+        }
+    }
+
+    /// Plays backwards (VLC's "Reverse"), or forwards again. Backwards, playback stays paused
+    /// and the frame loop steps the picture back with exact seeks, as fast as they decode.
+    fn set_reverse(&mut self, on: bool) {
+        if on == self.reverse.is_some() {
+            return;
+        }
+        let paused = self.shared.paused.load(Relaxed);
+        if on {
+            let Some(at) = self.session.as_ref().and_then(Session::position) else {
+                return;
+            };
+            if !paused {
+                self.shared.toggle_pause();
+            }
+            self.reverse = Some((at, Instant::now()));
+        } else {
+            self.reverse = None;
+            if paused {
+                self.shared.toggle_pause();
+            }
+        }
+    }
+
+    /// One step of reverse playback, from the frame loop: once the last step's picture is up,
+    /// seek back by the time since. Play or pause while reversing stops, paused.
+    fn step_reverse(&mut self) {
+        let Some((at, since)) = self.reverse else {
+            return;
+        };
+        if self.session.is_none() {
+            self.reverse = None;
+            return;
+        }
+        if !self.shared.paused.load(Relaxed) {
+            self.reverse = None;
+            self.shared.toggle_pause();
+            return;
+        }
+        let serial = self.shared.serial.load(Relaxed);
+        let landed = self.current.as_ref().is_none_or(|c| c.serial == serial);
+        if !landed || since.elapsed() < REVERSE_STEP {
+            return;
+        }
+        let to = at - since.elapsed().as_secs_f64() * f64::from(self.audio.effects().speed());
+        self.shared.seek_to(to.max(0.0));
+        self.reverse = (to > 0.0).then(|| (to, Instant::now()));
+    }
+
+    /// The stereo "Test": a tone on the left, then the right, as the stereo mode plays them.
+    // ponytail: Windows plays it on the default device at its own volume; mix it into the
+    // player's output if the chosen device or volume should count.
+    fn test_stereo(&mut self) {
+        use windows::Win32::Media::Audio::{PlaySoundW, SND_ASYNC, SND_MEMORY, SND_NODEFAULT};
+        use windows::core::PCWSTR;
+        unsafe {
+            // Stops a test still playing before its sound is freed.
+            _ = PlaySoundW(PCWSTR::null(), None, SND_ASYNC);
+            self.test_tone = dsp::test_tone(self.audio.effects().stereo());
+            let sound = PCWSTR(self.test_tone.as_ptr().cast());
+            _ = PlaySoundW(sound, None, SND_MEMORY | SND_ASYNC | SND_NODEFAULT);
+        }
+    }
+
+    /// Opens the chosen subtitle file in the program Windows edits it with, else Notepad.
+    fn edit_subtitle(&self, hwnd: HWND) {
+        use windows::Win32::UI::Shell::ShellExecuteW;
+        let Some((path, _)) = self.external_selected.and_then(|i| self.external.get(i)) else {
+            return;
+        };
+        let file = HSTRING::from(path.as_os_str());
+        unsafe {
+            let done = ShellExecuteW(Some(hwnd), w!("edit"), &file, None, None, SW_SHOWNORMAL);
+            // Above 32 means it started.
+            if done.0 as usize <= 32 {
+                let quoted = HSTRING::from(format!("\"{}\"", path.display()));
+                ShellExecuteW(
+                    Some(hwnd),
+                    w!("open"),
+                    w!("notepad.exe"),
+                    &quoted,
+                    None,
+                    SW_SHOWNORMAL,
+                );
+            }
+        }
     }
 
     /// Switches to a settings profile, adding it first when `create`, and applies its settings.
@@ -1190,6 +1384,7 @@ fn run() -> Result<(), Box<dyn Error>> {
     apply_effects(&audio, None, &settings);
     shared.set_volume(settings.startup_volume());
     library::SHOW_HIDDEN.store(settings.show_hidden, Relaxed);
+    ass::STYLES.store(settings.sub_styles, Relaxed);
     ui::theme::set(theme_of(&settings));
     UI.with_borrow_mut(|ui| ui.toolbar = ui::Toolbar::load(&Library::default_dir()));
     UI.with_borrow_mut(|ui| {
@@ -1226,6 +1421,10 @@ fn run() -> Result<(), Box<dyn Error>> {
         external: Vec::new(),
         external_selected: None,
         sub_delay: 0.0,
+        sub_speed: 1.0,
+        sub_duration: 0.0,
+        reverse: None,
+        test_tone: Vec::new(),
         caption: settings.caption(),
         devices: audio::output_devices(),
         sleep: 0,
@@ -1537,6 +1736,7 @@ fn run() -> Result<(), Box<dyn Error>> {
             renderer.resize(w, h)?;
         }
 
+        app.step_reverse();
         let serial = shared.serial.load(Relaxed);
         let fresh = app.current.as_ref().is_none_or(|c| c.serial != serial);
         let paused = shared.paused.load(Relaxed);
@@ -1696,13 +1896,30 @@ fn run() -> Result<(), Box<dyn Error>> {
         }
         // The mini player's progress bar moves while the library shows.
         let tick = card && now.is_some() && !paused && last_position.fract() < 0.02;
-        if next.is_some() || needs_paint || resized || tick {
+        // The audio visualizer draws in place of the cover, every pass while sound plays.
+        let visualizer = PREFS.with_borrow(|p| p.visualizer);
+        let visual_on = visualizer > 0
+            && UI.with_borrow(|ui| ui.page == Page::Player)
+            && app.session.as_ref().is_some_and(|s| s.video_size.is_none());
+        if next.is_some() || needs_paint || resized || tick || (visual_on && !paused) {
             let new_frame = next.is_some();
             if let Some(f) = next {
                 app.current = Some(f);
             }
             let session = app.session.as_ref();
             let cues = app.cues_at(session.and_then(Session::position).unwrap_or(last_position));
+            let marks = if PREFS.with_borrow(|p| p.sub_timeline) {
+                app.subtitle_spans()
+            } else {
+                Vec::new()
+            };
+            let visual = visual_on.then(|| {
+                let (rate, samples) = shared.scope.lock().unwrap().clone();
+                match visualizer {
+                    1 => dsp::spectrum(&samples, rate, VISUAL_BANDS),
+                    _ => samples,
+                }
+            });
             let stats = app.statistics(shown, dropped);
             let file = session.map_or(String::new(), |s| {
                 s.path
@@ -1719,7 +1936,8 @@ fn run() -> Result<(), Box<dyn Error>> {
                     position: ui.seek_preview().map_or(last_position, |f| f * duration),
                     duration,
                     live: duration <= 0.0 && session.is_some_and(|s| net::is_address(&s.path)),
-                    paused,
+                    // Reverse playback pauses underneath, but it is playing.
+                    paused: paused && app.reverse.is_none(),
                     volume: shared.volume(),
                     muted: shared.muted.load(Relaxed),
                     title: session.map_or("", |s| &s.title),
@@ -1750,6 +1968,8 @@ fn run() -> Result<(), Box<dyn Error>> {
                     favorite: session.is_some_and(|s| app.library.is_favorite(&s.path)),
                     recording: session.is_some_and(Session::recording),
                     cues: &cues,
+                    sub_marks: &marks,
+                    visual: visual.as_deref().map(|v| (visualizer, v)),
                     caption_style: &app.caption,
                     stats: stats.as_deref(),
                     notice: app.notice.as_ref().map(|(text, _)| text.as_str()),
@@ -1775,29 +1995,29 @@ fn run() -> Result<(), Box<dyn Error>> {
                 shown += 1;
             }
         } else {
-            if !paused && app.session.as_ref().is_some_and(Session::finished) {
-                if play_and_exit {
-                    return Ok(false);
-                }
-                // Like VLC's playlist: carry on with the next file, or stop at the end (or where
-                // the sleep timer says).
-                if app.sleep == SLEEP_END_OF_FILE || !app.advance() {
-                    // The sleep timer stops; the end of the queue may quit, per Settings.
-                    let quit =
-                        app.sleep != SLEEP_END_OF_FILE && PREFS.with_borrow(|p| p.at_end == 1);
-                    app.sleep = 0;
-                    app.stop();
-                    if quit {
-                        unsafe { _ = DestroyWindow(hwnd) };
-                    }
-                }
-                last_position = 0.0;
-                UI.with_borrow_mut(|ui| {
-                    ui.browse.stale = true;
-                    ui.dirty = true;
-                });
-            }
             thread::sleep(Duration::from_millis(2));
+        }
+        // Checked on painting passes too: the visualizer paints every one.
+        if !paused && app.session.as_ref().is_some_and(Session::finished) {
+            if play_and_exit {
+                return Ok(false);
+            }
+            // Like VLC's playlist: carry on with the next file, or stop at the end (or where
+            // the sleep timer says).
+            if app.sleep == SLEEP_END_OF_FILE || !app.advance() {
+                // The sleep timer stops; the end of the queue may quit, per Settings.
+                let quit = app.sleep != SLEEP_END_OF_FILE && PREFS.with_borrow(|p| p.at_end == 1);
+                app.sleep = 0;
+                app.stop();
+                if quit {
+                    unsafe { _ = DestroyWindow(hwnd) };
+                }
+            }
+            last_position = 0.0;
+            UI.with_borrow_mut(|ui| {
+                ui.browse.stale = true;
+                ui.dirty = true;
+            });
         }
         Ok(true)
     };
@@ -1821,6 +2041,11 @@ fn run() -> Result<(), Box<dyn Error>> {
     eprintln!("shown {shown} frames, dropped {dropped}");
     rendered
 }
+
+/// The shortest gap between reverse playback's steps back.
+const REVERSE_STEP: Duration = Duration::from_millis(33);
+/// The spectrum visualizer's bars.
+const VISUAL_BANDS: usize = 32;
 
 /// A pass of the render loop.
 type Frame<'a> = dyn FnMut() -> Result<bool, Box<dyn Error>> + 'a;

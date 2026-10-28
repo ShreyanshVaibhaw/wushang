@@ -63,6 +63,19 @@ pub const NET_TIMEOUT: Choices = &[
     ("30", "30 seconds"),
     ("60", "1 minute"),
 ];
+/// Subtitle fonts to pick from; Inter comes with myvlc, the rest with Windows.
+pub const FONTS: [&str; 8] = [
+    "Inter",
+    "Segoe UI",
+    "Arial",
+    "Verdana",
+    "Tahoma",
+    "Georgia",
+    "Times New Roman",
+    "Consolas",
+];
+/// The audio visualizers, drawn in place of the cover while audio plays.
+pub const VISUALIZERS: [&str; 3] = ["Disabled", "Spectrum", "Oscilloscope"];
 /// Subtitle and outline colours to pick from; the caption's own grey and near-black first.
 pub const COLORS: [(u32, &str); 8] = [
     (0xB8B8B8, "Light grey"),
@@ -143,6 +156,15 @@ pub struct Prefs {
     pub outline: usize,
     pub outline_color: u32,
     pub sub_shadow: bool,
+    /// One of `FONTS`.
+    pub sub_font: String,
+    /// Draw ASS and SSA subtitles with their own fonts, colours and positions (libass); off shows
+    /// their text like any other subtitle.
+    pub sub_styles: bool,
+    /// Marks where the subtitle track has lines along the seek bar.
+    pub sub_timeline: bool,
+    /// Index into `VISUALIZERS`.
+    pub visualizer: usize,
     // Library.
     pub show_hidden: bool,
     // Performance.
@@ -199,6 +221,10 @@ impl Default for Prefs {
             outline: 2,
             outline_color: caption.outline,
             sub_shadow: false,
+            sub_font: caption.font_family.clone(),
+            sub_styles: true,
+            sub_timeline: false,
+            visualizer: 0,
             show_hidden: false,
             hw_decoding: true,
             net_reconnect: true,
@@ -273,6 +299,10 @@ impl Prefs {
         line("outline", key(OUTLINE, self.outline).into());
         line("outline_color", format!("#{:06X}", self.outline_color));
         line("sub_shadow", self.sub_shadow.to_string());
+        line("sub_font", self.sub_font.clone());
+        line("sub_styles", self.sub_styles.to_string());
+        line("sub_timeline", self.sub_timeline.to_string());
+        line("visualizer", self.visualizer.to_string());
         line("show_hidden", self.show_hidden.to_string());
         line("hw_decoding", self.hw_decoding.to_string());
         line("net_reconnect", self.net_reconnect.to_string());
@@ -291,6 +321,7 @@ impl Prefs {
             bold: self.sub_bold,
             opacity: self.sub_opacity,
             shadow: self.sub_shadow,
+            font_family: self.sub_font.clone(),
             ..base
         }
     }
@@ -420,6 +451,14 @@ fn parse(text: &str) -> Prefs {
             "outline" => choice(&mut p.outline, OUTLINE),
             "outline_color" => colour(&mut p.outline_color),
             "sub_shadow" => flag(&mut p.sub_shadow),
+            "sub_font" if FONTS.contains(&v) => p.sub_font = v.into(),
+            "sub_styles" => flag(&mut p.sub_styles),
+            "sub_timeline" => flag(&mut p.sub_timeline),
+            "visualizer" => {
+                if let Ok(n) = v.parse::<usize>() {
+                    p.visualizer = n.min(VISUALIZERS.len() - 1);
+                }
+            }
             "show_hidden" => flag(&mut p.show_hidden),
             "hw_decoding" => flag(&mut p.hw_decoding),
             "net_reconnect" => flag(&mut p.net_reconnect),
@@ -483,6 +522,10 @@ mod tests {
             outline: 3,
             outline_color: 0x808080,
             sub_shadow: true,
+            sub_font: "Georgia".into(),
+            sub_styles: false,
+            sub_timeline: true,
+            visualizer: 2,
             show_hidden: true,
             hw_decoding: false,
             net_reconnect: false,

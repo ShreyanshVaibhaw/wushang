@@ -991,6 +991,11 @@ pub struct Scene<'a> {
     pub recording: bool,
     /// Subtitle cues to show now, and how.
     pub cues: &'a [crate::subs::Cue],
+    /// Where the subtitles have lines (seconds), marked along the seek bar; empty when off.
+    pub sub_marks: &'a [(f64, f64)],
+    /// The audio visualizer for an audio file: 1 with spectrum levels (0..1), 2 with the latest
+    /// samples (-1..1).
+    pub visual: Option<(usize, &'a [f32])>,
     pub caption_style: &'a crate::captions::CaptionStyle,
     /// Playback statistics, drawn over the video's top-left corner when turned on.
     pub stats: Option<&'a str>,
@@ -1249,6 +1254,8 @@ pub struct Painter {
     accent: ID2D1SolidColorBrush,
     track: ID2D1SolidColorBrush,
     played: ID2D1SolidColorBrush,
+    /// The seek bar's subtitle marks.
+    marks: ID2D1SolidColorBrush,
     hover: ID2D1SolidColorBrush,
     black: ID2D1SolidColorBrush,
     times: IDWriteTextFormat,
@@ -1301,6 +1308,7 @@ impl Painter {
             accent: brush(ACCENT, 1.0)?,
             track: brush(BG_B2, 1.0)?,
             played: brush(BG_ACCENT_BRIGHT, 1.0)?,
+            marks: brush(0xFFFFFF, 0.35)?,
             hover: brush(0xFFFFFF, 0.06)?,
             black: brush(0x000000, 1.0)?,
             times: format(15.0, DWRITE_TEXT_ALIGNMENT_CENTER)?,
@@ -1490,7 +1498,10 @@ impl Painter {
         unsafe {
             if !s.has_frame {
                 rt.FillRectangle(&l.video.d2d(), &self.black);
-                self.art(rt, ctx, s, l.video)?;
+                match s.visual {
+                    Some(visual) => self.visualizer(rt, visual, l.video)?,
+                    None => self.art(rt, ctx, s, l.video)?,
+                }
             }
             rt.FillGeometry(&self.frame_geometry(l)?, &self.bg, None);
             // Subtitles sit on the picture itself, or on the video area for audio files.
@@ -1621,6 +1632,75 @@ impl Painter {
         };
     }
 
+    /// The subtitle timeline: a thin line along the seek bar's bottom under each subtitle,
+    /// lines closer than a pixel merged.
+    unsafe fn sub_marks(&self, rt: &ID2D1RenderTarget, s: &Scene, t: Rect) {
+        if s.duration <= 0.0 {
+            return;
+        }
+        let x = |at: f64| t.l + 2.0 + (at / s.duration).clamp(0.0, 1.0) as f32 * (t.w() - 4.0);
+        let mut run: Option<(f32, f32)> = None;
+        let draw = |(l, r): (f32, f32)| {
+            let mark = Rect::new(l, t.b - 6.0, r.max(l + 1.5), t.b - 3.0);
+            unsafe { rt.FillRectangle(&mark.d2d(), &self.marks) };
+        };
+        for &(start, end) in s.sub_marks {
+            let (l, r) = (x(start), x(end));
+            run = match run {
+                Some((rl, rr)) if l <= rr + 1.0 => Some((rl, rr.max(r))),
+                Some(done) => {
+                    draw(done);
+                    Some((l, r))
+                }
+                None => Some((l, r)),
+            };
+        }
+        run.map(draw);
+    }
+
+    /// The audio visualizer filling `area`: spectrum bars rising from the bottom third, or the
+    /// waveform across the middle.
+    unsafe fn visualizer(
+        &self,
+        rt: &ID2D1RenderTarget,
+        (mode, v): (usize, &[f32]),
+        area: Rect,
+    ) -> Result<()> {
+        if v.is_empty() {
+            return Ok(());
+        }
+        let (w, base) = (area.w() * 0.8, area.t + area.h() * 0.7);
+        let left = area.l + (area.w() - w) / 2.0;
+        unsafe {
+            if mode == 1 {
+                let step = w / v.len() as f32;
+                for (i, level) in v.iter().enumerate() {
+                    let h = (level * area.h() * 0.45).max(2.0);
+                    let l = left + step * i as f32 + step * 0.15;
+                    let bar = Rect::new(l, base - h, l + step * 0.7, base);
+                    rt.FillRoundedRectangle(&rounded(bar, 2.0), &self.accent);
+                }
+            } else {
+                let path = self.factory.CreatePathGeometry()?;
+                let sink = path.Open()?;
+                let cy = area.t + area.h() / 2.0;
+                let amp = area.h() * 0.3;
+                let point = |i: usize| windows_numerics::Vector2 {
+                    X: left + w * i as f32 / (v.len() - 1).max(1) as f32,
+                    Y: cy - v[i].clamp(-1.0, 1.0) * amp,
+                };
+                sink.BeginFigure(point(0), D2D1_FIGURE_BEGIN_HOLLOW);
+                for i in 1..v.len() {
+                    sink.AddLine(point(i));
+                }
+                sink.EndFigure(D2D1_FIGURE_END_OPEN);
+                sink.Close()?;
+                rt.DrawGeometry(&path, &self.accent, 2.0, None);
+            }
+        }
+        Ok(())
+    }
+
     unsafe fn title_bar(&self, rt: &ID2D1RenderTarget, ctx: &ID2D1DeviceContext5, s: &Scene) {
         let (i, w) = (&self.icons, s.layout.width);
         unsafe {
@@ -1687,6 +1767,7 @@ impl Painter {
             let played = (fraction as f32 * (t.w() - 4.0)).max(8.0);
             let fill = Rect::new(t.l + 2.0, t.t + 2.0, t.l + 2.0 + played, t.b - 2.0);
             rt.FillRoundedRectangle(&rounded(fill, 4.0), &self.played);
+            self.sub_marks(rt, s, t);
             rt.FillRoundedRectangle(
                 &rounded(Rect::new(fill.r - 8.0, fill.t, fill.r, fill.b), 4.0),
                 &self.accent,

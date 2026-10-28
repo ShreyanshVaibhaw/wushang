@@ -283,6 +283,75 @@ pub fn apply_stereo(mode: StereoMode, samples: &mut [f32], channels: usize) {
     }
 }
 
+/// The stereo "Test" sound as a 16-bit WAV file: a low tone on the left, then a high one on the
+/// right, each 0.4 s, passed through `mode` as playback would.
+pub fn test_tone(mode: StereoMode) -> Vec<u8> {
+    const RATE: u32 = 44_100;
+    let half = (RATE as f32 * 0.4) as usize;
+    let mut samples = Vec::with_capacity(half * 4);
+    for i in 0..half * 2 {
+        let (right, f) = if i < half {
+            (false, 440.0)
+        } else {
+            (true, 660.0)
+        };
+        let t = (i % half) as f32 / RATE as f32;
+        // A short fade at both ends keeps it from clicking.
+        let fade = (t / 0.02).min((0.4 - t) / 0.02).clamp(0.0, 1.0);
+        let v = (t * f * std::f32::consts::TAU).sin() * 0.3 * fade;
+        samples.extend(if right { [0.0, v] } else { [v, 0.0] });
+    }
+    apply_stereo(mode, &mut samples, 2);
+    let data = samples.len() as u32 * 2;
+    let mut wav = Vec::with_capacity(44 + data as usize);
+    let mut put = |b: &[u8]| wav.extend_from_slice(b);
+    put(b"RIFF");
+    put(&(36 + data).to_le_bytes());
+    put(b"WAVEfmt ");
+    put(&16u32.to_le_bytes());
+    put(&1u16.to_le_bytes()); // PCM
+    put(&2u16.to_le_bytes());
+    put(&RATE.to_le_bytes());
+    put(&(RATE * 4).to_le_bytes());
+    put(&4u16.to_le_bytes());
+    put(&16u16.to_le_bytes());
+    put(b"data");
+    put(&data.to_le_bytes());
+    for s in samples {
+        put(&((s.clamp(-1.0, 1.0) * 32767.0) as i16).to_le_bytes());
+    }
+    wav
+}
+
+/// The level of `bands` log-spaced frequency bands from 50 Hz to 16 kHz in mono `samples` at
+/// `rate`, each 0..1 on a 60 dB scale, for the spectrum visualizer.
+// ponytail: a windowed DFT per band, a few thousand multiply-adds; an FFT if bands grow past ~64.
+pub fn spectrum(samples: &[f32], rate: u32, bands: usize) -> Vec<f32> {
+    let n = samples.len();
+    if n < 2 || rate == 0 {
+        return vec![0.0; bands];
+    }
+    let (lo, hi) = (50.0f32, 16_000.0f32.min(rate as f32 / 2.0));
+    (0..bands)
+        .map(|b| {
+            let f = lo * (hi / lo).powf((b as f32 + 0.5) / bands as f32);
+            let w = std::f32::consts::TAU * f / rate as f32;
+            let (mut re, mut im) = (0.0f32, 0.0f32);
+            for (i, s) in samples.iter().enumerate() {
+                // Hann window.
+                let hann = 0.5 - 0.5 * (std::f32::consts::TAU * i as f32 / (n - 1) as f32).cos();
+                let (sin, cos) = (w * i as f32).sin_cos();
+                re += s * hann * cos;
+                im += s * hann * sin;
+            }
+            // A full-scale sine reads about n / 4 through the window.
+            let level = (re * re + im * im).sqrt() / (n as f32 / 4.0);
+            let db = 20.0 * level.max(1e-6).log10();
+            ((db + 60.0) / 60.0).clamp(0.0, 1.0)
+        })
+        .collect()
+}
+
 /// One band of the equalizer: a band-pass biquad (RBJ audio EQ cookbook, 0 dB peak gain) in
 /// transposed direct form II, with b1 = 0 and b2 = -b0, plus the gain its output is mixed in with.
 #[derive(Clone, Copy)]
@@ -658,6 +727,41 @@ fn dot(a: &[f32], b: &[f32]) -> f32 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn test_tone_follows_the_stereo_mode() {
+        let level = |wav: &[u8], from: usize, channel: usize| {
+            (wav[44..].as_chunks::<4>().0.iter().skip(from).take(8000))
+                .map(|f| i16::from_le_bytes([f[channel * 2], f[channel * 2 + 1]]).unsigned_abs())
+                .max()
+                .unwrap()
+        };
+        let stereo = test_tone(StereoMode::Stereo);
+        assert_eq!(&stereo[..4], b"RIFF");
+        // The first tone is on the left only, the second on the right only.
+        assert!(level(&stereo, 2000, 0) > 5000 && level(&stereo, 2000, 1) == 0);
+        assert!(level(&stereo, 20000, 0) == 0 && level(&stereo, 20000, 1) > 5000);
+        let reverse = test_tone(StereoMode::Reverse);
+        assert!(level(&reverse, 2000, 0) == 0 && level(&reverse, 2000, 1) > 5000);
+        let right = test_tone(StereoMode::Right);
+        assert!(level(&right, 2000, 0) == 0 && level(&right, 20000, 0) > 5000);
+    }
+
+    #[test]
+    fn spectrum_peaks_at_the_tone() {
+        let rate = 48_000;
+        let samples: Vec<f32> = (0..1024)
+            .map(|i| (i as f32 * 1000.0 * std::f32::consts::TAU / rate as f32).sin())
+            .collect();
+        let bands = spectrum(&samples, rate, 24);
+        let peak = (0..24)
+            .max_by(|&a, &b| bands[a].total_cmp(&bands[b]))
+            .unwrap();
+        // 1 kHz sits in band 12 of 24 between 50 Hz and 16 kHz.
+        assert_eq!(peak, 12, "{bands:?}");
+        assert!(bands[peak] > 0.9 && bands[0] < 0.5);
+        assert!(spectrum(&[0.0; 1024], rate, 24).iter().all(|b| *b == 0.0));
+    }
+
     use super::*;
     use std::time::Instant;
 

@@ -123,6 +123,14 @@ pub fn available() -> bool {
     lib().is_some()
 }
 
+/// Settings' "Embedded Sub Format": off shows ASS and SSA as plain text.
+pub static STYLES: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// Whether new ASS and SSA tracks go to libass.
+pub fn styling() -> bool {
+    STYLES.load(std::sync::atomic::Ordering::Relaxed) && available()
+}
+
 /// Makes a font a file carries (a Matroska attachment) available to the tracks made after.
 pub fn add_font(name: &str, data: &[u8]) {
     let (Some(lib), Ok(name)) = (lib(), CString::new(name)) else {

@@ -259,7 +259,10 @@ impl CaptionRenderer {
         let format = unsafe {
             let format = dwrite.CreateTextFormat(
                 &HSTRING::from(family),
-                self.fonts.as_ref().map(|f| -> &IDWriteFontCollection { f }),
+                // The embedded collection only has Inter; other families are Windows' own.
+                (self.fonts.as_ref())
+                    .filter(|_| family == "Inter")
+                    .map(|f| -> &IDWriteFontCollection { f }),
                 if bold {
                     DWRITE_FONT_WEIGHT_BOLD
                 } else {

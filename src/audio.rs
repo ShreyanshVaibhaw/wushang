@@ -314,6 +314,20 @@ impl Device {
                 out[n..].fill(0.0);
                 ring.consume(n / format.channels);
                 drop(ring);
+                // The visualizer's copy; skipped rather than waited for while the UI reads it.
+                if n > 0
+                    && let Ok(mut scope) = shared.scope.try_lock()
+                {
+                    let ch = format.channels;
+                    let (rate, samples) = &mut *scope;
+                    *rate = format.rate;
+                    let mono = out[..n]
+                        .chunks_exact(ch)
+                        .map(|f| f.iter().sum::<f32>() / ch as f32);
+                    samples.extend(mono);
+                    let extra = samples.len().saturating_sub(crate::player::SCOPE);
+                    samples.drain(..extra);
+                }
                 feed.space.notify_one();
             },
             |e| eprintln!("audio: {e}"),

@@ -75,7 +75,7 @@ The playlist button opens the queue panel from the design, in the settings panel
   They live in `bookmarks.txt` next to the library state.
 - Chapters: the file's chapters with their titles; a click seeks there.
 
-The audio and subtitle buttons open the track popup from the design: video, audio and subtitle tracks (with names like "English" from the file's language tags), the output device, and external subtitle files, with + to load one by hand.
+The audio and subtitle buttons open the track popup from the design: video, audio and subtitle tracks (with names like "English" from the file's language tags), the output device, and external subtitle files, with + to load one by hand and the pencil to open the chosen one in its editor.
 "Add Audio File..." in the player menu's Audio submenu plays another file's sound with the video, like a dub or commentary kept beside it; it joins the audio track list under its file name and follows every seek.
 A subtitle file with the same name as the video, next to it or in a "Subs" folder, loads on its own, as in VLC.
 ASS and SSA subtitles, in the file or beside it, are drawn by libass as VLC and mpv draw them: their positions, fonts, colours, borders, shadows, rotation, karaoke and animation, with the fonts a Matroska file carries for them.
@@ -83,13 +83,18 @@ Without `libass-9.dll` next to myvlc.exe they fall back to plain text like every
 Old subtitle files in a Windows code page instead of UTF-8 are read in the right one: a language tag such as `film.ru.srt` names it, and otherwise myvlc tries the Western, Central European, Cyrillic, Greek, Turkish, Hebrew, Arabic, Baltic, Japanese, Chinese and Korean code pages and keeps the one whose text reads like real words.
 The gear opens the settings panel, with four tabs:
 
-- Playback: speed from 0.25x to 2x without changing pitch, a sleep timer, and playback statistics over the video.
-- Video: flip, rotation, zoom, aspect ratio, crop, and brightness, contrast, hue and saturation (under "Expand Settings"), all done by the GPU's video processor.
-- Audio: track, stereo mode (stereo, mono, left, right, reverse), audio delay, and VLC's 10-band equalizer with its 18 presets and the "2 Pass" option.
-- Subtitles: track, subtitle delay and text size.
+- Playback: marks on the seek bar where the subtitles have lines, playback statistics over the video, reverse playback, a sleep timer, an audio visualizer, and speed from 0.25x to 2x without changing pitch.
+- Video: flip, rotation, zoom, resolution, aspect ratio, crop, render, and brightness, contrast, hue and saturation (under "Expand Settings"), all done by the GPU's video processor.
+- Audio: track, stereo mode (stereo, mono, left, right, reverse) with a Test button, audio delay, and VLC's 10-band equalizer with its 18 presets and the "2 Pass" option.
+- Subtitles: track, subtitle delay, speed and duration factor, text size, whether ASS and SSA keep their own styling, font, and text and outline colours.
 
-Items the design shows that myvlc can't do yet (HDR, resolution, render, reverse, audio visualizer, subtitle font and colours, presets) are drawn dimmed.
-"Open Advanced Settings" opens the Settings window.
+Reverse plays backwards by stepping back with exact seeks, silent, as fast as the frames decode; Space or play stops it.
+The visualizer draws a spectrum or an oscilloscope in place of the cover while an audio file plays.
+Resolution picks between a stream's video tracks by picture size, "Best Available" being the largest, and Render adds streaming to other devices while the video still plays here.
+The stereo Test plays a low tone on the left, then a high one on the right, through the chosen stereo mode.
+The subtitle timeline knows every line of a subtitle file, but only the lines an embedded track has read so far.
+The footer's preset menu switches settings profiles, and "Open Advanced Settings" opens the Settings window.
+HDR is drawn dimmed, as myvlc can't show HDR on an HDR screen yet.
 Switching tracks and seeking land on the exact moment: the decoders read from the keyframe before it and drop what comes earlier.
 
 | Key | Action |
@@ -413,6 +418,8 @@ Each of these is marked with a `ponytail:` comment in the code, along with the u
 - Software frames reach the GPU as 8-bit NV12, so 10-bit video loses its extra precision there, and 4K60 10-bit H.264 drops frames on a laptop CPU.
 - Audio devices must mix in f32, which every WASAPI shared-mode device seen so far does.
 - The audio callback takes a mutex.
+- The stereo Test sound plays through Windows' default device at the system volume, not the chosen device or myvlc's volume.
+- The subtitle timeline shows nothing for ASS and SSA tracks libass draws, and an embedded track's lines only as the demuxer reads them.
 - A dropped stream reconnects only where FFmpeg does it (http and HLS); RTSP and UDP end when the connection does.
 - A podcast feed is fetched once per run, so new episodes show after a restart.
 - A video stream that fails its first 60 packets counts as undecodable, and playback goes on with audio only.

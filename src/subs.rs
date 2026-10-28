@@ -67,6 +67,9 @@ const PGS_HOLD: f64 = 60.0;
 pub struct Cues {
     list: Mutex<Vec<Entry>>,
     ass: Option<crate::ass::Track>,
+    /// Every cue's span seen so far, by start time's bits (starts are never negative, so the
+    /// bits sort like the times). A seek clears `list` but not this, for the timeline.
+    seen: Mutex<std::collections::BTreeMap<u64, f64>>,
 }
 
 struct Entry {
@@ -79,7 +82,14 @@ struct Entry {
 impl Cues {
     /// Cues whose `[start, end)` contains `t`, earliest first. For libass, one picture of the
     /// moment, its start the time it was first drawn for.
+    #[cfg(test)]
     pub fn active(&self, t: f64) -> Vec<Cue> {
+        self.active_stretched(t, 0.0)
+    }
+
+    /// `active`, with each text or picture cue lasting `stretch` times as long; 0 leaves them
+    /// as they are. libass draws its own timing.
+    pub fn active_stretched(&self, t: f64, stretch: f64) -> Vec<Cue> {
         if let Some(track) = &self.ass {
             let (width, height) = track.size();
             return track
@@ -100,8 +110,29 @@ impl Cues {
         let started = cues.partition_point(|e| e.cue.start <= t);
         cues[..started]
             .iter()
-            .filter(|e| t < e.cue.end)
+            .filter(|e| {
+                let end = if stretch > 0.0 {
+                    e.cue.start + (e.cue.end - e.cue.start) * stretch
+                } else {
+                    e.cue.end
+                };
+                t < end
+            })
             .map(|e| e.cue.clone())
+            .collect()
+    }
+
+    /// When each cue starts and ends, in start order, for the seek bar's subtitle timeline.
+    // ponytail: empty for libass tracks, and an embedded track only knows the cues the demuxer
+    // has read so far; read libass' events and scan the file ahead if a full timeline matters.
+    pub fn spans(&self) -> Vec<(f64, f64)> {
+        let mut seen = self.seen.lock().unwrap().clone();
+        // The cues held now have their final ends; earlier guesses may have been cut short.
+        for e in self.list.lock().unwrap().iter() {
+            seen.insert(e.cue.start.max(0.0).to_bits(), e.cue.end);
+        }
+        seen.into_iter()
+            .map(|(s, e)| (f64::from_bits(s), e))
             .collect()
     }
 
@@ -122,6 +153,12 @@ impl Cues {
             cue.end = cue.end.min(next.cue.start).max(cue.start);
         }
         close_open(&mut cues[..at], cue.start);
+        // What `close_open` just cut short is final, so it goes in `seen` with the new cue.
+        let mut seen = self.seen.lock().unwrap();
+        for e in &cues[at.saturating_sub(8)..at] {
+            seen.insert(e.cue.start.max(0.0).to_bits(), e.cue.end);
+        }
+        seen.insert(cue.start.max(0.0).to_bits(), cue.end);
         cues.insert(at, Entry { cue, open });
     }
 
@@ -150,7 +187,7 @@ fn close_open(earlier: &mut [Entry], t: f64) {
 
 /// Whether libass draws a track of codec `id`.
 fn styled(id: ff::codec::Id) -> bool {
-    matches!(id, ff::codec::Id::ASS | ff::codec::Id::SSA) && crate::ass::available()
+    matches!(id, ff::codec::Id::ASS | ff::codec::Id::SSA) && crate::ass::styling()
 }
 
 /// Decodes an embedded subtitle stream's packets as the demuxer routes them. Stops when
@@ -237,7 +274,7 @@ fn spawn_styled(
 pub fn load_external(path: &Path, canvas: (u32, u32)) -> Result<Arc<Cues>, String> {
     let ext = path.extension().map(|e| e.to_string_lossy().to_lowercase());
     if matches!(ext.as_deref(), Some("ass" | "ssa"))
-        && crate::ass::available()
+        && crate::ass::styling()
         && let Ok(bytes) = std::fs::read(path)
     {
         // libass reads UTF-8; old .ssa files are often in a Windows code page.
@@ -757,6 +794,26 @@ mod tests {
             true,
         );
         assert!(cues.active(0.5).len() == 1 && cues.active(1.0).len() == 1);
+    }
+
+    #[test]
+    fn stretched_cues_last_longer() {
+        let cues = Cues::default();
+        let cue = Cue {
+            start: 1.0,
+            end: 2.0,
+            content: CueContent::Text(Vec::new()),
+        };
+        cues.insert(cue, false);
+        assert!(cues.active(2.5).is_empty());
+        assert_eq!(cues.active_stretched(2.5, 2.0).len(), 1);
+        assert!(cues.active_stretched(3.0, 2.0).is_empty());
+        assert!(cues.active_stretched(1.6, 0.5).is_empty());
+        assert_eq!(cues.spans(), [(1.0, 2.0)]);
+        // A seek empties the cues; the timeline keeps them.
+        cues.clear();
+        assert!(cues.active(1.5).is_empty());
+        assert_eq!(cues.spans(), [(1.0, 2.0)]);
     }
 
     #[test]
