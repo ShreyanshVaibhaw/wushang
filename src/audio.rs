@@ -674,6 +674,7 @@ mod tests {
                 }])),
                 shared.clone(),
                 player::Role::Main(Vec::new()),
+                None,
             ),
         ]
     }

@@ -160,6 +160,9 @@ pub fn playlist_scope(name: &str) -> String {
     format!("playlist:{name}")
 }
 
+/// How old a feed may get before showing it fetches it again, for new episodes.
+pub const FEED_REFRESH: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+
 /// A podcast feed or the radio directory as last fetched: None while the fetch runs.
 pub type Fetched<T> = Option<Result<T, String>>;
 
@@ -257,6 +260,8 @@ pub struct Library {
     /// Feeds and the radio directory fetched this run, by feed address; they change too often
     /// to keep. Missing (None for stations) until first asked for.
     feeds: HashMap<String, Fetched<Feed>>,
+    /// When each feed's last fetch started, so a stale one fetches again (`FEED_REFRESH`).
+    feed_times: HashMap<String, std::time::Instant>,
     stations: Option<Fetched<Vec<Station>>>,
     /// Track preferences by `folder_scope` or `playlist_scope`.
     picks: HashMap<String, TrackPrefs>,
@@ -292,6 +297,7 @@ impl Library {
             track_at: HashMap::new(),
             addresses: Vec::new(),
             feeds: HashMap::new(),
+            feed_times: HashMap::new(),
             stations: None,
             picks: HashMap::new(),
         };
@@ -825,26 +831,45 @@ impl Library {
             .map_or_else(|| net::url_name(url), |a| a.name.clone())
     }
 
-    /// Whether `place` shows something not fetched yet, and so needs a fetch.
+    /// Whether `place` shows something not fetched yet, or a feed fetched longer than
+    /// `FEED_REFRESH` ago, and so needs a fetch.
     pub fn wants_fetch(&self, place: &Place) -> bool {
         match place {
-            Place::Podcast(url) => !self.feeds.contains_key(url),
+            Place::Podcast(url) => match self.feeds.get(url) {
+                None => true,
+                Some(Some(Ok(_))) => {
+                    (self.feed_times.get(url)).is_none_or(|t| t.elapsed() > FEED_REFRESH)
+                }
+                _ => false,
+            },
             Place::Radio => self.stations.is_none(),
             _ => false,
         }
     }
 
-    /// Marks a fetch as running, so `wants_fetch` asks only once.
+    /// Marks a fetch as running, so `wants_fetch` asks only once. A feed being fetched again
+    /// keeps showing its episodes meanwhile.
     pub fn fetching(&mut self, place: &Place) {
         match place {
-            Place::Podcast(url) => _ = self.feeds.insert(url.clone(), None),
+            Place::Podcast(url) => {
+                self.feed_times
+                    .insert(url.clone(), std::time::Instant::now());
+                self.feeds.entry(url.clone()).or_insert(None);
+            }
             Place::Radio => self.stations = Some(None),
             _ => {}
         }
     }
 
-    /// A feed fetch finished. A feed whose title is known now gets it as its name.
+    /// A feed fetch finished. A feed whose title is known now gets it as its name. A refresh
+    /// that failed keeps the episodes fetched before.
     pub fn feed_fetched(&mut self, url: &str, result: Result<Feed, String>) {
+        if let Err(e) = &result
+            && matches!(self.feeds.get(url), Some(Some(Ok(_))))
+        {
+            eprintln!("podcast: can't refresh {}: {e}", net::redact(url));
+            return;
+        }
         if let Ok(feed) = &result
             && !feed.title.is_empty()
             && let Some(a) =
@@ -860,8 +885,6 @@ impl Library {
     }
 
     /// Forgets a fetch of `place` that failed, so showing it again tries again.
-    // ponytail: a feed fetched fine stays as it was until the next run; refetch on every
-    // visit if new episodes should show sooner.
     pub fn retry_failed(&mut self, place: &Place) {
         match place {
             Place::Podcast(url) if matches!(self.feeds.get(url), Some(Some(Err(_)))) => {
@@ -1894,6 +1917,18 @@ mod tests {
         };
         assert_eq!(path, Path::new("https://example.com/one.mp3"));
         assert_eq!(subtitle.as_deref(), Some("26 Oct 2026"));
+        // A feed fetched a while ago fetches again, showing its episodes meanwhile, and keeps
+        // them when that fails.
+        let podcast = Place::Podcast(feed.into());
+        assert!(!lib.wants_fetch(&podcast));
+        let long_ago = std::time::Instant::now() - FEED_REFRESH - std::time::Duration::from_secs(1);
+        lib.feed_times.insert(feed.into(), long_ago);
+        assert!(lib.wants_fetch(&podcast));
+        lib.fetching(&podcast);
+        assert!(!lib.wants_fetch(&podcast));
+        assert_eq!(lib.entries(&podcast).len(), 1);
+        lib.feed_fetched(feed, Err("offline".into()));
+        assert_eq!(lib.entries(&podcast).len(), 1);
         // A failed directory fetch is tried again when the page shows again.
         lib.fetching(&Place::Radio);
         lib.stations_fetched(Err("offline".into()));

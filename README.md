@@ -159,6 +159,7 @@ The address stays on the Network page; right-clicking it offers Remove.
 A stream connects in the background while the player says "Connecting to ...", and if it can't play, the corner says so before the library comes back.
 A live stream, which has no end, shows "Live" in place of its length.
 Podcasts takes an RSS or Atom feed and lists its episodes, newest as the feed orders them, under the feed's own title; right-clicking a podcast removes it.
+A feed fetched more than 10 minutes ago fetches again when its page shows, keeping the episodes on screen meanwhile, and keeping them if the refresh fails.
 Radio lists the 100 most voted stations of the community [Radio Browser](https://www.radio-browser.info) directory, with their genre and country.
 Episodes and stations play with the name the page shows, and next and previous move through the page.
 Feeds and the directory load over WinHTTP on a background thread, so the window never waits on them.
@@ -218,6 +219,7 @@ Changes apply at once and are kept in `settings.txt` next to the library state.
 - Subtitles: on or off, the preferred language, loading subtitle files on their own, and their size, weight, colour, opacity, outline and shadow.
 - Library: show hidden files and folders.
 - Network: reconnect when a stream drops, and how long a stalled connection may wait (15 seconds by default).
+  FFmpeg reconnects http and HLS itself; an RTSP, RTP, UDP, TCP, SRT or RTMP stream that drops is opened again, each second until it answers or the timeout passes, with "Reconnecting..." over the video.
 - Performance: turn off GPU decoding.
 
 The equalizer, stereo mode, subtitle size, repeat and shuffle chosen in the panels are kept the same way.
@@ -424,8 +426,8 @@ Each of these is marked with a `ponytail:` comment in the code, along with the u
 - The audio callback takes a mutex.
 - The stereo Test sound plays through Windows' default device at the system volume, not the chosen device or myvlc's volume.
 - The subtitle timeline shows nothing for ASS and SSA tracks libass draws, and an embedded track's lines only as the demuxer reads them.
-- A dropped stream reconnects only where FFmpeg does it (http and HLS); RTSP and UDP end when the connection does.
-- A podcast feed is fetched once per run, so new episodes show after a restart.
+- A recording or network stream of an RTSP or UDP stream ends where that stream drops and reconnects.
+- A reconnected stream must keep its track order; one that comes back with different tracks plays them wrongly.
 - A video stream that fails its first 60 packets counts as undecodable, and playback goes on with audio only.
 - Thumbnails stay in memory for the whole run, about 350 KB each.
 - The folder picker is modal, so the video pauses on screen while it is open (audio keeps playing).

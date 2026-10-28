@@ -341,6 +341,10 @@ impl App {
             Session::open_with(
                 input,
                 cancel,
+                session::NetOptions {
+                    timeout: p.net_timeout,
+                    reconnect: p.net_reconnect,
+                },
                 path,
                 start,
                 &choice,
@@ -1640,6 +1644,14 @@ fn run() -> Result<(), Box<dyn Error>> {
             app.notice = None;
             app.start(&o.path, input.map(|input| (input, o.cancel)));
             UI.with_borrow_mut(|ui| ui.dirty = true);
+        }
+        // While a dropped stream opens again, the notice says so; it fades once it plays.
+        if shared.reconnecting.load(Relaxed) {
+            let fresh = app.notice.as_ref().is_none_or(|(t, _)| t != RECONNECTING);
+            app.notice = Some((RECONNECTING.to_owned(), Instant::now()));
+            if fresh {
+                UI.with_borrow_mut(|ui| ui.dirty = true);
+            }
         }
         if let Some(text) = app.notices.1.try_iter().last() {
             app.notice = Some((text, Instant::now()));
@@ -3718,6 +3730,8 @@ fn fetch_network(app: &mut App) {
         UI.with_borrow_mut(|ui| ui.browse.stale = true);
     }
 }
+
+const RECONNECTING: &str = "Reconnecting...";
 
 /// How long a notice stays over the video.
 const NOTICE_FOR: Duration = Duration::from_secs(3);

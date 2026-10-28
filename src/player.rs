@@ -129,6 +129,42 @@ pub struct Shared {
     pub audio_done: AtomicBool,
     /// The last `SCOPE` mono samples sent to the speakers, and their rate, for the visualizer.
     pub scope: Mutex<(u32, Vec<f32>)>,
+    /// A dropped live stream is being opened again.
+    pub reconnecting: AtomicBool,
+}
+
+/// How a live stream FFmpeg can't reconnect itself (RTSP, UDP) opens again when it drops.
+pub struct Reconnect {
+    pub open: Box<dyn Fn() -> Result<ff::format::context::Input, String> + Send>,
+    /// Keep trying this long before the stream counts as ended.
+    pub give_up: Duration,
+}
+
+impl Reconnect {
+    /// Opens the stream again, trying each second until it answers, `give_up` passes or the
+    /// player stops.
+    fn reopen(&self, shared: &Shared) -> Option<ff::format::context::Input> {
+        shared.reconnecting.store(true, Relaxed);
+        let since = std::time::Instant::now();
+        let input = loop {
+            if shared.quitting() {
+                break None;
+            }
+            match (self.open)() {
+                Ok(input) => break Some(input),
+                Err(e) if since.elapsed() < self.give_up => {
+                    eprintln!("stream: still down ({e})");
+                    thread::sleep(Duration::from_secs(1));
+                }
+                Err(e) => {
+                    eprintln!("stream: giving up ({e})");
+                    break None;
+                }
+            }
+        };
+        shared.reconnecting.store(false, Relaxed);
+        input
+    }
 }
 
 /// Samples the visualizer sees at once, about 20 ms.
@@ -159,6 +195,7 @@ impl Shared {
             audio_master: AtomicBool::new(false),
             audio_done: AtomicBool::new(false),
             scope: Mutex::new((0, Vec::with_capacity(SCOPE * 16))),
+            reconnecting: AtomicBool::new(false),
         }
     }
 
@@ -505,6 +542,7 @@ pub fn spawn_demuxer(
     routes: Routes,
     shared: Arc<Shared>,
     role: Role,
+    reconnect: Option<Reconnect>,
 ) -> JoinHandle<()> {
     let (follower, copies) = match role {
         Role::Main(copies) => (false, copies),
@@ -592,9 +630,36 @@ pub fn spawn_demuxer(
                         r.queue.push(Msg::Packet(packet));
                     }
                 }
-                // A live stream with nothing to read yet; reconnecting after real drops happens
-                // inside FFmpeg (see `session::open_input`), so any other error ends the stream.
+                // A live stream with nothing to read yet. FFmpeg reconnects http and HLS itself
+                // (see `session::open_input`); RTSP and UDP open again here.
                 Err(ff::Error::Other { errno }) if errno == ffi::EAGAIN => thread::sleep(POLL / 2),
+                Err(e) if let Some(reconnect) = &reconnect => {
+                    eprintln!("stream: dropped ({e}), reconnecting");
+                    // A copy can't go on across the break; it ends there.
+                    for (control, recorder) in copies.iter().zip(&mut recorders) {
+                        record::stop(recorder, control, playhead);
+                    }
+                    // The old connection closes first: a UDP port takes one listener at a time.
+                    drop(input);
+                    let Some(again) = reconnect.reopen(&shared) else {
+                        for r in routes.lock().unwrap().iter() {
+                            r.queue.push(Msg::Eof);
+                        }
+                        return;
+                    };
+                    input = again;
+                    // Like a seek: the decoders start over, and the clock from the new packets,
+                    // whose times may begin anywhere.
+                    shared
+                        .seek_floor
+                        .store(f64::NEG_INFINITY.to_bits(), Relaxed);
+                    let serial = shared.serial.fetch_add(1, Relaxed) + 1;
+                    for r in routes.lock().unwrap().iter() {
+                        r.queue.clear();
+                        r.queue.push(Msg::Flush(serial));
+                    }
+                    shared.clock.invalidate();
+                }
                 Err(_) => {
                     for r in routes.lock().unwrap().iter() {
                         r.queue.push(Msg::Eof);

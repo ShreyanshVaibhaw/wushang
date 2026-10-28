@@ -132,6 +132,17 @@ pub fn open_input(
         .map_err(|e| format!("cannot open {}: {e}", net::redact(&url)))
 }
 
+/// Whether `path` is a live stream FFmpeg doesn't reconnect itself (it does http and HLS), so
+/// the demuxer opens it again when it drops.
+fn reopens(path: &Path) -> bool {
+    let url = path.to_string_lossy().to_ascii_lowercase();
+    [
+        "rtsp://", "rtsps://", "rtp://", "udp://", "tcp://", "srt://", "rtmp://",
+    ]
+    .iter()
+    .any(|scheme| url.starts_with(scheme))
+}
+
 /// Which tracks a file starts with, from Settings.
 #[derive(Clone, Debug)]
 pub struct TrackChoice {
@@ -202,7 +213,9 @@ impl Session {
             reconnect: true,
         };
         let input = open_input(path, options, &cancel)?;
-        Session::open_with(input, cancel, path, start, choice, shared, hw, audio)
+        Session::open_with(
+            input, cancel, options, path, start, choice, shared, hw, audio,
+        )
     }
 
     /// Starts playing `input`, opened from `path` by `open_input` with `cancel`.
@@ -210,6 +223,7 @@ impl Session {
     pub fn open_with(
         input: ff::format::context::Input,
         cancel: Arc<AtomicBool>,
+        options: NetOptions,
         path: &Path,
         start: Option<f64>,
         choice: &TrackChoice,
@@ -386,11 +400,19 @@ impl Session {
         if let Some(t) = start.filter(|t| *t > 0.0) {
             shared.seek_to(t);
         }
+        let reconnect = (options.reconnect && reopens(path)).then(|| {
+            let (path, cancel) = (path.to_owned(), session.cancel.clone());
+            player::Reconnect {
+                open: Box::new(move || open_input(&path, options, &cancel)),
+                give_up: std::time::Duration::from_secs(options.timeout.into()),
+            }
+        });
         session.demuxer = Some(player::spawn_demuxer(
             input,
             session.routes.clone(),
             shared.clone(),
             player::Role::Main(vec![session.record.clone(), session.stream.clone()]),
+            reconnect,
         ));
         Ok(session)
     }
@@ -617,6 +639,7 @@ impl Session {
             routes.clone(),
             self.shared.clone(),
             player::Role::Follower,
+            None,
         );
         self.externals.push(External {
             path: path.to_owned(),
