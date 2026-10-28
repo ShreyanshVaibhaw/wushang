@@ -1559,25 +1559,7 @@ fn run() -> Result<(), Box<dyn Error>> {
     // index on disk covers the files that haven't changed since.
     let prober = thumbs::Prober::new();
     let mut tracks: HashMap<PathBuf, (tags::Stamp, Track)> = HashMap::new();
-    if !play_and_exit {
-        let mut saved_tags = tags::load(&Library::default_dir());
-        let mut changed = Vec::new();
-        // ponytail: one metadata read per music file on the UI thread at startup, like the
-        // folder walk before it; move both to a thread if a large library delays the window.
-        for path in app.library.music_files() {
-            match saved_tags.remove(&path) {
-                Some((stamp, track)) if tags::stamp(&path) == Some(stamp) => {
-                    tracks.insert(path, (stamp, track));
-                }
-                _ => changed.push(path),
-            }
-        }
-        if !tracks.is_empty() {
-            app.library
-                .set_tracks(tracks.values().map(|(_, t)| t.clone()).collect());
-        }
-        prober.request_all(changed);
-    }
+    let mut music_scan = (!play_and_exit).then(|| scan_music(app.library.roots(Section::Music)));
     let mut tracks_changed = false;
     let mut tags_unsaved = false;
     let mut tracks_set = Instant::now();
@@ -1748,6 +1730,30 @@ fn run() -> Result<(), Box<dyn Error>> {
                 thumb.as_ref().map(|t| (t.width, t.height, &t.bgra[..])),
             );
             UI.with_borrow_mut(|ui| ui.dirty = true);
+        }
+        if let Some(scan) = &music_scan
+            && let Ok((known, changed)) = scan.try_recv()
+        {
+            music_scan = None;
+            tracks.extend(known);
+            // Files still to probe show by name until their tags come; the empty stamp has
+            // them probed again next run if this one ends first.
+            for path in &changed {
+                let track = Track {
+                    path: path.clone(),
+                    ..Default::default()
+                };
+                tracks.insert(path.clone(), (tags::Stamp::default(), track));
+            }
+            prober.request_all(changed);
+            app.library
+                .set_tracks(tracks.values().map(|(_, t)| t.clone()).collect());
+            tracks_set = Instant::now();
+            UI.with_borrow_mut(|ui| {
+                if ui.browse.place.section() == Section::Music || ui.browse.place == Place::Home {
+                    ui.browse.stale = true;
+                }
+            });
         }
         for (path, info) in prober.take_ready() {
             let info = info.unwrap_or_default();
@@ -2180,6 +2186,29 @@ fn modal_frame() {
         eprintln!("render: {e}");
     }
 }
+
+/// Walks the Music folders `roots` on a thread, since a big library or a slow drive would hold
+/// up the window. Sends the files whose saved tags still match (by size and time) with those
+/// tags, and the files to probe.
+fn scan_music(roots: Vec<PathBuf>) -> mpsc::Receiver<MusicScan> {
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let mut saved = tags::load(&Library::default_dir());
+        let (mut known, mut changed) = (HashMap::new(), Vec::new());
+        for path in library::music_files(&roots) {
+            match saved.remove(&path) {
+                Some((stamp, track)) if tags::stamp(&path) == Some(stamp) => {
+                    known.insert(path, (stamp, track));
+                }
+                _ => changed.push(path),
+            }
+        }
+        _ = tx.send((known, changed));
+    });
+    rx
+}
+
+type MusicScan = (HashMap<PathBuf, (tags::Stamp, Track)>, Vec<PathBuf>);
 
 fn save_tags(tracks: &HashMap<PathBuf, (tags::Stamp, Track)>) {
     if let Err(e) = tags::save(&Library::default_dir(), tracks) {

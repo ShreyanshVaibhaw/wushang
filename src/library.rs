@@ -256,6 +256,8 @@ pub struct Library {
     // run finishes; save it next to state.txt if that wait shows.
     tracks: Vec<Track>,
     track_at: HashMap<PathBuf, usize>,
+    /// Set once the Music folders have been walked and `tracks` lists every file in them.
+    music_scanned: bool,
     /// Saved streams and podcast feeds, most recent first.
     addresses: Vec<Address>,
     /// Feeds and the radio directory fetched this run, by feed address; they change too often
@@ -298,6 +300,7 @@ impl Library {
             favorites: Vec::new(),
             tracks: Vec::new(),
             track_at: HashMap::new(),
+            music_scanned: false,
             addresses: Vec::new(),
             feeds: HashMap::new(),
             feed_times: HashMap::new(),
@@ -578,15 +581,10 @@ impl Library {
                 dirs.chain(files).collect()
             }
             Place::Songs => {
-                let mut out: Vec<Entry> = if self.tracks.is_empty() {
-                    let files = self.music_files();
-                    files
-                        .iter()
-                        .map(|p| media(p, stem_of(p), None, None))
-                        .collect()
-                } else {
-                    self.tracks.iter().map(track_media).collect()
-                };
+                if !self.music_scanned {
+                    return vec![notice("Looking for music...")];
+                }
+                let mut out: Vec<Entry> = self.tracks.iter().map(track_media).collect();
                 out.sort_by(|a, b| natural_cmp(a.label(), b.label()));
                 out
             }
@@ -1183,6 +1181,7 @@ impl Library {
 
     /// Replaces the music index with the result of a scan. Blank tags count as missing.
     pub fn set_tracks(&mut self, mut tracks: Vec<Track>) {
+        self.music_scanned = true;
         for t in &mut tracks {
             for tag in [&mut t.title, &mut t.artist, &mut t.album, &mut t.genre] {
                 *tag = tag
@@ -1212,17 +1211,9 @@ impl Library {
     }
 
     /// Every audio file under the Music roots, for the scanner to probe.
-    pub fn music_files(&self) -> Vec<PathBuf> {
-        let mut seen = HashSet::new();
-        let mut out = Vec::new();
-        for root in &self.music_roots {
-            walk(root, MUSIC_SCAN_DEPTH, &mut |p| {
-                if media_kind(&p) == Some(MediaKind::Audio) && seen.insert(p.clone()) {
-                    out.push(p);
-                }
-            });
-        }
-        out
+    #[cfg(test)]
+    fn music_files(&self) -> Vec<PathBuf> {
+        music_files(&self.music_roots)
     }
 
     pub fn track(&self, path: &Path) -> Option<&Track> {
@@ -1499,6 +1490,20 @@ fn search_dirs(state: &Mutex<DirSearch>) {
         s.known.insert(dir, has);
         s.hid |= !has;
     }
+}
+
+/// Every audio file under the Music folders `roots`, each once.
+pub fn music_files(roots: &[PathBuf]) -> Vec<PathBuf> {
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for root in roots {
+        walk(root, MUSIC_SCAN_DEPTH, &mut |p| {
+            if media_kind(&p) == Some(MediaKind::Audio) && seen.insert(p.clone()) {
+                out.push(p);
+            }
+        });
+    }
+    out
 }
 
 /// Whether `dir` or its subfolders, `depth` levels in all, hold any media file.
@@ -2192,7 +2197,13 @@ mod tests {
         lib.add_root(Section::Music, m.clone());
         lib.add_root(Section::Music, m.join("a"));
         assert_eq!(lib.music_files(), [m.join("b.mp3"), m.join(r"a\c.FLAC")]);
-        // Before a scan, Songs lists the files by name.
+        // Until the walk is done Songs says so; then files without tags show by name.
+        assert_eq!(labels(&lib.entries(&Place::Songs)), "Looking for music...");
+        let untagged = |p: PathBuf| Track {
+            path: p,
+            ..Default::default()
+        };
+        lib.set_tracks(lib.music_files().into_iter().map(untagged).collect());
         assert_eq!(labels(&lib.entries(&Place::Songs)), "b|c");
     }
 }
