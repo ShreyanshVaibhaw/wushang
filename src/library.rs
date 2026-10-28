@@ -1189,7 +1189,7 @@ impl Library {
         out
     }
 
-    fn track(&self, path: &Path) -> Option<&Track> {
+    pub fn track(&self, path: &Path) -> Option<&Track> {
         self.track_at.get(path).map(|&i| &self.tracks[i])
     }
 
@@ -1832,7 +1832,11 @@ mod tests {
         lib.set_track_pref(&folder_scope(&anime), true, Some("jpn".into()));
         lib.set_track_pref(&folder_scope(&anime), false, Some("eng".into()));
         // The nearer folder wins for what it sets; the rest comes from further up.
-        lib.set_track_pref(&folder_scope(&anime.join("Show")), false, Some("off".into()));
+        lib.set_track_pref(
+            &folder_scope(&anime.join("Show")),
+            false,
+            Some("off".into()),
+        );
         lib.create_playlist("Dubbed").unwrap();
         lib.add_to_playlist("Dubbed", &ep).unwrap();
         lib.add_to_playlist("Dubbed", &film).unwrap();
@@ -1850,7 +1854,10 @@ mod tests {
         let mut lib = lib;
         lib.set_track_pref(&playlist_scope("Dubbed"), true, None);
         assert_eq!(lib.tracks_for(&film), TrackPrefs::default());
-        assert_eq!(lib.track_prefs(&playlist_scope("Dubbed")), TrackPrefs::default());
+        assert_eq!(
+            lib.track_prefs(&playlist_scope("Dubbed")),
+            TrackPrefs::default()
+        );
     }
 
     #[test]

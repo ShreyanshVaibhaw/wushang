@@ -227,6 +227,10 @@ struct App {
     capture_devices: Arc<Mutex<Vec<capture::Device>>>,
     /// The conversion running, one at a time.
     converting: Option<convert::Job>,
+    /// The playlist the queue came from, for the bars' playlist name; the next `play` takes
+    /// `next_playlist`, which only playing from a playlist sets.
+    playing_playlist: Option<String>,
+    next_playlist: Option<String>,
     /// The HTTP server players connect to while streaming out, and where its errors come back.
     stream_server: Option<stream::Server>,
     stream_control: Option<record::Control>,
@@ -241,7 +245,14 @@ struct Opening {
 impl App {
     /// Plays `path` from where it was left, with `queue` for previous and next. Repeat and
     /// shuffle carry over from the last queue, as in VLC.
+    /// Counts a play of playlist `name` and marks the next `play` as coming from it.
+    fn mark_playlist(&mut self, name: &str) {
+        self.library.record_playlist_play(name);
+        self.next_playlist = Some(name.to_owned());
+    }
+
     fn play(&mut self, path: &Path, queue: Vec<PathBuf>) -> bool {
+        self.playing_playlist = self.next_playlist.take();
         let (repeat, shuffle) = (self.queue.repeat(), self.queue.shuffle());
         self.queue = Queue::new(queue, Some(path));
         self.queue.set_repeat(repeat);
@@ -1232,6 +1243,8 @@ fn run() -> Result<(), Box<dyn Error>> {
         record_control: None,
         capture_devices: Arc::default(),
         converting: None,
+        playing_playlist: None,
+        next_playlist: None,
         stream_server: None,
         stream_control: None,
     };
@@ -1715,6 +1728,14 @@ fn run() -> Result<(), Box<dyn Error>> {
                     art: session
                         .filter(|s| s.video_size.is_none())
                         .map(|s| s.path.as_path()),
+                    media: session
+                        .filter(|s| !net::is_address(&s.path))
+                        .map(|s| s.path.as_path()),
+                    artist: session
+                        .and_then(|s| app.library.track(&s.path))
+                        .and_then(|t| t.artist.as_deref())
+                        .unwrap_or_default(),
+                    playlist: app.playing_playlist.as_deref().unwrap_or_default(),
                     fullscreen,
                     has_frame: app.current.is_some(),
                     browse: &ui.browse,
@@ -1913,7 +1934,7 @@ fn handle(app: &mut App, hwnd: HWND, hit: Hit) {
                 }
                 Entry::Media { path, .. } => {
                     if let Place::Playlist(name) = &place {
-                        app.library.record_playlist_play(name);
+                        app.mark_playlist(name);
                     }
                     let queue = app.library.media_in(&place);
                     // Streams have no tags to name them by; the page's names do, for the whole
@@ -2099,7 +2120,7 @@ fn menu_action(app: &mut App, hwnd: HWND, action: MenuAction) {
                 queue = vec![path.clone()];
             }
             if let Place::Playlist(name) = &place {
-                app.library.record_playlist_play(name);
+                app.mark_playlist(name);
             }
             if app.play(&path, queue) {
                 show_player();
@@ -2383,7 +2404,7 @@ fn play_playlist(app: &mut App, name: &str, shuffle: bool) {
     let Some(first) = items.first().cloned() else {
         return;
     };
-    app.library.record_playlist_play(name);
+    app.mark_playlist(name);
     if app.play(&first, items) {
         UI.with_borrow_mut(|ui| ui.show(Page::Player));
     }
@@ -3369,6 +3390,26 @@ fn use_tool(app: &mut App, hwnd: HWND, item: ui::ToolItem) {
         T::Properties => WANT_PROPERTIES.set(true),
         T::Snapshot => WANT_SNAPSHOT.set(true),
         T::Record => app.toggle_record(),
+        T::RightSidebar => UI.with_borrow_mut(Ui::toggle_queue),
+        T::ArtistName => {
+            let artist = (app.session.as_ref())
+                .and_then(|s| app.library.track(&s.path))
+                .and_then(|t| t.artist.clone());
+            if let Some(artist) = artist {
+                UI.with_borrow_mut(|ui| {
+                    ui.browse.go(Place::Artist(artist));
+                    ui.show(Page::Library);
+                });
+            }
+        }
+        T::PlaylistName => {
+            if let Some(name) = app.playing_playlist.clone() {
+                UI.with_borrow_mut(|ui| {
+                    ui.browse.go(Place::Playlist(name));
+                    ui.show(Page::Library);
+                });
+            }
+        }
         T::Favorite => {
             if let Some(path) = app.session.as_ref().map(|s| s.path.clone()) {
                 let on = !app.library.is_favorite(&path);

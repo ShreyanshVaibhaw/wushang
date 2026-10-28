@@ -129,7 +129,8 @@ Dropping on the seek bar starts the centre group, and the control bar then takes
 Save keeps the bars in `toolbar.txt` next to the library state; Cancel or Esc drops the changes.
 
 Besides the bars' own controls, the palette has spacers and dividers, snapshot, playback speed, skip 10 or 15 seconds either way, stop, repeat, shuffle, the mini player, zoom, quit, Settings, the library, the file name, properties, replay, chapters, favourite, add a bookmark, bookmarks and playlists.
-HDR, the right sidebar, a thumbnail and the artist and playlist names are dimmed, as myvlc can't do them yet.
+The thumbnail item shows the playing file's picture, Artist Name and Playlist Name the track's artist and the playlist the queue came from (each opens its page when clicked), and Right Sidebar opens and closes the queue.
+HDR is dimmed, as myvlc can't show HDR on an HDR screen yet.
 
 ### Mini player
 

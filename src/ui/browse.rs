@@ -705,7 +705,7 @@ impl Layout {
 /// Brushes, fonts and icons only the library page uses.
 pub(super) struct Resources {
     body: ID2D1SolidColorBrush,
-    panel: ID2D1SolidColorBrush,
+    pub(super) panel: ID2D1SolidColorBrush,
     /// The overlay panel's list, a shade lighter than the page.
     list_bg: ID2D1SolidColorBrush,
     search_bg: ID2D1SolidColorBrush,
@@ -835,7 +835,7 @@ impl Resources {
 }
 
 /// Scales a `bw` x `bh` bitmap to cover `r`, centred, as a brush transform.
-fn cover(r: Rect, bw: f32, bh: f32) -> Matrix3x2 {
+pub(super) fn cover(r: Rect, bw: f32, bh: f32) -> Matrix3x2 {
     let s = (r.w() / bw).max(r.h() / bh);
     Matrix3x2 {
         M11: s,

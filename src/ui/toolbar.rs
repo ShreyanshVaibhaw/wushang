@@ -211,17 +211,9 @@ impl Item {
     }
 
     /// Whether myvlc can do it; the palette dims the others and won't let them go.
-    // ponytail: HDR needs output to an HDR screen; a thumbnail, artist and playlist name need
-    // the bars to know more about the file.
+    // ponytail: HDR needs output to an HDR screen.
     pub fn supported(self) -> bool {
-        !matches!(
-            self,
-            Item::Hdr
-                | Item::RightSidebar
-                | Item::Thumbnail
-                | Item::ArtistName
-                | Item::PlaylistName
-        )
+        self != Item::Hdr
     }
 
     /// Spacers and dividers can go in as often as wanted; the palette always offers them.
@@ -242,6 +234,8 @@ impl Item {
             Item::Volume => (120.0, 20.0),
             Item::Queue => (30.0, 20.0),
             Item::FileName => (180.0, 12.0),
+            Item::ArtistName | Item::PlaylistName => (160.0, 12.0),
+            Item::Thumbnail => (56.0, 12.0),
             Item::Spacer => (24.0, 0.0),
             _ => (30.0, 12.0),
         }

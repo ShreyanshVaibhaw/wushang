@@ -962,6 +962,12 @@ pub struct Scene<'a> {
     pub file: &'a str,
     /// An audio-only file: its cover (or a music glyph) goes where the video would.
     pub art: Option<&'a std::path::Path>,
+    /// The open file, for the bars' thumbnail; None for streams, discs and cameras.
+    pub media: Option<&'a std::path::Path>,
+    /// The bars' artist and playlist names: the track's artist tag, and the playlist the queue
+    /// came from. Empty when there is none.
+    pub artist: &'a str,
+    pub playlist: &'a str,
     pub fullscreen: bool,
     pub has_frame: bool,
     pub browse: &'a Browse,
@@ -1269,6 +1275,8 @@ pub struct Painter {
     thumbs: HashMap<PathBuf, Option<ID2D1Bitmap>>,
     /// Visible files without a thumbnail yet, collected while painting.
     wanted: Vec<PathBuf>,
+    /// The bars' thumbnail, wanted while painting the bars, which only borrow the painter.
+    bar_wanted: std::cell::Cell<Option<PathBuf>>,
     captions: crate::captions::CaptionRenderer,
     stats_text: IDWriteTextFormat,
     stats_bg: ID2D1SolidColorBrush,
@@ -1340,6 +1348,7 @@ impl Painter {
             dwrite,
             thumbs: HashMap::new(),
             wanted: Vec::new(),
+            bar_wanted: Default::default(),
         })
     }
 
@@ -1400,7 +1409,9 @@ impl Painter {
 
     /// Files the last paint showed without a thumbnail.
     pub fn take_wanted(&mut self) -> Vec<PathBuf> {
-        std::mem::take(&mut self.wanted)
+        let mut wanted = std::mem::take(&mut self.wanted);
+        wanted.extend(self.bar_wanted.take());
+        wanted
     }
 
     /// Lays out the library page; it needs DirectWrite to measure the breadcrumb.
@@ -1729,6 +1740,18 @@ impl Painter {
                     let tr = Rect::new(r.l, cy - 20.0, r.r, cy + 20.0);
                     self.text(rt, s.file, &self.folder, tr);
                 }
+                ToolItem::ArtistName | ToolItem::PlaylistName => {
+                    let text = match p.item {
+                        ToolItem::ArtistName => s.artist,
+                        _ => s.playlist,
+                    };
+                    if !text.is_empty() {
+                        self.hover_box(rt, s, Hit::Tool(p.item));
+                        let tr = Rect::new(r.l + 6.0, cy - 20.0, r.r - 6.0, cy + 20.0);
+                        self.text(rt, text, &self.folder, tr);
+                    }
+                }
+                ToolItem::Thumbnail => self.bar_thumbnail(rt, ctx, s, r, cy),
                 ToolItem::Previous => {
                     self.hover_box(rt, s, Hit::Previous);
                     self.icon(ctx, &i.previous, r.l + 3.0, cy - 12.0, false);
@@ -1784,6 +1807,7 @@ impl Painter {
                         ToolItem::Shuffle => s.shuffle,
                         ToolItem::Favorite => s.favorite,
                         ToolItem::Record => s.recording,
+                        ToolItem::RightSidebar => l.queue.open,
                         _ => false,
                     };
                     let svg = match (item, s.repeat) {
@@ -1794,6 +1818,47 @@ impl Painter {
                     let x = r.l + (r.w() - 24.0) / 2.0;
                     self.icon(ctx, svg, x, cy - 12.0, false);
                     self.tool_number(rt, item, x + 12.0, cy);
+                }
+            }
+        }
+    }
+
+    /// The bars' thumbnail of the open file: its picture (a video's frame, a song's cover) in a
+    /// 16:9 box, or the box with the file's kind of glyph until there is one.
+    unsafe fn bar_thumbnail(
+        &self,
+        rt: &ID2D1RenderTarget,
+        ctx: &ID2D1DeviceContext5,
+        s: &Scene,
+        r: Rect,
+        cy: f32,
+    ) {
+        let Some(path) = s.media else { return };
+        let (w, h) = (48.0, 27.0);
+        let x = r.l + (r.w() - w) / 2.0;
+        let box_ = Rect::new(x, cy - h / 2.0, x + w, cy + h / 2.0);
+        unsafe {
+            match self.thumbs.get(path) {
+                Some(Some(bitmap)) => {
+                    let size = bitmap.GetSize();
+                    if let Ok(brush) = ctx.CreateBitmapBrush(bitmap, None, None) {
+                        brush.SetTransform(&browse::cover(box_, size.width, size.height));
+                        rt.FillRoundedRectangle(&rounded(box_, 4.0), &brush);
+                    }
+                }
+                // Until it has one, or for a song without a cover: the library tile's look.
+                known => {
+                    if known.is_none() {
+                        self.bar_wanted.set(Some(path.to_owned()));
+                    }
+                    let audio =
+                        crate::library::media_kind(path) == Some(crate::library::MediaKind::Audio);
+                    let fill = if audio { &self.lib.panel } else { &self.black };
+                    rt.FillRoundedRectangle(&rounded(box_, 4.0), fill);
+                    if audio {
+                        let x = box_.l + (w - 24.0) / 2.0;
+                        self.icon(ctx, &self.icons.music, x, cy - 12.0, false);
+                    }
                 }
             }
         }
