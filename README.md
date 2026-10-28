@@ -45,8 +45,11 @@ Playlists are standard M3U files.
 
 Right-click a file, folder or playlist (on the library page or in the player's sidebar panel) for the design's context menus:
 - files: play, mark as watched, favourite, add to the queue or a playlist, show in File Explorer, go to its folder, add a subtitle file, properties, and remove from the playlist when on a playlist's page;
-- folders: add files or a folder, rescan, info;
-- playlists: play, shuffle, favourite, export as M3U, add to the queue, rename (Properties & Metadata), delete.
+- folders: add files or a folder, rescan, info, and the subtitle and audio languages its files start with;
+- playlists: play, shuffle, favourite, export as M3U, add to the queue, rename (Properties & Metadata), delete, and the same track languages.
+
+A folder's or playlist's track languages go over Settings' for its files: "Japanese audio, English subtitles" for an anime folder, say.
+A folder's choice covers the folders inside it, the nearest choice wins, and a playlist's applies to files no chosen folder holds.
 Favourites appear first on Home.
 
 Library state (folders, recent files and positions, visit and play counts) lives in `%APPDATA%\myvlc`, or in the folder named by the `MYVLC_HOME` environment variable, which never seeds your own folders and suits tests.

@@ -13,7 +13,7 @@ use super::browse::SortMode;
 use super::panels::{ASPECT, CROP, PanelAction, PanelData, SLEEP, STEREO, SettingsTab, ZOOM};
 use super::*;
 use crate::convert::Target as Format;
-use crate::library::{Entry, Place};
+use crate::library::{Entry, Place, TrackPrefs};
 use crate::net::{NetKind, is_address};
 
 const ROW: f32 = 48.0;
@@ -82,6 +82,9 @@ pub enum MenuAction {
     StreamFile(PathBuf),
     /// Plays a capture device: its address and its name.
     OpenCapture(String, String),
+    /// Sets a folder's or playlist's (the scope's) audio language, or with `false` its
+    /// subtitle language ("off" for none); None goes back to Settings.
+    SetTracks(String, bool, Option<String>),
     /// Plays the DVD or Blu-ray in a drive or folder; None asks for the folder.
     OpenDisc(Option<PathBuf>),
     OpenDiscImage,
@@ -1026,11 +1029,13 @@ pub fn player_menu(d: &PanelData, paused: bool) -> Vec<Item> {
 /// The context menu of a library entry: files, streams, folders and playlists have their own.
 /// `playlists` fills "Add to Playlist"; `items` are a playlist's files; `place` is the page the
 /// entry is on: a playlist page adds "Remove from Playlist", the Network page "Remove".
+/// `tracks` is a folder's or playlist's track preferences, with the scope they're kept under.
 pub fn entry_menu(
     entry: &Entry,
     playlists: &[String],
     items: &[PathBuf],
     place: &Place,
+    tracks: Option<(String, TrackPrefs)>,
 ) -> Option<(Kind, Vec<Item>)> {
     let within = match place {
         Place::Playlist(name) => Some(name.as_str()),
@@ -1045,7 +1050,7 @@ pub fn entry_menu(
         Entry::Folder {
             place: Place::Playlist(name),
             ..
-        } => Some((Kind::Playlist, playlist_menu(name, items))),
+        } => Some((Kind::Playlist, playlist_menu(name, items, tracks))),
         Entry::Folder {
             place: Place::Podcast(url),
             ..
@@ -1060,7 +1065,7 @@ pub fn entry_menu(
             place: Place::Podcasts | Place::Radio,
             ..
         } => None,
-        Entry::Folder { place, .. } => Some((Kind::Folder, folder_menu(place))),
+        Entry::Folder { place, .. } => Some((Kind::Folder, folder_menu(place, tracks))),
         Entry::Header { .. } | Entry::Action { .. } => None,
     }
 }
@@ -1180,7 +1185,36 @@ pub fn queue_menu(
     items
 }
 
-fn folder_menu(place: &Place) -> Vec<Item> {
+/// "As in Settings", (for subtitles) "Off", and every language, the folder's or playlist's
+/// current choice checked.
+fn track_menu(scope: &str, current: Option<&str>, audio: bool) -> Vec<Item> {
+    let set = |value: Option<&str>| {
+        MenuAction::SetTracks(scope.to_owned(), audio, value.map(str::to_owned))
+    };
+    let mut items = vec![Item::new("As in Settings", set(None)).checked(current.is_none())];
+    if !audio {
+        items.push(Item::new("Off", set(Some("off"))).checked(current == Some("off")));
+    }
+    items.push(Item::divider());
+    for (codes, name) in crate::session::LANGUAGES {
+        items.push(Item::new(*name, set(Some(codes[0]))).checked(current == Some(codes[0])));
+    }
+    items
+}
+
+/// The subtitle and audio track submenus, `labels` as the design names them; dimmed without a
+/// folder or playlist to keep them for.
+fn track_items(tracks: Option<(String, TrackPrefs)>, labels: [&str; 2]) -> [Item; 2] {
+    match tracks {
+        Some((scope, t)) => [
+            Item::submenu(labels[0], track_menu(&scope, t.subtitles.as_deref(), false)),
+            Item::submenu(labels[1], track_menu(&scope, t.audio.as_deref(), true)),
+        ],
+        None => [Item::off(labels[0]), Item::off(labels[1])],
+    }
+}
+
+fn folder_menu(place: &Place, tracks: Option<(String, TrackPrefs)>) -> Vec<Item> {
     let dir = match place {
         Place::Folder(_, dir) => Some(dir.clone()),
         _ => None,
@@ -1189,19 +1223,20 @@ fn folder_menu(place: &Place) -> Vec<Item> {
         Some(dir) => Item::new("Info", MenuAction::Properties(dir)),
         None => Item::off("Info"),
     };
+    let [subtitles, audio] = track_items(tracks, ["Edit Subtitle Tracks", "Edit Audio Tracks"]);
     vec![
         Item::new("Add File", MenuAction::OpenFiles).icon(Icon::Add),
         Item::new("Add Folder", MenuAction::AddFolder(place.section())).icon(Icon::AddFolder),
-        // ponytail: editing a folder's tracks needs per-folder track settings, which don't exist.
-        Item::off("Edit Subtitle Tracks").icon(Icon::Subtitle),
-        Item::off("Edit Audio Tracks").icon(Icon::Audio),
+        subtitles.icon(Icon::Subtitle),
+        audio.icon(Icon::Audio),
         Item::new("Resync", MenuAction::Resync).icon(Icon::Resync),
         info.icon(Icon::Info),
     ]
 }
 
-fn playlist_menu(name: &str, items: &[PathBuf]) -> Vec<Item> {
+fn playlist_menu(name: &str, items: &[PathBuf], tracks: Option<(String, TrackPrefs)>) -> Vec<Item> {
     let has = !items.is_empty();
+    let [subtitles, audio] = track_items(tracks, ["Add Subtitle Tracks", "Add Audio Tracks"]);
     let name = || name.to_owned();
     vec![
         Item::new("Play", MenuAction::PlayPlaylist(name()))
@@ -1215,9 +1250,8 @@ fn playlist_menu(name: &str, items: &[PathBuf]) -> Vec<Item> {
         Item::new("Add to Queue", MenuAction::AddToQueue(items.to_vec()))
             .icon(Icon::Queue)
             .enabled(has),
-        // ponytail: subtitle and audio tracks for a whole playlist have nowhere to live yet.
-        Item::off("Add Subtitle Tracks").icon(Icon::Subtitle),
-        Item::off("Add Audio Tracks").icon(Icon::Audio),
+        subtitles.icon(Icon::Subtitle),
+        audio.icon(Icon::Audio),
         Item::new("Properties & Metadata", MenuAction::RenamePlaylist(name())).icon(Icon::Info),
         Item::divider(),
         Item::new("Delete Playlist", MenuAction::DeletePlaylist(name())).icon(Icon::Delete),

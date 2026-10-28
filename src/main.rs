@@ -291,7 +291,20 @@ impl App {
         path: &Path,
         input: Result<(ff::format::context::Input, Arc<AtomicBool>), String>,
     ) -> bool {
-        let p = prefs();
+        // A folder's or playlist's track choices go over Settings' for its files.
+        let mut p = prefs();
+        let tracks = self.library.tracks_for(path);
+        if let Some(audio) = tracks.audio {
+            p.audio_language = audio;
+        }
+        match tracks.subtitles.as_deref() {
+            Some("off") => p.subtitles = false,
+            Some(language) => {
+                p.subtitles = true;
+                p.sub_language = language.to_owned();
+            }
+            None => {}
+        }
         let start = if p.resume == 0 {
             self.library.resume_position(path)
         } else {
@@ -2025,7 +2038,23 @@ fn open_menu(app: &mut App, hit: Hit, at: (f32, f32)) {
                 _ => Vec::new(),
             };
             let place = UI.with_borrow(|ui| ui.browse.place.clone());
-            match menu::entry_menu(&entry, &app.library.playlists(), &items, &place) {
+            let scope = match &entry {
+                Entry::Folder {
+                    place: Place::Folder(_, dir),
+                    ..
+                } => Some(library::folder_scope(dir)),
+                Entry::Folder {
+                    place: Place::Playlist(name),
+                    ..
+                } => Some(library::playlist_scope(name)),
+                _ => None,
+            };
+            let tracks = scope.map(|s| {
+                let prefs = app.library.track_prefs(&s);
+                (s, prefs)
+            });
+            let playlists = app.library.playlists();
+            match menu::entry_menu(&entry, &playlists, &items, &place, tracks) {
                 Some(menu) => menu,
                 None => return,
             }
@@ -2113,6 +2142,10 @@ fn menu_action(app: &mut App, hwnd: HWND, action: MenuAction) {
         MenuAction::OpenNetwork => open_dialog(app, Dialog::Address(NetKind::Stream)),
         MenuAction::Snapshot => WANT_SNAPSHOT.set(true),
         MenuAction::Record => app.toggle_record(),
+        MenuAction::SetTracks(scope, audio, value) => {
+            app.library.set_track_pref(&scope, audio, value);
+            app.library_changed = true;
+        }
         MenuAction::Stream => app.toggle_stream(),
         MenuAction::StreamFile(path) => {
             if app.session.as_ref().is_none_or(|s| s.path != path) {

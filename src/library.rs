@@ -143,6 +143,23 @@ pub struct Address {
     pub name: String,
 }
 
+/// The tracks a folder's or playlist's files start with, over Settings: an audio language
+/// code, and a subtitle language code or "off". None leaves Settings in charge.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct TrackPrefs {
+    pub audio: Option<String>,
+    pub subtitles: Option<String>,
+}
+
+/// The key track preferences are kept under, for a folder or a playlist.
+pub fn folder_scope(dir: &Path) -> String {
+    format!("folder:{}", abs(dir).display())
+}
+
+pub fn playlist_scope(name: &str) -> String {
+    format!("playlist:{name}")
+}
+
 /// A podcast feed or the radio directory as last fetched: None while the fetch runs.
 pub type Fetched<T> = Option<Result<T, String>>;
 
@@ -241,6 +258,8 @@ pub struct Library {
     /// to keep. Missing (None for stations) until first asked for.
     feeds: HashMap<String, Fetched<Feed>>,
     stations: Option<Fetched<Vec<Station>>>,
+    /// Track preferences by `folder_scope` or `playlist_scope`.
+    picks: HashMap<String, TrackPrefs>,
 }
 
 impl Library {
@@ -274,6 +293,7 @@ impl Library {
             addresses: Vec::new(),
             feeds: HashMap::new(),
             stations: None,
+            picks: HashMap::new(),
         };
         match fs::read(dir.join(STATE_FILE)) {
             Ok(bytes) => lib.parse(&String::from_utf8_lossy(&bytes)),
@@ -353,6 +373,16 @@ impl Library {
                         });
                     }
                 }
+                ["tracks", scope, audio, subtitles] if !scope.is_empty() => {
+                    let some = |v: &str| (v != "-" && !v.is_empty()).then(|| v.to_owned());
+                    let prefs = TrackPrefs {
+                        audio: some(audio),
+                        subtitles: some(subtitles),
+                    };
+                    if prefs != TrackPrefs::default() {
+                        self.picks.insert(scope.into(), prefs);
+                    }
+                }
                 ["favorite", p] if !p.is_empty() => {
                     let p = PathBuf::from(p);
                     if !self.favorites.contains(&p) {
@@ -395,6 +425,11 @@ impl Library {
         }
         for p in self.favorites.iter().filter_map(|p| p.to_str()) {
             writeln!(out, "favorite\t{p}").unwrap();
+        }
+        for (scope, t) in &self.picks {
+            let value = |v: &Option<String>| v.clone().unwrap_or_else(|| "-".into());
+            let (audio, subtitles) = (value(&t.audio), value(&t.subtitles));
+            writeln!(out, "tracks\t{scope}\t{audio}\t{subtitles}").unwrap();
         }
         for a in &self.addresses {
             let name = a.name.replace(['\t', '\n', '\r'], " ");
@@ -720,6 +755,48 @@ impl Library {
             _ => {}
         }
         out
+    }
+
+    /// The track preferences set on a folder or playlist.
+    pub fn track_prefs(&self, scope: &str) -> TrackPrefs {
+        self.picks.get(scope).cloned().unwrap_or_default()
+    }
+
+    /// Sets a folder's or playlist's audio (or subtitle) language; None goes back to Settings.
+    pub fn set_track_pref(&mut self, scope: &str, audio: bool, value: Option<String>) {
+        let prefs = self.picks.entry(scope.to_owned()).or_default();
+        *(if audio {
+            &mut prefs.audio
+        } else {
+            &mut prefs.subtitles
+        }) = value;
+        if *prefs == TrackPrefs::default() {
+            self.picks.remove(scope);
+        }
+    }
+
+    /// The track preferences for playing `file`: each from the nearest folder above it that sets
+    /// one, else from a playlist holding it.
+    pub fn tracks_for(&self, file: &Path) -> TrackPrefs {
+        let mut found = TrackPrefs::default();
+        let mut take = |t: &TrackPrefs| {
+            found.audio = found.audio.take().or_else(|| t.audio.clone());
+            found.subtitles = found.subtitles.take().or_else(|| t.subtitles.clone());
+        };
+        let file = abs(file);
+        for dir in file.ancestors().skip(1) {
+            if let Some(t) = self.picks.get(&folder_scope(dir)) {
+                take(t);
+            }
+        }
+        for (scope, t) in &self.picks {
+            if let Some(name) = scope.strip_prefix("playlist:")
+                && self.playlist_items(name).iter().any(|p| abs(p) == file)
+            {
+                take(t);
+            }
+        }
+        found
     }
 
     /// Saved addresses of one kind, most recent first.
@@ -1743,6 +1820,37 @@ mod tests {
             labels(&lib.entries(&Place::Home)),
             "Continue Watching|half.mp4"
         );
+    }
+
+    #[test]
+    fn folders_and_playlists_choose_tracks() {
+        let tmp = TempDir::new();
+        let anime = tmp.0.join("Anime");
+        let ep = tmp.touch(r"Anime\Show\ep1.mkv");
+        let film = tmp.touch(r"Films\film.mkv");
+        let mut lib = Library::open(&tmp.0.join("state"), false);
+        lib.set_track_pref(&folder_scope(&anime), true, Some("jpn".into()));
+        lib.set_track_pref(&folder_scope(&anime), false, Some("eng".into()));
+        // The nearer folder wins for what it sets; the rest comes from further up.
+        lib.set_track_pref(&folder_scope(&anime.join("Show")), false, Some("off".into()));
+        lib.create_playlist("Dubbed").unwrap();
+        lib.add_to_playlist("Dubbed", &ep).unwrap();
+        lib.add_to_playlist("Dubbed", &film).unwrap();
+        lib.set_track_pref(&playlist_scope("Dubbed"), true, Some("ger".into()));
+        lib.save().unwrap();
+
+        let lib = Library::open(&tmp.0.join("state"), false);
+        let want = |audio: &str, subtitles: Option<&str>| TrackPrefs {
+            audio: Some(audio.into()),
+            subtitles: subtitles.map(str::to_owned),
+        };
+        assert_eq!(lib.tracks_for(&ep), want("jpn", Some("off")));
+        // A file in no chosen folder takes its playlist's choice.
+        assert_eq!(lib.tracks_for(&film), want("ger", None));
+        let mut lib = lib;
+        lib.set_track_pref(&playlist_scope("Dubbed"), true, None);
+        assert_eq!(lib.tracks_for(&film), TrackPrefs::default());
+        assert_eq!(lib.track_prefs(&playlist_scope("Dubbed")), TrackPrefs::default());
     }
 
     #[test]
