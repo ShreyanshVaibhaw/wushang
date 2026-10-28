@@ -1,8 +1,13 @@
-//! HDR10 video brought to the back buffer with Direct2D effects. The video processor only
-//! turns a frame from YCbCr into RGB, still PQ-encoded in BT.2020, which every driver that
-//! supports HDR displays can do. Direct2D does the rest:
+//! BT.2020 video (HDR10, HLG and SDR) brought to the back buffer with Direct2D effects. The
+//! video processor only turns a frame from YCbCr into RGB, still encoded and in BT.2020, which
+//! every driver that supports HDR displays can do. Direct2D does the rest:
 //!
-//! 1. PQ to linear scRGB: BT.709 primaries, 1.0 is 80 nits, BT.2020 colours outside 0..1.
+//! 1. To linear scRGB: BT.709 primaries, BT.2020 colours outside 0..1. PQ goes through a colour
+//!    management effect. HLG and SDR go through a table of their transfer function and a matrix
+//!    to BT.709, as Direct2D has no colour context for HLG, and video processors that do the
+//!    BT.2020 to BT.709 step for SDR may skip the matrix and leave colours pale (this laptop's
+//!    Intel one does). HLG also gets its system gamma (BT.2100, 1.2 for a 1000-nit display) on
+//!    luminance, so it doesn't change saturation.
 //! 2. Scaled so the stream's peak is 1.0, the domain of the next step's table.
 //! 3. A tone curve (`curve`) per channel. On an SDR screen light is unchanged up to most of HDR's
 //!    reference white (203 nits, BT.2408) and highlights above roll off into the rest of SDR's
@@ -20,29 +25,66 @@ use windows::Win32::Graphics::Direct2D::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::core::{Interface, Result};
 
+use crate::hdr::Screen;
+
 /// SDR white in scRGB, and where HDR video puts its diffuse white (BT.2408).
 const SDR_WHITE: f32 = 80.0;
 const HDR_WHITE: f32 = 203.0;
+/// The display HLG is graded for: its signal's 1.0 is this many nits.
+const HLG_PEAK: f32 = 1000.0;
+/// BT.2020 luminance weights, and its linear RGB in BT.709 primaries (BT.2087).
+const LUMA: [f32; 3] = [0.2627, 0.6780, 0.0593];
+const BT2020_TO_709: [[f32; 3]; 3] = [
+    [1.660_491, -0.587_641, -0.072_850],
+    [-0.124_550, 1.132_9, -0.008_349],
+    [-0.018_151, -0.100_579, 1.118_73],
+];
+
+/// How a BT.2020 frame is encoded.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Signal {
+    /// HDR10.
+    Pq,
+    Hlg,
+    /// SDR. Decoded with BT.1886's gamma 2.4, as BT.709 masters are converted to BT.2020, and
+    /// encoded with it again after the matrix, so it shows as BT.709 video does: the same
+    /// tones, only the colours change.
+    Sdr,
+}
 /// Light up to this share of reference white passes unchanged.
 const KNEE: f32 = 0.75;
 /// Table entries; Direct2D interpolates between them.
 const TABLE: usize = 1024;
 
 pub struct ToneMap {
+    /// PQ to linear scRGB.
     linear: ID2D1Effect,
+    /// HLG or SDR to linear BT.2020, HLG then through its system gamma in `ootf` (wired up once
+    /// in `new`), both through `gamut` to scRGB, SDR then through `display` to the light the
+    /// screen would show for it as BT.709 video.
+    decode: ID2D1Effect,
+    ootf: ID2D1Effect,
+    gamut: ID2D1Effect,
+    display: ID2D1Effect,
     scale: ID2D1Effect,
     curve: ID2D1Effect,
     srgb: ID2D1Effect,
     /// For an HDR screen: the curve's 0..1 back to nits, in scRGB.
     boost: ID2D1Effect,
-    /// The stream's peak and the screen's (None for SDR) the effects are set for.
-    set: Cell<(f32, Option<f32>)>,
+    /// The signal, stream peak and screen the effects are set for.
+    set: Cell<Option<(Signal, f32, Option<Screen>)>>,
 }
 
 impl ToneMap {
     pub fn new(ctx: &ID2D1DeviceContext5) -> Result<Self> {
         unsafe {
             let linear = ctx.CreateEffect(&CLSID_D2D1ColorManagement)?;
+            let decode = ctx.CreateEffect(&CLSID_D2D1TableTransfer)?;
+            let luma = ctx.CreateEffect(&CLSID_D2D1ColorMatrix)?;
+            let gamma = ctx.CreateEffect(&CLSID_D2D1TableTransfer)?;
+            let ootf = ctx.CreateEffect(&CLSID_D2D1ArithmeticComposite)?;
+            let gamut = ctx.CreateEffect(&CLSID_D2D1ColorMatrix)?;
+            let display = ctx.CreateEffect(&CLSID_D2D1TableTransfer)?;
             let scale = ctx.CreateEffect(&CLSID_D2D1WhiteLevelAdjustment)?;
             let curve = ctx.CreateEffect(&CLSID_D2D1TableTransfer)?;
             let srgb = ctx.CreateEffect(&CLSID_D2D1ColorManagement)?;
@@ -50,8 +92,8 @@ impl ToneMap {
             let space = |s| ctx.CreateColorContextFromDxgiColorSpace(s);
             let hdr10 = space(DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020)?;
             let scrgb = space(DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709)?;
-            let display = space(DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709)?;
-            for (effect, from, to) in [(&linear, &hdr10, &scrgb), (&srgb, &scrgb, &display)] {
+            let srgb_space = space(DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709)?;
+            for (effect, from, to) in [(&linear, &hdr10, &scrgb), (&srgb, &scrgb, &srgb_space)] {
                 set_context(
                     effect,
                     D2D1_COLORMANAGEMENT_PROP_SOURCE_COLOR_CONTEXT.0,
@@ -65,61 +107,101 @@ impl ToneMap {
                 let quality = D2D1_COLORMANAGEMENT_PROP_QUALITY.0 as u32;
                 set_enum(effect, quality, D2D1_COLORMANAGEMENT_QUALITY_BEST.0)?;
             }
-            set_bool(&curve, D2D1_TABLETRANSFER_PROP_ALPHA_DISABLE.0 as u32, true)?;
+            for table in [&decode, &gamma, &display, &curve] {
+                set_bool(table, D2D1_TABLETRANSFER_PROP_ALPHA_DISABLE.0 as u32, true)?;
+            }
+            // Luminance into every channel; the light times luminance to the power 0.2.
+            set_matrix(&luma, [LUMA; 3])?;
+            set_table(&gamma, |y| y.powf(0.2))?;
+            let coefficients = D2D1_ARITHMETICCOMPOSITE_PROP_COEFFICIENTS.0 as u32;
+            let product: Vec<u8> = [1f32, 0.0, 0.0, 0.0]
+                .iter()
+                .flat_map(|c| c.to_ne_bytes())
+                .collect();
+            ootf.SetValue(coefficients, D2D1_PROPERTY_TYPE_VECTOR4, &product)?;
+            set_matrix(&gamut, BT2020_TO_709)?;
+            set_table(&display, |l| srgb_linear(l.powf(1.0 / 2.4)))?;
+            chain(&display, &gamut);
             // Effects work in 8-bit buffers on an 8-bit target, which would clip everything
             // brighter or more saturated than SDR before it is mapped.
             let precision = D2D1_PROPERTY_PRECISION.0 as u32;
-            for e in [&linear, &scale, &curve, &srgb, &boost] {
+            for e in [
+                &linear, &decode, &luma, &gamma, &ootf, &gamut, &display, &scale, &curve, &srgb,
+                &boost,
+            ] {
                 set_enum(e, precision, D2D1_BUFFER_PRECISION_16BPC_FLOAT.0)?;
             }
-            chain(&scale, &linear);
+            chain(&luma, &decode);
+            chain(&gamma, &luma);
+            chain(&ootf, &decode);
+            let output = gamma.GetOutput().ok();
+            ootf.SetInput(1, output.as_ref(), true);
             chain(&curve, &scale);
             chain(&srgb, &curve);
             chain(&boost, &curve);
             Ok(ToneMap {
                 linear,
+                decode,
+                ootf,
+                gamut,
+                display,
                 scale,
                 curve,
                 srgb,
                 boost,
-                set: Cell::new((0.0, None)),
+                set: Cell::new(None),
             })
         }
     }
 
-    /// What to draw for `hdr10`, an RGB frame still PQ-encoded in BT.2020 whose brightest light
-    /// is `peak` nits: sRGB, or for an HDR `screen` as bright as that many nits, scRGB.
+    /// What to draw for `frame`, RGB still encoded as `signal` in BT.2020; `peak` is a PQ
+    /// stream's brightest light in nits. sRGB, or scRGB for an HDR `screen`.
     pub fn apply(
         &self,
-        hdr10: &ID2D1Bitmap1,
+        frame: &ID2D1Bitmap1,
+        signal: Signal,
         peak: f32,
-        screen: Option<f32>,
+        screen: Option<Screen>,
     ) -> Result<ID2D1Image> {
+        // The nits linear light's 1.0 stands for, and the stream's peak. SDR white goes where
+        // the screen shows SDR content: on an SDR screen, at the curve's top.
+        let sdr_white = screen.map_or(HDR_WHITE, |s| s.white);
+        let (unit, peak) = match signal {
+            Signal::Pq => (SDR_WHITE, peak),
+            Signal::Hlg => (HLG_PEAK, HLG_PEAK),
+            Signal::Sdr => (sdr_white, sdr_white),
+        };
         let peak = peak.max(HDR_WHITE);
-        let screen = screen.map(|nits| nits.max(HDR_WHITE));
         // The light the curve's 1.0 stands for: SDR white, or the screen's peak.
-        let top = screen.unwrap_or(HDR_WHITE);
+        let top = screen.map_or(HDR_WHITE, |s| s.peak.max(HDR_WHITE));
+        let key = Some((signal, peak, screen));
         unsafe {
-            if self.set.get() != (peak, screen) {
-                // From 80 nits per 1.0 to the peak, then from the top to 80 nits per 1.0.
-                scale_white(&self.scale, SDR_WHITE, peak)?;
+            if self.set.get() != key {
+                // From `unit` nits per 1.0 to the peak, then from the top to 80 nits per 1.0.
+                scale_white(&self.scale, unit, peak)?;
                 scale_white(&self.boost, top, SDR_WHITE)?;
-                let table: Vec<u8> = (0..TABLE)
-                    .flat_map(|i| curve(i as f32 / (TABLE - 1) as f32, peak, top).to_ne_bytes())
-                    .collect();
-                for channel in [
-                    D2D1_TABLETRANSFER_PROP_RED_TABLE,
-                    D2D1_TABLETRANSFER_PROP_GREEN_TABLE,
-                    D2D1_TABLETRANSFER_PROP_BLUE_TABLE,
-                ] {
-                    let index = channel.0 as u32;
-                    self.curve
-                        .SetValue(index, D2D1_PROPERTY_TYPE_BLOB, &table)?;
-                }
-                self.set.set((peak, screen));
+                set_table(&self.curve, |x| curve(x, peak, top))?;
+                let head = match signal {
+                    Signal::Pq => &self.linear,
+                    Signal::Hlg => {
+                        set_table(&self.decode, hlg_scene)?;
+                        chain(&self.gamut, &self.ootf);
+                        &self.gamut
+                    }
+                    Signal::Sdr => {
+                        set_table(&self.decode, |v| v.powf(2.4))?;
+                        chain(&self.gamut, &self.decode);
+                        &self.display
+                    }
+                };
+                chain(&self.scale, head);
+                self.set.set(key);
             }
-            self.linear
-                .SetInput(0, Some(&hdr10.cast::<ID2D1Image>()?), true);
+            let first = match signal {
+                Signal::Pq => &self.linear,
+                _ => &self.decode,
+            };
+            first.SetInput(0, Some(&frame.cast::<ID2D1Image>()?), true);
             if screen.is_some() {
                 self.boost.GetOutput()
             } else {
@@ -190,6 +272,56 @@ unsafe fn scale_white(effect: &ID2D1Effect, input: f32, output: f32) -> Result<(
         let index = D2D1_WHITELEVELADJUSTMENT_PROP_OUTPUT_WHITE_LEVEL.0 as u32;
         set_f32(effect, index, output)
     }
+}
+
+/// HLG's inverse OETF (BT.2100): scene light, 0..1, of signal `e`.
+fn hlg_scene(e: f32) -> f32 {
+    let (a, b, c) = (0.178_832_77, 0.284_668_92, 0.559_910_7);
+    if e <= 0.5 {
+        e * e / 3.0
+    } else {
+        (((e - c) / a).exp() + b) / 12.0
+    }
+}
+
+/// The sRGB curve, decoding: the light a screen shows for BT.709 video's level `v`.
+fn srgb_linear(v: f32) -> f32 {
+    if v <= 0.040_45 {
+        v / 12.92
+    } else {
+        ((v + 0.055) / 1.055).powf(2.4)
+    }
+}
+
+/// Sets all three channel tables of a Table Transfer effect to `f` over 0..1.
+unsafe fn set_table(effect: &ID2D1Effect, f: impl Fn(f32) -> f32) -> Result<()> {
+    let table: Vec<u8> = (0..TABLE)
+        .flat_map(|i| f(i as f32 / (TABLE - 1) as f32).to_ne_bytes())
+        .collect();
+    for channel in [
+        D2D1_TABLETRANSFER_PROP_RED_TABLE,
+        D2D1_TABLETRANSFER_PROP_GREEN_TABLE,
+        D2D1_TABLETRANSFER_PROP_BLUE_TABLE,
+    ] {
+        unsafe { effect.SetValue(channel.0 as u32, D2D1_PROPERTY_TYPE_BLOB, &table)? };
+    }
+    Ok(())
+}
+
+/// Sets a Color Matrix effect to give each output channel `rgb[out][in]` of the inputs and keep
+/// alpha.
+unsafe fn set_matrix(effect: &ID2D1Effect, rgb: [[f32; 3]; 3]) -> Result<()> {
+    // Direct2D's 5x4 matrix has a row per input (R, G, B, A, offset) and a column per output.
+    let mut m = [0f32; 20];
+    for (out, row) in rgb.iter().enumerate() {
+        for (input, &v) in row.iter().enumerate() {
+            m[input * 4 + out] = v;
+        }
+    }
+    m[15] = 1.0;
+    let bytes: Vec<u8> = m.iter().flat_map(|v| v.to_ne_bytes()).collect();
+    let index = D2D1_COLORMATRIX_PROP_COLOR_MATRIX.0 as u32;
+    unsafe { effect.SetValue(index, D2D1_PROPERTY_TYPE_MATRIX_5X4, &bytes) }
 }
 
 /// The level, 1.0 for `top` nits, of light at `x` times the stream's `peak` nits. Light up to
@@ -296,10 +428,20 @@ mod tests {
         let frame = source(&ctx, DXGI_FORMAT_R10G10B10A2_UNORM, &grey.to_ne_bytes());
         let tonemap = ToneMap::new(&ctx).unwrap();
         // On a 1000-nit screen it keeps its nits: 1.25 in scRGB's 80 nits per 1.0.
-        let hdr = draw(&ctx, &tonemap.apply(&frame, 1000.0, Some(1000.0)).unwrap());
+        let screen = Some(Screen {
+            peak: 1000.0,
+            white: 203.0,
+        });
+        let hdr = draw(
+            &ctx,
+            &tonemap.apply(&frame, Signal::Pq, 1000.0, screen).unwrap(),
+        );
         assert!((hdr[0] - 1.25).abs() < 0.03, "{hdr:?}");
         // On an SDR screen it is half of reference white, sRGB-encoded.
-        let sdr = draw(&ctx, &tonemap.apply(&frame, 1000.0, None).unwrap());
+        let sdr = draw(
+            &ctx,
+            &tonemap.apply(&frame, Signal::Pq, 1000.0, None).unwrap(),
+        );
         assert!((sdr[0] - 0.726).abs() < 0.01, "{sdr:?}");
 
         // Interface white at a 240-nit SDR white level is 3.0, and mid grey 0.2158 * 3.
@@ -312,6 +454,77 @@ mod tests {
         let lit = draw(&ctx, &layer.apply(&ui, 240.0).unwrap());
         assert!((lit[0] - 3.0).abs() < 0.03, "{lit:?}");
         assert!((lit[4] - 0.647).abs() < 0.02, "{lit:?}");
+    }
+
+    #[test]
+    fn sdr_bt2020_keeps_its_saturation_and_tones() {
+        let ctx = warp();
+        let tonemap = ToneMap::new(&ctx).unwrap();
+        // BT.709 red in BT.2020, then a mid grey, gamma 2.4-encoded in 10 bits.
+        let frame = source(
+            &ctx,
+            DXGI_FORMAT_R10G10B10A2_UNORM,
+            &rgb10(&[[842, 336, 185], [512; 3]]),
+        );
+        // Red again on an SDR screen, not the pale (0.82, 0.33, 0.18) of skipping the matrix,
+        // and the grey as it was.
+        let sdr = draw(
+            &ctx,
+            &tonemap.apply(&frame, Signal::Sdr, 0.0, None).unwrap(),
+        );
+        assert!(
+            (sdr[0] - 1.0).abs() < 0.01 && sdr[1] < 0.03 && sdr[2] < 0.03,
+            "{sdr:?}"
+        );
+        assert!((sdr[4] - 0.5).abs() < 0.01, "{sdr:?}");
+        // On an HDR screen the grey goes where Windows puts SDR content: 0.2145 of 240 nits.
+        let screen = Some(Screen {
+            peak: 1000.0,
+            white: 240.0,
+        });
+        let hdr = draw(
+            &ctx,
+            &tonemap.apply(&frame, Signal::Sdr, 0.0, screen).unwrap(),
+        );
+        assert!((hdr[4] - 0.643).abs() < 0.01, "{hdr:?}");
+    }
+
+    #[test]
+    fn hlg_puts_reference_white_at_203_nits() {
+        let ctx = warp();
+        let tonemap = ToneMap::new(&ctx).unwrap();
+        // A grey and a BT.2020 green, both at 75% signal, HLG's reference white.
+        let frame = source(
+            &ctx,
+            DXGI_FORMAT_R10G10B10A2_UNORM,
+            &rgb10(&[[767; 3], [0, 767, 0]]),
+        );
+        let screen = Some(Screen {
+            peak: 1000.0,
+            white: 203.0,
+        });
+        let hdr = draw(
+            &ctx,
+            &tonemap.apply(&frame, Signal::Hlg, 0.0, screen).unwrap(),
+        );
+        // 203 nits in scRGB. The green's system gamma goes by its luminance, not its channel:
+        // 2.66 in BT.709, where a per-channel gamma would give 2.87.
+        assert!((hdr[0] - 2.536).abs() < 0.03, "{hdr:?}");
+        assert!((hdr[5] - 2.658).abs() < 0.03 && hdr[4] < 0.01, "{hdr:?}");
+        // On an SDR screen reference white rolls off with the highlights, as HDR10's does.
+        let sdr = draw(
+            &ctx,
+            &tonemap.apply(&frame, Signal::Hlg, 0.0, None).unwrap(),
+        );
+        assert!((sdr[0] - 0.943).abs() < 0.01, "{sdr:?}");
+    }
+
+    /// Pixels of 10-bit RGB, packed as R10G10B10A2 with opaque alpha.
+    fn rgb10(pixels: &[[u32; 3]]) -> Vec<u8> {
+        pixels
+            .iter()
+            .flat_map(|[r, g, b]| (r | g << 10 | b << 20 | 3 << 30).to_ne_bytes())
+            .collect()
     }
 
     fn warp() -> ID2D1DeviceContext5 {

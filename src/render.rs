@@ -3,9 +3,12 @@
 //! system memory. Software frames are repacked to NV12 with swscale and uploaded first, then take
 //! the same path. Direct2D then paints the interface into the same back buffer.
 //!
-//! On a screen in HDR mode the swap chain is scRGB instead. HDR10 video goes there tone mapped to
-//! the screen's peak, and the interface and SDR video are drawn as above into a layer that goes
-//! over it at the brightness Windows shows SDR content at.
+//! BT.2020 video (HDR10, HLG and SDR) only goes from YCbCr to RGB in the video processor, into
+//! a texture of its own; Direct2D's effects do its colours and tone mapping (see tonemap.rs).
+//!
+//! On a screen in HDR mode the swap chain is scRGB instead. BT.2020 video goes there tone mapped
+//! to the screen's peak, and the interface and BT.709 video are drawn as above into a layer that
+//! goes over it at the brightness Windows shows SDR content at.
 
 use std::error::Error;
 use std::ffi::c_void;
@@ -25,6 +28,7 @@ use windows::Win32::Graphics::Dxgi::*;
 use windows::Win32::Graphics::Gdi::{HMONITOR, MONITOR_DEFAULTTONEAREST, MonitorFromWindow};
 use windows::core::Interface;
 
+use crate::tonemap::Signal;
 use crate::ui::{Browse, Layout, Painter, Rect, Scene};
 
 type Result<T> = std::result::Result<T, Box<dyn Error>>;
@@ -216,7 +220,7 @@ pub struct Renderer {
     upload: Option<Upload>,
     /// For a software frame that reaches the renderer in another format than NV12.
     nv12: crate::nv12::Nv12,
-    /// HDR10 frames land here as RGB before Direct2D tone maps them.
+    /// BT.2020 frames land here as RGB before Direct2D tone maps them.
     wide: Option<Wide>,
     tonemap: Option<crate::tonemap::ToneMap>,
     /// Set once that path failed; such frames then go straight to the target.
@@ -225,7 +229,7 @@ pub struct Renderer {
     hdr: Option<Hdr>,
     /// The monitor and HDR setting `hdr` was decided for.
     display: (HMONITOR, bool),
-    /// An HDR10 picture waiting to go under the layer, and where.
+    /// A BT.2020 picture waiting to go under the layer, and where.
     hdr_video: Option<(ID2D1Image, RECT)>,
     /// Set once an adjustment the GPU can't do has been reported.
     warned: bool,
@@ -631,7 +635,7 @@ impl Renderer {
     }
 
     /// Converts one frame into `area` of `target`, a `size` texture, adjusted and letterboxed;
-    /// with `hdr`, HDR10 frames are left in `hdr_video` for the HDR screen instead. Returns where
+    /// with `hdr`, BT.2020 frames are left in `hdr_video` for the HDR screen instead. Returns where
     /// the picture landed.
     fn blit(
         &mut self,
@@ -660,9 +664,9 @@ impl Renderer {
         let mut desc = D3D11_TEXTURE2D_DESC::default();
         unsafe { texture.GetDesc(&mut desc) };
         let (w, h) = (frame.width(), frame.height());
-        // HDR10 frames go to RGB in a texture of their own first, then through Direct2D's colour
-        // effects into `target`.
-        let wide = self.wide_target(input_space.dxgi, size);
+        // BT.2020 frames go to RGB in a texture of their own first, then through Direct2D's
+        // colour effects into `target`.
+        let wide = input_space.wide.and_then(|_| self.wide_target(size));
         self.ensure_processor(w, h, desc.Format, size)?;
         let p = self.processor.as_ref().unwrap();
 
@@ -788,13 +792,16 @@ impl Renderer {
             // The newer call knows BT.2020, PQ and HLG; the old one only BT.601 and BT.709.
             match vc1 {
                 Some(vc1) => {
-                    vc1.VideoProcessorSetStreamColorSpace1(vp, 0, input_space.dxgi);
-                    // HDR10 only changes from YCbCr to RGB here; see `is_wide`.
-                    let output = if wide.is_some() {
-                        DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020
+                    // BT.2020 only changes from YCbCr to RGB here. Whatever its transfer, it is
+                    // called PQ on both sides, the one BT.2020 pair video processors convert
+                    // without touching the transfer (Intel's knows no HLG, nor BT.2020 RGB out).
+                    let (input, output) = if wide.is_some() {
+                        let pq = DXGI_COLOR_SPACE_YCBCR_STUDIO_G2084_LEFT_P2020;
+                        (pq, DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020)
                     } else {
-                        DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709
+                        (input_space.dxgi, DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709)
                     };
+                    vc1.VideoProcessorSetStreamColorSpace1(vp, 0, input);
                     vc1.VideoProcessorSetOutputColorSpace1(vp, output);
                 }
                 None => {
@@ -806,16 +813,18 @@ impl Renderer {
         });
         unsafe { ManuallyDrop::drop(&mut streams[0].pInputSurface) };
         result?;
-        if wide.is_some() {
-            let screen = self.hdr.as_ref().filter(|_| hdr).map(|h| h.screen.peak);
-            let drawn = self.wide_image(hdr_peak(frame), screen).and_then(|image| {
-                if screen.is_some() {
-                    self.hdr_video = Some((image, area));
-                    Ok(())
-                } else {
-                    self.draw_wide(target, area, &image)
-                }
-            });
+        if let Some(signal) = input_space.wide.filter(|_| wide.is_some()) {
+            let screen = self.hdr.as_ref().filter(|_| hdr).map(|h| h.screen);
+            let drawn = self
+                .wide_image(signal, hdr_peak(frame), screen)
+                .and_then(|image| {
+                    if screen.is_some() {
+                        self.hdr_video = Some((image, area));
+                        Ok(())
+                    } else {
+                        self.draw_wide(target, area, &image)
+                    }
+                });
             if let Err(e) = drawn {
                 self.give_up_wide(&*e);
                 return Err(e);
@@ -824,20 +833,16 @@ impl Renderer {
         Ok(Some(dest))
     }
 
-    /// After a failure of the HDR10 path, frames go straight to the target: one lost frame
+    /// After a failure of the BT.2020 path, frames go straight to the target: one lost frame
     /// rather than a stream that never shows.
     fn give_up_wide(&self, e: &dyn std::fmt::Display) {
-        eprintln!("video: no HDR tone mapping ({e}); the video processor maps HDR10 itself");
+        eprintln!("video: no BT.2020 effects ({e}); the video processor converts BT.2020 itself");
         self.no_wide.set(true);
     }
 
-    /// The HDR10 texture for a frame in `space`, when it is HDR10 and that path works.
-    fn wide_target(
-        &mut self,
-        space: DXGI_COLOR_SPACE_TYPE,
-        size: (u32, u32),
-    ) -> Option<ID3D11Texture2D> {
-        if !is_wide(space) || self.video_context1.is_none() || self.no_wide.get() {
+    /// The BT.2020 texture, when that path works.
+    fn wide_target(&mut self, size: (u32, u32)) -> Option<ID3D11Texture2D> {
+        if self.video_context1.is_none() || self.no_wide.get() {
             return None;
         }
         let ready = (|| -> Result<()> {
@@ -856,16 +861,21 @@ impl Renderer {
         self.wide.as_ref().map(|w| w.texture.clone())
     }
 
-    /// The HDR10 texture, whose brightest light is `peak` nits, through the colour effects: for
-    /// an HDR `screen` that many nits bright, else for SDR.
-    fn wide_image(&self, peak: f32, screen: Option<f32>) -> Result<ID2D1Image> {
+    /// The BT.2020 texture, holding `signal` (`peak` nits at most for PQ), through the colour
+    /// effects: for an HDR `screen`, else for SDR.
+    fn wide_image(
+        &self,
+        signal: Signal,
+        peak: f32,
+        screen: Option<crate::hdr::Screen>,
+    ) -> Result<ID2D1Image> {
         let (Some(wide), Some(tonemap)) = (&self.wide, &self.tonemap) else {
-            return Err("no HDR10 texture".into());
+            return Err("no BT.2020 texture".into());
         };
-        Ok(tonemap.apply(&wide.bitmap, peak, screen)?)
+        Ok(tonemap.apply(&wide.bitmap, signal, peak, screen)?)
     }
 
-    /// Draws the area of the tone mapped HDR10 `image` into `target`.
+    /// Draws the area of the tone mapped BT.2020 `image` into `target`.
     fn draw_wide(&self, target: &ID3D11Texture2D, area: RECT, image: &ID2D1Image) -> Result<()> {
         unsafe {
             let props = bitmap_props(
@@ -1091,8 +1101,8 @@ unsafe fn draw_area(d2d: &ID2D1DeviceContext5, image: &ID2D1Image, area: RECT) {
     };
 }
 
-/// The 10-bit texture HDR10 frames are converted into, still PQ-encoded in BT.2020, and the
-/// Direct2D bitmap on it.
+/// The 10-bit texture BT.2020 frames are converted into, still encoded, and the Direct2D bitmap
+/// on it.
 struct Wide {
     size: (u32, u32),
     texture: ID3D11Texture2D,
@@ -1118,7 +1128,7 @@ impl Wide {
         let mut texture = None;
         unsafe {
             device.CreateTexture2D(&desc, None, Some(&mut texture))?;
-            let texture: ID3D11Texture2D = texture.ok_or("no HDR10 texture")?;
+            let texture: ID3D11Texture2D = texture.ok_or("no BT.2020 texture")?;
             let props = D2D1_BITMAP_PROPERTIES1 {
                 pixelFormat: D2D1_PIXEL_FORMAT {
                     format: DXGI_FORMAT_R10G10B10A2_UNORM,
@@ -1139,10 +1149,25 @@ impl Wide {
     }
 }
 
-/// HDR10: PQ needs tone mapping that video processors either lack or do badly (this laptop's
-/// Intel one washes it out), so it goes through Direct2D's effects instead.
-fn is_wide(space: DXGI_COLOR_SPACE_TYPE) -> bool {
-    space == DXGI_COLOR_SPACE_YCBCR_STUDIO_G2084_LEFT_P2020
+/// BT.2020 frames Direct2D's effects convert instead of the video processor. PQ and HLG need
+/// tone mapping that video processors either lack or do badly (this laptop's Intel one washes PQ
+/// out and knows no HLG), and Intel's leaves SDR BT.2020 pale. Full-range HLG and SDR, which DXGI
+/// can't call PQ, stay with the video processor.
+fn wide_signal(frame: &ff::frame::Video) -> Option<Signal> {
+    use ff::color::TransferCharacteristic as Transfer;
+    let studio = frame.color_range() != ff::color::Range::JPEG;
+    match frame.color_transfer_characteristic() {
+        Transfer::SMPTE2084 => Some(Signal::Pq),
+        Transfer::ARIB_STD_B67 if studio => Some(Signal::Hlg),
+        _ if studio && is_bt2020(frame) => Some(Signal::Sdr),
+        _ => None,
+    }
+}
+
+fn is_bt2020(frame: &ff::frame::Video) -> bool {
+    use ff::color::{Primaries, Space};
+    matches!(frame.color_space(), Space::BT2020NCL | Space::BT2020CL)
+        || frame.color_primaries() == Primaries::BT2020
 }
 
 /// libavutil's AVContentLightMetadata (CTA-861.3), which the bindings leave out.
@@ -1189,35 +1214,36 @@ fn hdr_peak(frame: &ff::frame::Video) -> f32 {
     1000.0
 }
 
-/// A frame's colours for the video processor, in the old and the new form.
+/// A frame's colours for the video processor, in the old and the new form, and for the BT.2020
+/// effects.
 struct Colors {
     legacy: D3D11_VIDEO_PROCESSOR_COLOR_SPACE,
     dxgi: DXGI_COLOR_SPACE_TYPE,
+    wide: Option<Signal>,
 }
 
 fn colors(frame: &ff::frame::Video) -> Colors {
     Colors {
         legacy: ycbcr_space(frame),
         dxgi: dxgi_space(frame),
+        wide: wide_signal(frame),
     }
 }
 
 /// The frame's matrix, range, transfer and primaries as DXGI names them. PQ (HDR10) is BT.2020
 /// by definition; DXGI has no full-range PQ, which no real stream uses.
 ///
-/// Video processors support few BT.2020 spaces (Intel: PQ, and SDR with top-left chroma), so
-/// SDR BT.2020 is described with top-left chroma, a half-pixel shift of the colour planes at
-/// most. HLG goes the same way: it was designed to look right on SDR BT.2020 screens.
-// ponytail: HLG highlights then clip; tone map it like PQ where a driver converts HLG.
+/// For the video processor alone, when the BT.2020 effects fail or the API is too old. Video
+/// processors support few BT.2020 spaces (Intel: PQ, and SDR with top-left chroma), so SDR
+/// BT.2020 is described with top-left chroma, a half-pixel shift of the colour planes at most.
+/// HLG goes the same way: it was designed to look right on SDR BT.2020 screens.
 fn dxgi_space(frame: &ff::frame::Video) -> DXGI_COLOR_SPACE_TYPE {
-    use ff::color::{Primaries, Space, TransferCharacteristic as Transfer};
+    use ff::color::TransferCharacteristic as Transfer;
     let full = frame.color_range() == ff::color::Range::JPEG;
     let pick = |studio, full_range| if full { full_range } else { studio };
-    let bt2020 = matches!(frame.color_space(), Space::BT2020NCL | Space::BT2020CL)
-        || frame.color_primaries() == Primaries::BT2020;
     match frame.color_transfer_characteristic() {
         Transfer::SMPTE2084 => DXGI_COLOR_SPACE_YCBCR_STUDIO_G2084_LEFT_P2020,
-        _ if bt2020 => pick(
+        _ if is_bt2020(frame) => pick(
             DXGI_COLOR_SPACE_YCBCR_STUDIO_G22_TOPLEFT_P2020,
             DXGI_COLOR_SPACE_YCBCR_FULL_G22_LEFT_P2020,
         ),

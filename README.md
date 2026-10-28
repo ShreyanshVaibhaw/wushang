@@ -335,17 +335,22 @@ A stream the GPU turns down after all, such as 10-bit H.264, which no GPU decode
 The decoder thread repacks software frames to NV12, or P010 for 10-bit video so it keeps its precision, with swscale, splitting each frame across the cores, so the render thread only copies them to the GPU.
 On the test laptop a 4K60 10-bit H.264 clip went from 90 dropped frames of 300 to about 50; the rest is the CPU's limit for decoding and repacking at once.
 
-On an SDR screen HDR10 (PQ) video gets tone mapped, because video processors either can't do it or wash it out (the test laptop's Intel one does).
-The video processor only converts such a frame from YCbCr to RGB, still PQ-encoded in BT.2020, which every driver that supports HDR displays can do.
-Direct2D's colour effects do the rest ([src/tonemap.rs](src/tonemap.rs)): PQ to linear light, a tone curve per channel, then sRGB.
-The curve leaves everything up to three quarters of HDR's reference white (203 nits) as it is and rolls the highlights above it off into the rest of SDR's range, up to the stream's MaxCLL.
+BT.2020 video (HDR10, HLG and SDR) gets its colours from Direct2D rather than the video processor.
+Video processors either can't tone map HDR or wash it out, and the test laptop's Intel one also leaves SDR BT.2020 pale and knows no HLG at all.
+The video processor only converts such a frame from YCbCr to RGB, still encoded and in BT.2020.
+HLG and SDR are labelled PQ for that step, the one BT.2020 pair video processors convert without touching the transfer.
+Direct2D's colour effects do the rest ([src/tonemap.rs](src/tonemap.rs)): to linear light, a tone curve per channel, then sRGB.
+HLG gets its system gamma on luminance, so its colours keep their saturation, and puts reference white at 203 nits.
+SDR BT.2020 is decoded with BT.1886's gamma 2.4 and encoded with it again after the matrix to BT.709, so it has the tones BT.709 video has and only its colours change.
+The curve leaves everything up to three quarters of HDR's reference white (203 nits) as it is and rolls the highlights above it off into the rest of SDR's range, up to the stream's MaxCLL (1000 nits for HLG).
 
 On a screen in HDR mode the swap chain switches to 16-bit float scRGB ([src/hdr.rs](src/hdr.rs) asks Windows for the screen's peak and its SDR content brightness).
-HDR10 video keeps its nits up to three quarters of the screen's peak, and the same curve rolls brighter highlights off into the rest.
-The interface and SDR video are drawn in sRGB as before, into a layer that goes over the video at the SDR content brightness, so they look as they do in other apps.
+HDR10 and HLG video keep their nits up to three quarters of the screen's peak, and the same curve rolls brighter highlights off into the rest.
+SDR BT.2020 goes to the SDR content brightness.
+The interface and BT.709 video are drawn in sRGB as before, into a layer that goes over the video at the SDR content brightness, so they look as they do in other apps.
 The window checks again when it moves to another screen or the display settings change.
 No HDR screen was at hand: the effect chains are checked in numbers on the WARP software renderer (100 nits of PQ comes out as 100 nits, interface white at the SDR level), and the whole path ran in the app on an SDR screen told it was HDR.
-On test clips with a known answer, the result is within a few levels of 255 of the exact conversion, and a 4K60 HDR10 clip plays with 2 of 240 frames dropped.
+On test clips with a known answer, HDR10, HLG and SDR BT.2020 come out within a few levels of 255 of the exact conversion, and a 4K60 HDR10 clip plays with 2 of 240 frames dropped.
 BT.709 and BT.601 video is unchanged by this.
 
 The render loop runs above normal priority, as VLC's video output thread does.
@@ -426,8 +431,8 @@ Each of these is marked with a `ponytail:` comment in the code, along with the u
 - Without a language tag, traditional Chinese (Big5) subtitles read as simplified (GBK), and Turkish or Baltic ones as Western, since the same bytes are valid in both.
 - Contrast and saturation go up to 2x, like VLC's adjust filter; brightness and hue use the GPU's full range.
 - HDR output hasn't been seen on a real HDR screen yet.
-  It sends no HDR metadata, leaving the final fit to Windows, and HLG and SDR BT.2020 still show as SDR there.
-- SDR BT.2020 and HLG go through the video processor's own conversion, which on the test laptop's Intel GPU leaves saturated colours paler than they should be, and HLG's highlights clip.
+  It sends no HDR metadata, leaving the final fit to Windows.
+- HLG is graded for a 1000-nit display whatever the screen's peak, and full-range HLG or SDR BT.2020, which no real stream seems to use, still goes through the video processor's own conversion.
 - 4K60 10-bit H.264 decodes in software, which drops frames on a laptop CPU.
 - Audio devices must mix in f32, which every WASAPI shared-mode device seen so far does.
 - The audio callback takes a mutex.
