@@ -9,16 +9,20 @@
 # Recording copies packets into Matroska, MP4 or MPEG-TS without re-encoding. Converting encodes
 # with Windows' own Media Foundation encoders (H.264, HEVC, AAC, MP3), which keeps the build LGPL
 # with no codec library of its own. Capture devices come from DirectShow, the screen from GDI.
+# Blu-ray folders and images open through libbluray (LGPL), linked in statically; DVDs need no
+# library, as myvlc reads their files itself (src/disc.rs) and plays them through `concat`.
+# libdvdnav and libdvdread would make the build GPL.
 #
 # Needs: gcc-mingw-w64-x86-64-win32 nasm make pkg-config meson ninja-build, plus gcc and
 # libc6-dev for FFmpeg's build-time host tools.
 # Usage: SRC=/path/to/ffmpeg-9.0.2 DAV1D_SRC=/path/to/dav1d-1.5.4 PREFIX=/path/to/output \
-#        ZLIB_SRC=/path/to/zlib-1.3.1 scripts/build-ffmpeg.sh
+#        ZLIB_SRC=/path/to/zlib-1.3.1 BLURAY_SRC=/path/to/libbluray-1.3.4 scripts/build-ffmpeg.sh
 set -euo pipefail
 
 SRC=${SRC:-/mnt/d/tools/src/ffmpeg-9.0.2}
 DAV1D_SRC=${DAV1D_SRC:-/mnt/d/tools/src/dav1d-1.5.4}
 ZLIB_SRC=${ZLIB_SRC:-/mnt/d/tools/src/zlib-1.3.1}
+BLURAY_SRC=${BLURAY_SRC:-/mnt/d/tools/src/bluray/libbluray-1.3.4}
 PREFIX=${PREFIX:-/mnt/d/tools/ffmpeg-9.0.2-myvlc}
 # Static libraries linked into the FFmpeg DLLs: none of them ships as a DLL of its own.
 DAV1D_PREFIX="$PREFIX-deps"
@@ -44,6 +48,14 @@ ninja -C "$DAV1D_SRC/build-mingw" install
 # makes the plain pkg-config safe to use; configure would otherwise look for a cross-prefixed one.
 export PKG_CONFIG_LIBDIR="$DAV1D_PREFIX/lib/pkgconfig"
 
+# libbluray (LGPL) reads Blu-ray folders and ISO images. No BD-J (Java menus), no libxml2 (disc
+# metadata) and no fonts: what plays is the main title. AACS decryption is a separate library
+# libbluray would load at run time, which myvlc doesn't ship, so encrypted discs don't play.
+(cd "$BLURAY_SRC" && ./configure --host=x86_64-w64-mingw32 --prefix="$DAV1D_PREFIX" \
+  --enable-static --disable-shared --disable-bdjava-jar --without-libxml2 --without-freetype \
+  --without-fontconfig --disable-examples --disable-doxygen-doc && make clean && \
+  make -j"$(nproc)" && make install)
+
 join() { local IFS=,; echo "$*"; }
 
 demuxers=(mov matroska avi mpegts mpegps flv ogg asf ivf obu
@@ -51,7 +63,7 @@ demuxers=(mov matroska avi mpegts mpegps flv ogg asf ivf obu
           h264 hevc m4v mpegvideo
           srt ass webvtt microdvd subviewer sami vobsub sup
           hls rtsp sdp)
-protocols=(file data http https tls tcp udp rtp crypto)
+protocols=(file data http https tls tcp udp rtp crypto concat bluray)
 muxers=(matroska webm mov mp4 mpegts adts mp3 wav flac)
 encoders=(h264_mf hevc_mf aac_mf mp3_mf)
 indevs=(dshow gdigrab)
@@ -77,7 +89,7 @@ cd "$SRC"
   --disable-avfilter \
   --disable-autodetect --enable-w32threads --enable-d3d11va \
   --enable-network --enable-schannel --enable-mediafoundation \
-  --enable-libdav1d --pkg-config=pkg-config --pkg-config-flags=--static \
+  --enable-libdav1d --enable-libbluray --pkg-config=pkg-config --pkg-config-flags=--static \
   --enable-zlib --extra-cflags="-I$DAV1D_PREFIX/include" \
   --disable-everything \
   --enable-protocol="$(join "${protocols[@]}")" \

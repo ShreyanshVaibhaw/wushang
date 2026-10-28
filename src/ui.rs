@@ -1718,6 +1718,8 @@ impl Painter {
                     self.icon(ctx, &i.divider, r.l + (r.w() - 24.0) / 2.0, cy - 12.0, true)
                 }
                 ToolItem::Spacer => {}
+                // A stream, disc or camera has no folder; neither icon nor name then.
+                ToolItem::Folder if s.folder.is_empty() => {}
                 ToolItem::Folder => {
                     self.icon(ctx, &i.folder, r.l + 2.0, cy - 12.0, true);
                     let tr = Rect::new(r.l + 30.0, cy - 20.0, r.r, cy + 20.0);

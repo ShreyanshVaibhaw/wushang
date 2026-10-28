@@ -59,7 +59,7 @@ The title bar has minimize, maximize, fullscreen and close, and dragging it move
 While playing, the bars hide after 3 seconds without mouse movement and the video fills the window inside a 10 px rounded frame; moving the mouse brings them back.
 The "…" button opens the main menu from the design: open files, open a folder, recent files, settings profiles, keyboard shortcuts, Customize Player, Settings and About.
 Right-clicking the video opens the player menu: play, stop, previous, next, hide the controls, the mini player, and submenus for speed and sleep timer, video tracks and transforms, audio tracks, stereo mode and output device, subtitles, the settings tabs, the queue, and opening media.
-Items for features myvlc doesn't have (discs) are shown dimmed.
+Items that need something first, like Convert with nothing open, are shown dimmed.
 
 The playlist button opens the queue panel from the design, in the settings panel's place, with three tabs:
 
@@ -159,6 +159,15 @@ Feeds and the directory load over WinHTTP on a background thread, so the window 
 Picking one plays it live, and Record saves it like any other media.
 The list is gathered in the background and again each time the menu opens, so a camera plugged in later shows up.
 
+### Discs
+
+"Open Disc" in the "..." menu plays a DVD or Blu-ray: the disc in an optical drive, a disc's files copied to a folder (Ctrl+D), or a Blu-ray image (.iso).
+A disc folder or image also opens from the command line or when dropped on the window.
+Blu-ray goes through libbluray, which picks the main title.
+DVD needs no library: myvlc reads the disc's IFO files, picks the title set whose main program chain runs longest, and plays its VOB files back to back, with the length and chapters the IFO gives.
+libdvdnav and libdvdread would add menus and every title, but would make the FFmpeg build GPL.
+Neither plays encrypted discs (CSS on DVDs, AACS on Blu-rays), so commercial discs don't play; discs you made yourself do.
+
 ### Streaming to other devices
 
 "Stream to Other Devices" in the player menu, or "Stream" in a file's right-click menu, serves what plays over HTTP as MPEG-TS, copied without re-encoding, to any number of players on the network: VLC, mpv, Kodi or a TV opens the address the corner shows, like `http://192.168.1.101:8080/`.
@@ -226,16 +235,16 @@ Change those two paths on another machine.
 
 ### Building the slim FFmpeg
 
-The script cross-compiles zlib 1.3.1, dav1d 1.5.4 and FFmpeg 9.0.2 for Windows from Linux or WSL with MinGW-w64.
+The script cross-compiles zlib 1.3.1, dav1d 1.5.4, libbluray 1.3.4 and FFmpeg 9.0.2 for Windows from Linux or WSL with MinGW-w64.
 It needs these Ubuntu packages: `gcc-mingw-w64-x86-64-win32 nasm make pkg-config meson ninja-build gcc libc6-dev`.
 
 ```bash
 SRC=/mnt/d/tools/src/ffmpeg-9.0.2 DAV1D_SRC=/mnt/d/tools/src/dav1d-1.5.4 \
-  ZLIB_SRC=/mnt/d/tools/src/zlib-1.3.1 PREFIX=/mnt/d/tools/ffmpeg-9.0.2-myvlc \
-  bash scripts/build-ffmpeg.sh
+  ZLIB_SRC=/mnt/d/tools/src/zlib-1.3.1 BLURAY_SRC=/mnt/d/tools/src/bluray/libbluray-1.3.4 \
+  PREFIX=/mnt/d/tools/ffmpeg-9.0.2-myvlc bash scripts/build-ffmpeg.sh
 ```
 
-It builds the file protocol and the network ones a player opens (http, https, tcp, udp, rtp, with TLS from Windows' Schannel), 36 demuxers (HLS and RTSP among them), 20 parsers, 51 decoders (raw video among them, for capture devices) and the D3D11VA hwaccels, plus libswresample and libswscale.
+It builds the file protocol and the network ones a player opens (http, https, tcp, udp, rtp, with TLS from Windows' Schannel), `concat` for a DVD's VOB files, `bluray` for Blu-rays through libbluray (LGPL, linked into `avformat-63.dll`, 282 KB), 36 demuxers (HLS and RTSP among them), 20 parsers, 51 decoders (raw video among them, for capture devices) and the D3D11VA hwaccels, plus libswresample and libswscale.
 For recording and converting it adds 9 muxers (Matroska, MP4 and MPEG-TS among them), every bitstream filter, and Media Foundation's H.264, HEVC, AAC and MP3 encoders, which come with Windows.
 The DirectShow and GDI capture devices are in a sixth DLL, `avdevice-63.dll` (89 KB).
 The subtitle decoders (SRT, ASS/SSA, WebVTT, MP4 text, MicroDVD, SubViewer, SAMI, DVD, DVB and PGS) and their file demuxers add 78 KB.
@@ -356,7 +365,7 @@ The memory, CPU and startup rows were measured before libdav1d was added to the 
 
 | | Full (BtbN LGPL) | Slim, with libdav1d |
 |---|---|---|
-| FFmpeg DLLs on disk | 114.4 MB | 15.4 MB (13.2 MB without libdav1d) |
+| FFmpeg DLLs on disk | 114.4 MB | 15.7 MB (13.5 MB without libdav1d) |
 | `avcodec-63.dll` | 86.9 MB | 10.7 MB (8.7 MB without libdav1d) |
 | H.264: private memory / working set | 88.8 / 88.2 MB | 79.1 / 82.2 MB |
 | HEVC: private memory / working set | 98.2 / 94.9 MB | 88.6 / 89.1 MB |
@@ -392,6 +401,7 @@ Opening the audio device took 1.2 to 3.5 s in these runs, and playback starts mo
 Each of these is marked with a `ponytail:` comment in the code, along with the upgrade path.
 
 - libass draws at the video's stored size, so on anamorphic video (non-square pixels) styled subtitles stretch with the picture.
+- DVDs play their main title only, without menus or the other titles, and DVD images (.iso) don't open; Blu-ray menus (BD-J) don't play either.
 - Without a language tag, traditional Chinese (Big5) subtitles read as simplified (GBK), and Turkish or Baltic ones as Western, since the same bytes are valid in both.
 - Contrast and saturation go up to 2x, like VLC's adjust filter; brightness and hue use the GPU's full range.
 - HDR10 is always tone mapped to SDR, even on an HDR screen; there is no HDR output.

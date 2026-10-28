@@ -82,6 +82,9 @@ pub enum MenuAction {
     StreamFile(PathBuf),
     /// Plays a capture device: its address and its name.
     OpenCapture(String, String),
+    /// Plays the DVD or Blu-ray in a drive or folder; None asks for the folder.
+    OpenDisc(Option<PathBuf>),
+    OpenDiscImage,
     /// Converts a file into an MP4 or an MP3.
     Convert(PathBuf, Format),
     /// Converts the open file into an MP4 (Ctrl+R).
@@ -745,6 +748,17 @@ pub fn main_menu(
         Converting::File(path) => Item::submenu("Convert", convert_menu(path)),
         Converting::Running => Item::new("Stop Converting", MenuAction::CancelConvert),
     };
+    // The optical drives, then a disc's files on disk or a Blu-ray image.
+    let mut discs: Vec<Item> = (crate::disc::drives().into_iter())
+        .map(|d| {
+            Item::new(
+                format!("Disc in {}", d.display()),
+                MenuAction::OpenDisc(Some(d)),
+            )
+        })
+        .collect();
+    discs.push(Item::new("Disc Folder...", MenuAction::OpenDisc(None)).key("Ctrl + D"));
+    discs.push(Item::new("Blu-ray Image...", MenuAction::OpenDiscImage));
     let devices = devices
         .iter()
         .map(|d| {
@@ -776,8 +790,7 @@ pub fn main_menu(
         Item::new("Open Network Stream", MenuAction::OpenNetwork)
             .icon(Icon::Network)
             .key("Ctrl + N"),
-        // ponytail: discs need libdvdnav and libbluray, which the FFmpeg build leaves out.
-        Item::off("Open Disc").icon(Icon::Disc).key("Ctrl + D"),
+        Item::submenu("Open Disc", discs).icon(Icon::Disc),
         Item::submenu("Open Capture Device", devices).icon(Icon::Capture),
         convert.icon(Icon::Convert),
         Item::submenu("Open Recent", recent).icon(Icon::Recent),

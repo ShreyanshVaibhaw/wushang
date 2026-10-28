@@ -90,6 +90,10 @@ pub fn open_input(
     if crate::capture::is_capture_path(path) {
         return crate::capture::open(path);
     }
+    if crate::disc::is_disc_path(path) {
+        let url = crate::disc::url(path)?;
+        return ff::format::input(&url).map_err(|e| format!("can't play the disc: {e}"));
+    }
     if !net::is_url_path(path) {
         return ff::format::input(path).map_err(|e| format!("cannot open {path:?}: {e}"));
     }
@@ -205,7 +209,11 @@ impl Session {
         audio: &Arc<audio::Device>,
     ) -> Result<Session, Box<dyn Error>> {
         shared.reset();
-        let duration = if input.duration() > 0 {
+        // A DVD's VOBs carry no length or chapters; its IFO has both.
+        let dvd = crate::disc::dvd_title(path);
+        let duration = if let Some(title) = &dvd {
+            title.length
+        } else if input.duration() > 0 {
             input.duration() as f64 / f64::from(ff::ffi::AV_TIME_BASE)
         } else {
             0.0
@@ -272,7 +280,12 @@ impl Session {
         for (list, titles) in tracks.iter_mut().zip(&titles) {
             label_tracks(list, titles);
         }
-        let chapters = read_chapters(&input);
+        let chapters = match &dvd {
+            Some(title) => (title.chapters.iter().enumerate())
+                .map(|(i, start)| (*start, format!("Chapter {}", i + 1)))
+                .collect(),
+            None => read_chapters(&input),
+        };
         let best = |kind, medium| {
             let list: &Vec<TrackInfo> = &tracks[kind as usize];
             let best = input.streams().best(medium).map(|s| s.index());
@@ -296,9 +309,11 @@ impl Session {
 
         let url = net::is_url_path(path).then(|| path.to_string_lossy().into_owned());
         let capture = crate::capture::is_capture_path(path);
+        let disc = crate::disc::is_disc_path(path);
         let title = match &url {
             // The app names a device after the menu entry it came from.
             _ if capture => "Capture".to_owned(),
+            _ if disc => crate::disc::title(path),
             // A stream's own title ("icy-name" for radio) beats its address.
             Some(url) => (input.metadata().get("icy-name"))
                 .or(input.metadata().get("title"))
@@ -312,7 +327,7 @@ impl Session {
                 .replace('_', " "),
         };
         let folder = match &url {
-            _ if capture => String::new(),
+            _ if capture || disc => String::new(),
             Some(url) => net::host_of(url).unwrap_or_default(),
             None => path
                 .parent()

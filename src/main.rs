@@ -11,6 +11,7 @@ mod captions;
 mod capture;
 mod codepage;
 mod convert;
+mod disc;
 mod dsp;
 mod library;
 mod net;
@@ -263,8 +264,13 @@ impl App {
             let (done, ready) = mpsc::channel();
             let (url, flag) = (path.to_owned(), cancel.clone());
             thread::spawn(move || _ = done.send(session::open_input(&url, options, &flag)));
-            let line = match net::host_of(&path.to_string_lossy()) {
+            // Disc and capture addresses have "://" too, but no host.
+            let host = net::is_url_path(path)
+                .then(|| net::host_of(&path.to_string_lossy()))
+                .flatten();
+            let line = match host {
                 Some(host) => format!("Connecting to {host}..."),
+                None if disc::is_disc_path(path) => "Opening the disc...".to_owned(),
                 None => "Opening the capture device...".to_owned(),
             };
             self.notice = Some((line, Instant::now()));
@@ -337,8 +343,15 @@ impl App {
             Err(e) => {
                 eprintln!("myvlc: {e}");
                 if net::is_address(path) {
-                    let line = match net::host_of(&path.to_string_lossy()) {
+                    let host = net::is_url_path(path)
+                        .then(|| net::host_of(&path.to_string_lossy()))
+                        .flatten();
+                    let line = match host {
                         Some(host) => format!("Can't play the stream from {host}"),
+                        None if disc::is_disc_path(path) => {
+                            "Can't play the disc (an encrypted one needs AACS or CSS keys)"
+                                .to_owned()
+                        }
                         None => "Can't open the capture device".to_owned(),
                     };
                     self.notice = Some((line, Instant::now()));
@@ -352,6 +365,15 @@ impl App {
     fn play_file(&mut self, path: &Path) -> bool {
         if net::is_address(path) {
             return self.play(path, vec![path.to_owned()]);
+        }
+        // A DVD or Blu-ray folder, or a Blu-ray image, opened or dropped like a file.
+        if (path.is_dir()
+            || path
+                .extension()
+                .is_some_and(|e| e.eq_ignore_ascii_case("iso")))
+            && let Some(address) = disc::address(path)
+        {
+            return self.play(&address, vec![address.clone()]);
         }
         let queue = path.parent().map_or_else(Vec::new, |dir| {
             self.library
@@ -1917,7 +1939,8 @@ fn handle(app: &mut App, hwnd: HWND, hit: Hit) {
             }
         }
         Hit::Folder => {
-            if let Some(dir) = app.session.as_ref().and_then(|s| s.path.parent()) {
+            let file = app.session.as_ref().filter(|s| !net::is_address(&s.path));
+            if let Some(dir) = file.and_then(|s| s.path.parent()) {
                 let place = Place::Folder(
                     section_of(&app.session.as_ref().unwrap().path),
                     dir.to_owned(),
@@ -2118,6 +2141,18 @@ fn menu_action(app: &mut App, hwnd: HWND, action: MenuAction) {
         MenuAction::CancelConvert => {
             if let Some(job) = &app.converting {
                 job.cancel();
+            }
+        }
+        MenuAction::OpenDisc(folder) => {
+            let Some(folder) = folder.or_else(|| pick_folder(hwnd)) else {
+                return;
+            };
+            open_disc(app, &folder);
+        }
+        MenuAction::OpenDiscImage => {
+            let images = [("Blu-ray images", "*.iso".to_owned())];
+            if let Some(image) = pick_files(hwnd, &images, false).pop() {
+                open_disc(app, &image);
             }
         }
         MenuAction::OpenCapture(address, name) => {
@@ -3317,6 +3352,22 @@ fn use_tool(app: &mut App, hwnd: HWND, item: ui::ToolItem) {
     }
 }
 
+/// Plays the DVD or Blu-ray in `path` (a drive, a folder, or a Blu-ray image).
+fn open_disc(app: &mut App, path: &Path) {
+    match disc::address(path) {
+        Some(address) => {
+            if app.play(&address, vec![address.clone()]) {
+                UI.with_borrow_mut(|ui| ui.show(Page::Player));
+            }
+        }
+        None => {
+            let line = format!("No DVD or Blu-ray video in {}", path.display());
+            app.notice = Some((line, Instant::now()));
+            UI.with_borrow_mut(|ui| ui.show(Page::Player));
+        }
+    }
+}
+
 /// Lists the capture devices into `devices` in the background; DirectShow takes a moment.
 fn refresh_devices(devices: &Arc<Mutex<Vec<capture::Device>>>) {
     let devices = devices.clone();
@@ -3457,6 +3508,7 @@ fn on_key(hwnd: HWND, shared: &Shared, key: VIRTUAL_KEY) {
     let shortcut = match key {
         VK_O if ctrl => Some(MenuAction::OpenFiles),
         VK_R if ctrl => Some(MenuAction::ConvertOpen),
+        VK_D if ctrl => Some(MenuAction::OpenDisc(None)),
         VK_N if ctrl => Some(MenuAction::OpenNetwork),
         VK_F if ctrl => Some(MenuAction::OpenFolder),
         VK_P if ctrl => Some(MenuAction::Preferences(Category::Playback)),
