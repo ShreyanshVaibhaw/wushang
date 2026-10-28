@@ -32,6 +32,8 @@ const MAX_QUEUED_BYTES: usize = 32 << 20;
 /// Subtitle queues keep at most this many packets and drop the oldest beyond it, so a subtitle
 /// stream nobody reads never holds up the demuxer or grows without bound.
 pub const SUBTITLE_QUEUE_LEN: usize = 500;
+/// How far before a seek the demuxer looks for subtitles still on screen there.
+const SUBTITLE_PREROLL: f64 = 10.0;
 pub const POLL: Duration = Duration::from_millis(20);
 pub const MAX_VOLUME: f32 = 2.0;
 /// Video packets that may fail before the first frame until the stream counts as undecodable,
@@ -134,6 +136,9 @@ pub struct Shared {
 }
 
 /// How a live stream FFmpeg can't reconnect itself (RTSP, UDP) opens again when it drops.
+/// Opens the playing file again, for a second reader.
+pub type Reopen = Arc<dyn Fn() -> Result<ff::format::context::Input, String> + Send + Sync>;
+
 pub struct Reconnect {
     pub open: Box<dyn Fn() -> Result<ff::format::context::Input, String> + Send>,
     /// Keep trying this long before the stream counts as ended.
@@ -544,9 +549,9 @@ pub fn spawn_demuxer(
     role: Role,
     reconnect: Option<Reconnect>,
 ) -> JoinHandle<()> {
-    let (follower, copies) = match role {
-        Role::Main(copies) => (false, copies),
-        Role::Follower => (true, Vec::new()),
+    let (follower, copies, reopen) = match role {
+        Role::Main(copies, reopen) => (false, copies, reopen),
+        Role::Follower => (true, Vec::new(), None),
     };
     // Read before the thread starts, which may be after the seek that selects this file's track.
     let mut followed = shared.serial.load(Relaxed);
@@ -557,6 +562,8 @@ pub fn spawn_demuxer(
         // Where playback is in the input, for the recorders; the clock is unknown just after a
         // seek, and the last value stands in.
         let mut playhead = 0.0;
+        // Subtitle streams already sent what shows at the reading position from before it.
+        let mut prerolled: Vec<usize> = Vec::new();
         while !shared.quitting() {
             playhead = shared.clock.get().unwrap_or(playhead);
             for (control, recorder) in copies.iter().zip(&mut recorders) {
@@ -605,6 +612,24 @@ pub fn spawn_demuxer(
                     r.seeked();
                 }
                 eof = false;
+                prerolled.clear();
+            }
+            if let Some(reopen) = &reopen {
+                let fresh: Vec<_> = {
+                    let routes = routes.lock().unwrap();
+                    prerolled.retain(|s| routes.iter().any(|r| r.sparse && r.stream == *s));
+                    (routes.iter())
+                        .filter(|r| r.sparse && !prerolled.contains(&r.stream))
+                        .map(|r| (r.stream, r.queue.clone()))
+                        .collect()
+                };
+                if !fresh.is_empty() {
+                    prerolled.extend(fresh.iter().map(|(s, _)| *s));
+                    let at = shared.clock.get().unwrap_or(shared.seek_floor());
+                    if at > 0.0 {
+                        spawn_preroll(reopen.clone(), fresh, at, shared.clone());
+                    }
+                }
             }
 
             let (enough, bytes) = routes.lock().unwrap().iter().filter(|r| !r.sparse).fold(
@@ -678,9 +703,57 @@ pub fn spawn_demuxer(
 /// Which demuxer a thread is: the open file's, which owns seeks and can record, or a second
 /// file's (an external audio track) that follows its seeks.
 pub enum Role {
-    /// With the controls of its copies: recording and streaming out.
-    Main(Vec<record::Control>),
+    /// With the controls of its copies (recording and streaming out), and for a local file a
+    /// way to open it again for `spawn_preroll`.
+    Main(Vec<record::Control>, Option<Reopen>),
     Follower,
+}
+
+/// Reads the `SUBTITLE_PREROLL` seconds before `at` from a second opening of the file and sends
+/// the packets of `streams` found there, so a line that began before a seek, a resume or a track
+/// switch shows instead of waiting for the next one. The demuxer reads on from a keyframe at or
+/// before `at`, so both may send a line; libass and `Cues` keep one. Gives up at the next seek.
+// ponytail: reads every stream's packets in those seconds; discard the others and stop by byte
+// position if seeking big remuxes on a slow disk stutters.
+fn spawn_preroll(
+    reopen: Reopen,
+    streams: Vec<(usize, Arc<PacketQueue>)>,
+    at: f64,
+    shared: Arc<Shared>,
+) {
+    let serial = shared.serial.load(Relaxed);
+    thread::spawn(move || {
+        let Ok(mut input) = reopen() else {
+            return;
+        };
+        let bases: Vec<f64> = input.streams().map(|s| f64::from(s.time_base())).collect();
+        let from = ((at - SUBTITLE_PREROLL).max(0.0) * f64::from(ffi::AV_TIME_BASE)) as i64;
+        if input.seek(from, ..from + 1).is_err() {
+            return;
+        }
+        loop {
+            let mut packet = ff::Packet::empty();
+            if packet.read(&mut input).is_err()
+                || shared.quitting()
+                || shared.serial.load(Relaxed) != serial
+            {
+                return;
+            }
+            let Some(pts) = packet.pts() else {
+                continue;
+            };
+            let t = pts as f64 * bases[packet.stream()];
+            // Video comes in decoding order, a few frames ahead of its own times.
+            if t > at + 1.0 {
+                return;
+            }
+            if t <= at
+                && let Some((_, queue)) = streams.iter().find(|(s, _)| *s == packet.stream())
+            {
+                queue.push(Msg::Packet(packet));
+            }
+        }
+    });
 }
 
 /// Seeks `input` to the keyframe of `stream` at or before `ts` (in `AV_TIME_BASE` units). A file

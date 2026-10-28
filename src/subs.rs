@@ -149,6 +149,11 @@ impl Cues {
     fn insert(&self, mut cue: Cue, open: bool) {
         let mut cues = self.list.lock().unwrap();
         let at = cues.partition_point(|e| e.cue.start <= cue.start);
+        // After a seek the demuxer and its preroll may both send a cue; it shows once.
+        let same = cues.partition_point(|e| e.cue.start < cue.start);
+        if cues[same..at].iter().any(|e| e.cue.content == cue.content) {
+            return;
+        }
         if open && let Some(next) = cues.get(at) {
             cue.end = cue.end.min(next.cue.start).max(cue.start);
         }
@@ -798,6 +803,23 @@ mod tests {
             true,
         );
         assert!(cues.active(0.5).len() == 1 && cues.active(1.0).len() == 1);
+    }
+
+    #[test]
+    fn a_cue_sent_twice_shows_once() {
+        let cues = Cues::default();
+        let line = |text| Cue {
+            start: 8.0,
+            end: 16.0,
+            content: CueContent::Text(vec![vec![span(text, false, false)]]),
+        };
+        // From a seek's preroll and from the demuxer reading on from the keyframe.
+        cues.insert(line("Line 1"), false);
+        cues.insert(line("Line 1"), false);
+        assert_eq!(cues.active(10.0).len(), 1);
+        // Another line at the same moment still shows.
+        cues.insert(line("Sign"), false);
+        assert_eq!(cues.active(10.0).len(), 2);
     }
 
     #[test]

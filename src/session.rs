@@ -407,11 +407,18 @@ impl Session {
                 give_up: std::time::Duration::from_secs(options.timeout.into()),
             }
         });
+        // Plain files only: a stream or a disc would be read twice over.
+        let reopen = (!capture && !disc && url.is_none()).then(|| {
+            let path = path.to_owned();
+            let open = move || ff::format::input(&path).map_err(|e| e.to_string());
+            Arc::new(open) as player::Reopen
+        });
+        let copies = vec![session.record.clone(), session.stream.clone()];
         session.demuxer = Some(player::spawn_demuxer(
             input,
             session.routes.clone(),
             shared.clone(),
-            player::Role::Main(vec![session.record.clone(), session.stream.clone()]),
+            player::Role::Main(copies, reopen),
             reconnect,
         ));
         Ok(session)
