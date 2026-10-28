@@ -3,6 +3,8 @@
 //!
 //! demux thread -> video and audio decoder threads -> D3D11 renderer + Direct2D UI (this thread)
 //!                                                 -> WASAPI callback (drives the clock)
+// A GUI program: started from Explorer it opens no console window. See `main` for the log.
+#![cfg_attr(not(test), windows_subsystem = "windows")]
 
 mod ass;
 mod audio;
@@ -159,9 +161,44 @@ const SLEEP_MINUTES: [u64; 5] = [0, 15, 30, 45, 60];
 const SLEEP_END_OF_FILE: usize = 5;
 
 fn main() {
+    use_parent_console();
     if let Err(e) = run() {
         eprintln!("myvlc: {e}");
         std::process::exit(1);
+    }
+}
+
+/// A GUI program has no console. Started from a terminal, its log goes to that terminal; with
+/// stderr already redirected (a pipe, a file) it stays where it was sent.
+fn use_parent_console() {
+    use windows::Win32::Foundation::GENERIC_WRITE;
+    use windows::Win32::Storage::FileSystem::{
+        CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_WRITE, OPEN_EXISTING,
+    };
+    use windows::Win32::System::Console::{
+        ATTACH_PARENT_PROCESS, AttachConsole, GetStdHandle, STD_ERROR_HANDLE, STD_OUTPUT_HANDLE,
+        SetStdHandle,
+    };
+    unsafe {
+        // windows-rs reports an unset handle as an error carrying a success code.
+        let unset = GetStdHandle(STD_ERROR_HANDLE).map_or(true, |h| h.is_invalid());
+        if !unset || AttachConsole(ATTACH_PARENT_PROCESS).is_err() {
+            return;
+        }
+        // Attaching leaves the standard handles unset; point them at the console.
+        let console = CreateFileW(
+            w!("CONOUT$"),
+            GENERIC_WRITE.0,
+            FILE_SHARE_WRITE,
+            None,
+            OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL,
+            None,
+        );
+        if let Ok(console) = console {
+            _ = SetStdHandle(STD_OUTPUT_HANDLE, console);
+            _ = SetStdHandle(STD_ERROR_HANDLE, console);
+        }
     }
 }
 
@@ -1487,15 +1524,9 @@ fn run() -> Result<(), Box<dyn Error>> {
         UI.with_borrow_mut(|ui| ui.show(Page::Player));
     }
 
-    let window_title = app.session.as_ref().map_or("myvlc".into(), |s| {
-        s.path
-            .file_name()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .into_owned()
-    });
+    let mut shown_title = window_title(app.session.as_ref());
     let size = app.session.as_ref().and_then(|s| s.video_size);
-    let hwnd = create_window(&window_title, size.unwrap_or((1600, 900)))?;
+    let hwnd = create_window(&shown_title, size.unwrap_or((1600, 900)))?;
     let maximized = restore_placement(hwnd, &settings);
     if settings.on_top {
         set_topmost(hwnd, true);
@@ -1819,6 +1850,12 @@ fn run() -> Result<(), Box<dyn Error>> {
         let card = app.session.is_some();
         let panel_data = app.panel_data();
         let queue_data = UI.with_borrow(|ui| ui.queue.open).then(|| app.queue_data());
+        // The taskbar and Alt+Tab name the file playing.
+        let title = window_title(app.session.as_ref());
+        if title != shown_title {
+            unsafe { _ = SetWindowTextW(hwnd, &HSTRING::from(&title)) };
+            shown_title = title;
+        }
         let needs_paint = UI.with_borrow_mut(|ui| {
             // Nothing to show on the player page once playback ends or fails, unless its bars
             // are being customized. A stream connecting, or the notice saying why it couldn't,
@@ -1828,6 +1865,10 @@ fn run() -> Result<(), Box<dyn Error>> {
                 ui.show(Page::Library);
             }
             ui.menu_tick();
+            // An open context menu would close with the refresh; it waits for that.
+            if ui.browse.context.is_none() && app.library.media_folders_changed() {
+                ui.browse.stale = true;
+            }
             if ui.browse.stale {
                 ui.browse.refresh(&app.library);
                 ui.relayout = true;
@@ -2533,7 +2574,10 @@ fn menu_action(app: &mut App, hwnd: HWND, action: MenuAction) {
             });
         }
         MenuAction::AddFolder(section) => add_folder(app, hwnd, section),
-        MenuAction::Resync => UI.with_borrow_mut(|ui| ui.browse.stale = true),
+        MenuAction::Resync => {
+            app.library.forget_media_folders();
+            UI.with_borrow_mut(|ui| ui.browse.stale = true);
+        }
         MenuAction::PlayPlaylist(name) => play_playlist(app, &name, false),
         MenuAction::ShufflePlaylist(name) => play_playlist(app, &name, true),
         MenuAction::ExportPlaylist(name) => export_playlist(app, hwnd, &name),
@@ -3036,6 +3080,14 @@ fn pick_folder(hwnd: HWND) -> Option<PathBuf> {
 /// Creates the window hidden; `run` shows it once the renderer is ready. The window draws its own
 /// title bar, so the system frame is removed in WM_NCCALCSIZE while DWM keeps the shadow,
 /// rounded corners, snapping and minimize/maximize animations.
+/// The window's own title, for the taskbar and Alt+Tab: the file playing, then the app.
+fn window_title(session: Option<&Session>) -> String {
+    match session.and_then(|s| s.path.file_name()) {
+        Some(name) => format!("{} - myvlc", name.to_string_lossy()),
+        None => "myvlc".to_owned(),
+    }
+}
+
 fn create_window(title: &str, (video_w, video_h): (u32, u32)) -> windows::core::Result<HWND> {
     unsafe {
         // Without this Windows bitmap-scales the window on high-DPI screens and blurs everything.
@@ -3068,7 +3120,7 @@ fn create_window(title: &str, (video_w, video_h): (u32, u32)) -> windows::core::
         let hwnd = CreateWindowExW(
             WINDOW_EX_STYLE::default(),
             w!("myvlc"),
-            &HSTRING::from(format!("{title} - myvlc")),
+            &HSTRING::from(title),
             WS_OVERLAPPEDWINDOW,
             CW_USEDEFAULT,
             CW_USEDEFAULT,

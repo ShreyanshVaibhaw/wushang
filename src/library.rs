@@ -6,13 +6,14 @@
 //! playlist each.
 
 use std::cmp::Ordering;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt::Write as _;
 use std::io::ErrorKind;
 use std::os::windows::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering::Relaxed;
+use std::sync::{Arc, Mutex};
 use std::{env, fs, io};
 
 use crate::net::{self, Feed, NetKind, Station};
@@ -265,6 +266,8 @@ pub struct Library {
     stations: Option<Fetched<Vec<Station>>>,
     /// Track preferences by `folder_scope` or `playlist_scope`.
     picks: HashMap<String, TrackPrefs>,
+    /// Which subfolders hold media, for folder listings.
+    media_dirs: MediaDirs,
 }
 
 impl Library {
@@ -300,6 +303,7 @@ impl Library {
             feed_times: HashMap::new(),
             stations: None,
             picks: HashMap::new(),
+            media_dirs: MediaDirs::default(),
         };
         match fs::read(dir.join(STATE_FILE)) {
             Ok(bytes) => lib.parse(&String::from_utf8_lossy(&bytes)),
@@ -565,9 +569,7 @@ impl Library {
                 .collect(),
             Place::Folder(section, dir) => {
                 let (dirs, files) = list_dir(dir);
-                let dirs = dirs
-                    .into_iter()
-                    .filter(|(_, d)| has_media(d, MEDIA_SEARCH_DEPTH))
+                let dirs = (self.media_dirs.keep(dirs).into_iter())
                     .map(|(name, d)| folder(&name, Place::Folder(*section, d)));
                 let files = files
                     .iter()
@@ -1198,6 +1200,17 @@ impl Library {
         self.tracks = tracks;
     }
 
+    /// Whether the background search found a listed folder empty since the last call, so the
+    /// listing on screen should be redone without it.
+    pub fn media_folders_changed(&self) -> bool {
+        self.media_dirs.take_hid()
+    }
+
+    /// Searches every folder for media again on its next listing (Resync).
+    pub fn forget_media_folders(&self) {
+        self.media_dirs.forget();
+    }
+
     /// Every audio file under the Music roots, for the scanner to probe.
     pub fn music_files(&self) -> Vec<PathBuf> {
         let mut seen = HashSet::new();
@@ -1412,6 +1425,82 @@ fn list_dir(dir: &Path) -> (Named, Named) {
     (dirs, files)
 }
 
+/// Which folders hold media, searched for by one background thread so a listing never waits on
+/// it: a drive root can hold thousands of folders, and the window froze for minutes walking them.
+/// A subfolder lists until the search finds no media in it. Answers last the run; `forget`
+/// (Resync) drops them.
+#[derive(Default)]
+struct MediaDirs(Arc<Mutex<DirSearch>>);
+
+#[derive(Default)]
+struct DirSearch {
+    known: HashMap<PathBuf, bool>,
+    /// The folders the latest listing asked about and the search hasn't reached.
+    queue: VecDeque<PathBuf>,
+    running: bool,
+    /// Set when the search found a listed folder empty, so the listing should be redone.
+    hid: bool,
+}
+
+impl MediaDirs {
+    /// The subfolders of `dirs` to list. Those not searched yet are kept and queued, in place of
+    /// what an earlier listing queued.
+    fn keep(&self, dirs: Named) -> Named {
+        let mut s = self.0.lock().unwrap();
+        s.queue.clear();
+        let kept: Named = dirs
+            .into_iter()
+            .filter(|(_, d)| match s.known.get(d) {
+                Some(&has) => has,
+                None => {
+                    s.queue.push_back(d.clone());
+                    true
+                }
+            })
+            .collect();
+        if !s.queue.is_empty() && !s.running {
+            s.running = true;
+            let state = self.0.clone();
+            std::thread::spawn(move || search_dirs(&state));
+        }
+        kept
+    }
+
+    /// Whether a search hid a listed folder since the last call.
+    fn take_hid(&self) -> bool {
+        std::mem::take(&mut self.0.lock().unwrap().hid)
+    }
+
+    fn forget(&self) {
+        self.0.lock().unwrap().known.clear();
+    }
+
+    /// Waits for the queued searches.
+    #[cfg(test)]
+    fn settle(&self) {
+        while self.0.lock().unwrap().running {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+}
+
+fn search_dirs(state: &Mutex<DirSearch>) {
+    loop {
+        let dir = {
+            let mut s = state.lock().unwrap();
+            let Some(dir) = s.queue.pop_front() else {
+                s.running = false;
+                return;
+            };
+            dir
+        };
+        let has = has_media(&dir, MEDIA_SEARCH_DEPTH);
+        let mut s = state.lock().unwrap();
+        s.known.insert(dir, has);
+        s.hid |= !has;
+    }
+}
+
 /// Whether `dir` or its subfolders, `depth` levels in all, hold any media file.
 fn has_media(dir: &Path, depth: usize) -> bool {
     let (dirs, files) = list_dir(dir);
@@ -1550,6 +1639,14 @@ mod tests {
         lib.add_root(Section::Videos, shows.clone());
 
         let place = Place::Folder(Section::Videos, shows.clone());
+        // Subfolders list at once, and those without media drop out once the search is done.
+        assert_eq!(
+            labels(&lib.entries(&place)),
+            "Deep|Empty|season 1|Season 2|Season 10|TooDeep|e1.mkv|E2.mp4|E10.mp4"
+        );
+        lib.media_dirs.settle();
+        assert!(lib.media_folders_changed());
+        assert!(!lib.media_folders_changed());
         let entries = lib.entries(&place);
         assert_eq!(
             labels(&entries),
