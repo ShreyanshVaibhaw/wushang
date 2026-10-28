@@ -3,9 +3,8 @@
 //! and subtitle options), opened by the gear. Both sit at the window's bottom right over the
 //! video. Sizes are DIPs measured from the design's stage-3 frames, colours sampled from them.
 //!
-//! HDR is drawn as in the design but disabled (dimmed, no action), because myvlc can't show HDR
-//! on an HDR screen yet. Open Advanced Settings opens the Settings window, and the footer's preset
-//! menu switches settings profiles.
+//! Open Advanced Settings opens the Settings window, and the footer's preset menu switches
+//! settings profiles.
 
 use super::*;
 
@@ -97,6 +96,8 @@ pub struct PanelData {
     /// Settings profiles, for the footer's preset menu, and the one in force.
     pub profiles: Vec<String>,
     pub profile: usize,
+    /// HDR output on HDR screens ("Auto"), or tone mapped to SDR everywhere ("Off").
+    pub hdr: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -147,6 +148,7 @@ pub enum PanelAction {
     SetProfile(usize),
     /// Opens the chosen external subtitle file in its editor.
     EditSubtitle,
+    SetHdr(bool),
 }
 
 /// "1:1 Original" is the picture at its own shape, fitted to the window (VLC's normal view).
@@ -164,6 +166,7 @@ const SPEED_TICKS: [&str; 8] = ["0.25", "0.5", "0.75", "1", "1.25", "1.5", "1.75
 const DELAY_TICKS: [&str; 3] = ["-10 s", "0 s", "+10 s"];
 const SIZE_TICKS: [&str; 4] = ["50%", "100%", "150%", "200%"];
 const RENDER: [&str; 2] = ["Local", "Local + Stream"];
+const HDR: [&str; 2] = ["Auto", "Off"];
 
 /// The video track with the largest picture, which "Best Available" plays.
 pub fn best_video(sizes: &[Option<(u32, u32)>]) -> Option<usize> {
@@ -304,6 +307,7 @@ pub enum Ctl {
     /// The footer's preset (settings profile) menu.
     Preset,
     EditSubtitle,
+    Hdr,
 }
 
 fn track_name(names: &[String], selected: Option<usize>) -> String {
@@ -405,6 +409,7 @@ impl Ctl {
                 .chain((0..d.video_sizes.len()).map(|i| size_name(&d.video_sizes, i)))
                 .collect(),
             Ctl::Render => list(&RENDER),
+            Ctl::Hdr => list(&HDR),
             Ctl::SubFont => list(&crate::prefs::FONTS),
             Ctl::SubColor | Ctl::OutlineColor => crate::prefs::COLORS
                 .iter()
@@ -442,6 +447,7 @@ impl Ctl {
             Ctl::Resolution if d.video_selected == best_video(&d.video_sizes) => Some(0),
             Ctl::Resolution => d.video_selected.map(|i| i + 1),
             Ctl::Render => Some(usize::from(d.streaming.is_some())),
+            Ctl::Hdr => Some(usize::from(!d.hdr)),
             Ctl::SubFont => crate::prefs::FONTS.iter().position(|f| *f == d.sub_font),
             Ctl::SubColor => colour(d.sub_color),
             Ctl::OutlineColor => colour(d.outline_color),
@@ -465,6 +471,7 @@ impl Ctl {
             Ctl::Visualizer => PanelAction::SetVisualizer(i),
             Ctl::Resolution => PanelAction::SetResolution(i.checked_sub(1)),
             Ctl::Render => PanelAction::SetStreaming(i == 1),
+            Ctl::Hdr => PanelAction::SetHdr(i == 0),
             Ctl::SubFont => PanelAction::SetSubFont(i),
             Ctl::SubColor => PanelAction::SetSubColor(i),
             Ctl::OutlineColor => PanelAction::SetOutlineColor(i),
@@ -554,6 +561,7 @@ impl Ctl {
                 _ => "Best Available".into(),
             },
             Ctl::Render => pick(&RENDER, usize::from(d.streaming.is_some())),
+            Ctl::Hdr => pick(&HDR, usize::from(!d.hdr)),
             Ctl::SubSpeed => format!("{:.2}x", d.sub_speed),
             Ctl::SubDuration if d.sub_duration <= 0.0 => "As Written".into(),
             Ctl::SubDuration => format!("{:.2}x", d.sub_duration),
@@ -612,13 +620,6 @@ pub enum Target {
 }
 
 #[derive(Clone, Copy, Debug)]
-enum Value {
-    Fixed(&'static str),
-    /// `Ctl::text` of the row's control.
-    Live,
-}
-
-#[derive(Clone, Copy, Debug)]
 enum Glyph {
     Refresh,
     Pencil,
@@ -636,13 +637,9 @@ enum Kind {
     Toggle,
     /// `up`: the chevron points up, as on the footer's preset menu.
     Dropdown {
-        value: Value,
         up: bool,
     },
-    Field {
-        value: Value,
-        swatch: Option<u32>,
-    },
+    Field,
     /// The dark well behind the segments.
     Segments,
     Segment(&'static str),
@@ -761,30 +758,24 @@ impl Builder<'_> {
     }
 
     /// A label with a menu at the right, or a full-width menu without a label.
-    fn dropdown(&mut self, label: Option<&'static str>, cy: f32, ctl: Option<Ctl>, value: Value) {
-        let dim = ctl.is_none();
+    fn dropdown(&mut self, label: Option<&'static str>, cy: f32, ctl: Ctl) {
         let l = match label {
             Some(text) => {
-                self.label(text, LABEL_X, cy, dim);
+                self.label(text, LABEL_X, cy, false);
                 160.0
             }
             None => PAD,
         };
         let r = self.rect(l, cy, W - PAD, DROPDOWN_H);
-        let kind = Kind::Dropdown { value, up: false };
-        self.push(kind, r, ctl, !dim, dim);
+        let kind = Kind::Dropdown { up: false };
+        self.push(kind, r, Some(ctl), true, false);
     }
 
     /// A label with a value field at the right. Fields whose control has choices open a list.
-    fn field(&mut self, label: &'static str, cy: f32, ctl: Option<Ctl>, value: Value, dim: bool) {
-        self.label(label, LABEL_X, cy, dim);
+    fn field(&mut self, label: &'static str, cy: f32, ctl: Ctl) {
+        self.label(label, LABEL_X, cy, false);
         let r = self.rect(W - PAD - FIELD_W, cy, W - PAD, FIELD_H);
-        let click = !dim && ctl.is_some_and(Ctl::has_options);
-        let swatch = match value {
-            Value::Fixed(text) if text.starts_with('#') => u32::from_str_radix(&text[1..], 16).ok(),
-            _ => None,
-        };
-        self.push(Kind::Field { value, swatch }, r, ctl, click, dim);
+        self.push(Kind::Field, r, Some(ctl), ctl.has_options(), false);
     }
 
     fn slider(&mut self, ctl: Option<Ctl>, cy: f32, l: f32, r: f32, ticks: u8, centre: bool) {
@@ -898,19 +889,9 @@ fn playback(b: &mut Builder) -> f32 {
     );
     b.toggle("Show Statistics", 139.5, Some(Ctl::ShowStatistics));
     b.toggle("Reverse", 191.5, Some(Ctl::Reverse));
-    b.dropdown(
-        Some("Sleep Timer"),
-        251.0,
-        Some(Ctl::SleepTimer),
-        Value::Live,
-    );
-    b.dropdown(
-        Some("Audio Visualizer"),
-        319.0,
-        Some(Ctl::Visualizer),
-        Value::Live,
-    );
-    b.field("Speed", 386.0, Some(Ctl::Speed), Value::Live, false);
+    b.dropdown(Some("Sleep Timer"), 251.0, Ctl::SleepTimer);
+    b.dropdown(Some("Audio Visualizer"), 319.0, Ctl::Visualizer);
+    b.field("Speed", 386.0, Ctl::Speed);
     b.slider(Some(Ctl::Speed), 433.0, PAD, W - PAD, 6, false);
     b.ticks(&SPEED_TICKS, 463.0, false);
     478.0
@@ -934,18 +915,13 @@ fn video(b: &mut Builder) -> f32 {
             false,
         );
     }
-    b.field("Rotate", 241.5, Some(Ctl::Rotate), Value::Live, false);
-    b.dropdown(Some("Zoom"), 309.0, Some(Ctl::Zoom), Value::Live);
-    b.dropdown(Some("HDR"), 377.0, None, Value::Fixed("Auto"));
-    b.dropdown(
-        Some("Resolution"),
-        445.0,
-        Some(Ctl::Resolution),
-        Value::Live,
-    );
-    b.dropdown(Some("Aspect Ratio"), 513.0, Some(Ctl::Aspect), Value::Live);
-    b.dropdown(Some("Crop"), 581.0, Some(Ctl::Crop), Value::Live);
-    b.dropdown(Some("Render"), 649.0, Some(Ctl::Render), Value::Live);
+    b.field("Rotate", 241.5, Ctl::Rotate);
+    b.dropdown(Some("Zoom"), 309.0, Ctl::Zoom);
+    b.dropdown(Some("HDR"), 377.0, Ctl::Hdr);
+    b.dropdown(Some("Resolution"), 445.0, Ctl::Resolution);
+    b.dropdown(Some("Aspect Ratio"), 513.0, Ctl::Aspect);
+    b.dropdown(Some("Crop"), 581.0, Ctl::Crop);
+    b.dropdown(Some("Render"), 649.0, Ctl::Render);
     b.divider(692.5);
     b.heading("Filters", 722.0);
     b.label("Essential", LABEL_X, 761.0, false);
@@ -968,38 +944,20 @@ fn video(b: &mut Builder) -> f32 {
 
 fn audio(b: &mut Builder) -> f32 {
     b.heading("Defaults", 80.0);
-    b.field(
-        "Audio Track",
-        124.5,
-        Some(Ctl::AudioTrack),
-        Value::Live,
-        false,
-    );
-    b.field(
-        "Audio Language",
-        177.5,
-        Some(Ctl::AudioLanguage),
-        Value::Live,
-        false,
-    );
+    b.field("Audio Track", 124.5, Ctl::AudioTrack);
+    b.field("Audio Language", 177.5, Ctl::AudioLanguage);
     b.label("Stereo Mode", LABEL_X, 238.0, false);
     b.button("Test", 238.0, Some(Ctl::TestStereo));
-    b.dropdown(None, 297.5, Some(Ctl::Stereo), Value::Live);
+    b.dropdown(None, 297.5, Ctl::Stereo);
     b.divider(341.0);
     b.heading("Synchronization", 372.0);
-    b.field(
-        "Audio Track Delay",
-        420.0,
-        Some(Ctl::AudioDelay),
-        Value::Live,
-        false,
-    );
+    b.field("Audio Track Delay", 420.0, Ctl::AudioDelay);
     b.slider(Some(Ctl::AudioDelay), 467.5, PAD, W - PAD, 0, true);
     b.ticks(&DELAY_TICKS, 494.0, false);
     b.divider(525.0);
     b.heading("Filters", 555.0);
     b.label("Equalizer", LABEL_X, 595.0, false);
-    b.dropdown(None, 645.5, Some(Ctl::EqPreset), Value::Live);
+    b.dropdown(None, 645.5, Ctl::EqPreset);
     let rows = 1 + BANDS.len();
     let h = BOX_HEAD + 20.0 + BOX_EQ_ROW * rows as f32 - 6.0;
     let open = b.s.equalizer;
@@ -1022,69 +980,27 @@ fn audio(b: &mut Builder) -> f32 {
 
 fn subtitles(b: &mut Builder) -> f32 {
     b.heading("Defaults", 80.0);
-    b.field(
-        "Subtitle Track",
-        124.5,
-        Some(Ctl::SubTrack),
-        Value::Live,
-        false,
-    );
-    b.field(
-        "Subtitle Language",
-        177.5,
-        Some(Ctl::SubLanguage),
-        Value::Live,
-        false,
-    );
+    b.field("Subtitle Track", 124.5, Ctl::SubTrack);
+    b.field("Subtitle Language", 177.5, Ctl::SubLanguage);
     b.divider(211.0);
     b.heading("Synchronization", 241.0);
-    b.field(
-        "Subtitle Track Delay",
-        289.0,
-        Some(Ctl::SubDelay),
-        Value::Live,
-        false,
-    );
+    b.field("Subtitle Track Delay", 289.0, Ctl::SubDelay);
     b.slider(Some(Ctl::SubDelay), 332.5, PAD, W - PAD, 0, true);
     b.ticks(&DELAY_TICKS, 359.0, false);
-    b.field(
-        "Subtitle Speed",
-        404.0,
-        Some(Ctl::SubSpeed),
-        Value::Live,
-        false,
-    );
+    b.field("Subtitle Speed", 404.0, Ctl::SubSpeed);
     b.slider(Some(Ctl::SubSpeed), 448.0, PAD, W - PAD, 0, false);
-    b.field(
-        "Subtitle Duration Factor",
-        493.0,
-        Some(Ctl::SubDuration),
-        Value::Live,
-        false,
-    );
+    b.field("Subtitle Duration Factor", 493.0, Ctl::SubDuration);
     b.slider(Some(Ctl::SubDuration), 538.0, PAD, W - PAD, 0, false);
     b.divider(570.5);
     b.heading("Appearance", 601.0);
     // Not in the design: Settings' text size.
-    b.field("Text Size", 646.0, Some(Ctl::SubSize), Value::Live, false);
+    b.field("Text Size", 646.0, Ctl::SubSize);
     b.slider(Some(Ctl::SubSize), 690.0, PAD, W - PAD, 0, false);
     b.ticks(&SIZE_TICKS, 717.0, false);
     b.toggle("Embedded Sub Format", 762.0, Some(Ctl::SubStyles));
-    b.field(
-        "Subtitle Font",
-        814.0,
-        Some(Ctl::SubFont),
-        Value::Live,
-        false,
-    );
-    b.field("Text Color", 867.0, Some(Ctl::SubColor), Value::Live, false);
-    b.field(
-        "Outline Color",
-        918.0,
-        Some(Ctl::OutlineColor),
-        Value::Live,
-        false,
-    );
+    b.field("Subtitle Font", 814.0, Ctl::SubFont);
+    b.field("Text Color", 867.0, Ctl::SubColor);
+    b.field("Outline Color", 918.0, Ctl::OutlineColor);
     950.0
 }
 
@@ -1147,10 +1063,7 @@ impl Layout {
             Panel::Settings(_) => {
                 let y = footer_top - frame.t;
                 let r = b.rect(PAD, y + 41.0, W - PAD, 42.0);
-                let preset = Kind::Dropdown {
-                    value: Value::Live,
-                    up: true,
-                };
+                let preset = Kind::Dropdown { up: true };
                 b.push(preset, r, Some(Ctl::Preset), true, false);
                 let r = b.rect(PAD, y + 89.0, W - PAD, 24.0);
                 let ctl = Some(Ctl::AdvancedSettings);
@@ -1618,10 +1531,7 @@ impl Painter {
             && row
                 .ctl
                 .is_some_and(|c| s.hover == Some(Hit::Popup(Target::Ctl(c))));
-        let value_text = |v: Value| match v {
-            Value::Fixed(t) => t.to_owned(),
-            Value::Live => row.ctl.map(|c| c.text(d)).unwrap_or_default(),
-        };
+        let value_text = row.ctl.map(|c| c.text(d)).unwrap_or_default();
         unsafe {
             match &row.kind {
                 Kind::Heading(text) => self.put(rt, text, &p.heading_font, r, &p.heading),
@@ -1665,7 +1575,7 @@ impl Painter {
                         rt.FillRoundedRectangle(&rounded(r, 6.0), &p.hover);
                     }
                 }
-                Kind::Dropdown { value, up } => {
+                Kind::Dropdown { up } => {
                     let open = row.ctl.is_some() && row.ctl == s.layout.panels.list_ctl();
                     let well = if *up { &p.header } else { &p.panel };
                     rt.FillRoundedRectangle(&rounded(r, 6.0), well);
@@ -1676,7 +1586,7 @@ impl Painter {
                         rt.FillRoundedRectangle(&rounded(r, 6.0), &p.hover);
                     }
                     let tr = Rect::new(r.l + 16.0, r.t, r.r - 44.0, r.b);
-                    self.put(rt, &value_text(*value), &p.text, tr, &p.row);
+                    self.put(rt, &value_text, &p.text, tr, &p.row);
                     let chevron = if *up || open {
                         &p.chevron_up
                     } else {
@@ -1684,7 +1594,7 @@ impl Painter {
                     };
                     self.glyph(ctx, chevron, r.r - 26.0, cy, 24.0);
                 }
-                Kind::Field { value, swatch } => {
+                Kind::Field => {
                     // The design draws the speed readout quieter: no outline, dim text.
                     let quiet = row.ctl == Some(Ctl::Speed);
                     rt.FillRoundedRectangle(&rounded(r, 6.0), &p.header);
@@ -1697,8 +1607,8 @@ impl Painter {
                     }
                     let tr = Rect::new(r.l + 13.0, r.t, r.r - 10.0, r.b);
                     let fg = if quiet { &p.dim } else { &p.row };
-                    self.put(rt, &value_text(*value), &p.text, tr, fg);
-                    if let Some(rgb) = swatch.or_else(|| row.ctl.and_then(|c| c.swatch(d))) {
+                    self.put(rt, &value_text, &p.text, tr, fg);
+                    if let Some(rgb) = row.ctl.and_then(|c| c.swatch(d)) {
                         let sw = Rect::around(r.r - 17.0, cy, 18.0);
                         p.swatch.SetColor(&color(theme::fixed(rgb), 1.0));
                         rt.FillRoundedRectangle(&rounded(sw, 2.0), &p.swatch);
@@ -1965,12 +1875,17 @@ mod tests {
         let list = l.panels.list.as_ref().unwrap();
         assert!(list.frame.b < 1006.0 - 125.0 + 41.0 && list.rows.len() == 2);
 
-        // Disabled rows swallow clicks without acting.
+        // HDR picks Auto or Off; its label swallows clicks without acting.
         let l = open(Panel::Settings(SettingsTab::Video));
         assert_eq!(
             l.hit(1500.0 + 300.0, 61.0 + 377.0),
+            Some(Hit::Popup(Target::Ctl(Ctl::Hdr)))
+        );
+        assert_eq!(
+            l.hit(1500.0 + 40.0, 61.0 + 377.0),
             Some(Hit::Popup(Target::Body))
         );
+        assert_eq!(Ctl::Hdr.pick(1), Some(PanelAction::SetHdr(false)));
     }
 
     #[test]

@@ -95,7 +95,7 @@ Resolution picks between a stream's video tracks by picture size, "Best Availabl
 The stereo Test plays a low tone on the left, then a high one on the right, through the chosen stereo mode.
 The subtitle timeline knows every line of a subtitle file, but only the lines an embedded track has read so far.
 The footer's preset menu switches settings profiles, and "Open Advanced Settings" opens the Settings window.
-HDR is drawn dimmed, as myvlc can't show HDR on an HDR screen yet.
+HDR "Auto" shows HDR10 video in HDR on a screen in HDR mode, and "Off" tone maps it to SDR there too.
 Switching tracks and seeking land on the exact moment: the decoders read from the keyframe before it and drop what comes earlier.
 
 | Key | Action |
@@ -137,7 +137,7 @@ Save keeps the bars in `toolbar.txt` next to the library state; Cancel or Esc dr
 
 Besides the bars' own controls, the palette has spacers and dividers, snapshot, playback speed, skip 10 or 15 seconds either way, stop, repeat, shuffle, the mini player, zoom, quit, Settings, the library, the file name, properties, replay, chapters, favourite, add a bookmark, bookmarks and playlists.
 The thumbnail item shows the playing file's picture, Artist Name and Playlist Name the track's artist and the playlist the queue came from (each opens its page when clicked), and Right Sidebar opens and closes the queue.
-HDR is dimmed, as myvlc can't show HDR on an HDR screen yet.
+The HDR item switches HDR output between Auto and Off, and lights while it is on Auto.
 
 ### Mini player
 
@@ -335,10 +335,16 @@ A stream the GPU turns down after all, such as 10-bit H.264, which no GPU decode
 The decoder thread repacks software frames to NV12, or P010 for 10-bit video so it keeps its precision, with swscale, splitting each frame across the cores, so the render thread only copies them to the GPU.
 On the test laptop a 4K60 10-bit H.264 clip went from 90 dropped frames of 300 to about 50; the rest is the CPU's limit for decoding and repacking at once.
 
-HDR10 (PQ) video gets tone mapped to the SDR screen, because video processors either can't do it or wash it out (the test laptop's Intel one does).
+On an SDR screen HDR10 (PQ) video gets tone mapped, because video processors either can't do it or wash it out (the test laptop's Intel one does).
 The video processor only converts such a frame from YCbCr to RGB, still PQ-encoded in BT.2020, which every driver that supports HDR displays can do.
 Direct2D's colour effects do the rest ([src/tonemap.rs](src/tonemap.rs)): PQ to linear light, a tone curve per channel, then sRGB.
 The curve leaves everything up to three quarters of HDR's reference white (203 nits) as it is and rolls the highlights above it off into the rest of SDR's range, up to the stream's MaxCLL.
+
+On a screen in HDR mode the swap chain switches to 16-bit float scRGB ([src/hdr.rs](src/hdr.rs) asks Windows for the screen's peak and its SDR content brightness).
+HDR10 video keeps its nits up to three quarters of the screen's peak, and the same curve rolls brighter highlights off into the rest.
+The interface and SDR video are drawn in sRGB as before, into a layer that goes over the video at the SDR content brightness, so they look as they do in other apps.
+The window checks again when it moves to another screen or the display settings change.
+No HDR screen was at hand: the effect chains are checked in numbers on the WARP software renderer (100 nits of PQ comes out as 100 nits, interface white at the SDR level), and the whole path ran in the app on an SDR screen told it was HDR.
 On test clips with a known answer, the result is within a few levels of 255 of the exact conversion, and a 4K60 HDR10 clip plays with 2 of 240 frames dropped.
 BT.709 and BT.601 video is unchanged by this.
 
@@ -419,7 +425,8 @@ Each of these is marked with a `ponytail:` comment in the code, along with the u
 - DVDs play their main title only, without menus or the other titles, and DVD images (.iso) don't open; Blu-ray menus (BD-J) don't play either.
 - Without a language tag, traditional Chinese (Big5) subtitles read as simplified (GBK), and Turkish or Baltic ones as Western, since the same bytes are valid in both.
 - Contrast and saturation go up to 2x, like VLC's adjust filter; brightness and hue use the GPU's full range.
-- HDR10 is always tone mapped to SDR, even on an HDR screen; there is no HDR output.
+- HDR output hasn't been seen on a real HDR screen yet.
+  It sends no HDR metadata, leaving the final fit to Windows, and HLG and SDR BT.2020 still show as SDR there.
 - SDR BT.2020 and HLG go through the video processor's own conversion, which on the test laptop's Intel GPU leaves saturated colours paler than they should be, and HLG's highlights clip.
 - 4K60 10-bit H.264 decodes in software, which drops frames on a laptop CPU.
 - Audio devices must mix in f32, which every WASAPI shared-mode device seen so far does.

@@ -2,6 +2,10 @@
 //! (YUV to RGB, scaling, letterboxing, video adjustments) into the swap chain, so they never touch
 //! system memory. Software frames are repacked to NV12 with swscale and uploaded first, then take
 //! the same path. Direct2D then paints the interface into the same back buffer.
+//!
+//! On a screen in HDR mode the swap chain is scRGB instead. HDR10 video goes there tone mapped to
+//! the screen's peak, and the interface and SDR video are drawn as above into a layer that goes
+//! over it at the brightness Windows shows SDR content at.
 
 use std::error::Error;
 use std::ffi::c_void;
@@ -18,6 +22,7 @@ use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_HARDWARE;
 use windows::Win32::Graphics::Direct3D11::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::Win32::Graphics::Dxgi::*;
+use windows::Win32::Graphics::Gdi::{HMONITOR, MONITOR_DEFAULTTONEAREST, MonitorFromWindow};
 use windows::core::Interface;
 
 use crate::ui::{Browse, Layout, Painter, Rect, Scene};
@@ -216,8 +221,27 @@ pub struct Renderer {
     tonemap: Option<crate::tonemap::ToneMap>,
     /// Set once that path failed; such frames then go straight to the target.
     no_wide: std::cell::Cell<bool>,
+    /// Set while the swap chain is scRGB for a screen in HDR mode.
+    hdr: Option<Hdr>,
+    /// The monitor and HDR setting `hdr` was decided for.
+    display: (HMONITOR, bool),
+    /// An HDR10 picture waiting to go under the layer, and where.
+    hdr_video: Option<(ID2D1Image, RECT)>,
     /// Set once an adjustment the GPU can't do has been reported.
     warned: bool,
+}
+
+struct Hdr {
+    screen: crate::hdr::Screen,
+    sdr: crate::tonemap::SdrLayer,
+    /// The interface and SDR video, drawn as on an SDR screen, with alpha.
+    layer: Option<Layer>,
+}
+
+struct Layer {
+    size: (u32, u32),
+    texture: ID3D11Texture2D,
+    view: ID3D11RenderTargetView,
 }
 
 impl Renderer {
@@ -276,6 +300,9 @@ impl Renderer {
                 wide: None,
                 tonemap: None,
                 no_wide: Default::default(),
+                hdr: None,
+                display: (HMONITOR::default(), false),
+                hdr_video: None,
                 warned: false,
             })
         }
@@ -298,6 +325,157 @@ impl Renderer {
         }
         self.size = (width, height);
         Ok(())
+    }
+
+    /// Follows the window's screen in and out of HDR mode; `allowed` is the HDR setting. Cheap
+    /// unless the window changed screens, the setting changed or `force` (a display change).
+    pub fn update_display(&mut self, hwnd: HWND, allowed: bool, force: bool) {
+        let monitor = unsafe { MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST) };
+        if !force && self.display == (monitor, allowed) {
+            return;
+        }
+        self.display = (monitor, allowed);
+        let screen = allowed.then(|| crate::hdr::screen(monitor)).flatten();
+        match (&mut self.hdr, screen) {
+            (Some(hdr), Some(screen)) => hdr.screen = screen,
+            (None, None) => {}
+            _ => {
+                if let Err(e) = self.switch(screen) {
+                    eprintln!("video: can't switch HDR output ({e})");
+                    if screen.is_some() {
+                        _ = self.switch(None);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Remakes the swap chain's buffers in scRGB for an HDR screen, or in sRGB.
+    fn switch(&mut self, screen: Option<crate::hdr::Screen>) -> Result<()> {
+        self.hdr = None;
+        self.hdr_video = None;
+        let (format, space) = match screen {
+            Some(_) => (
+                DXGI_FORMAT_R16G16B16A16_FLOAT,
+                DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709,
+            ),
+            None => (
+                DXGI_FORMAT_B8G8R8A8_UNORM,
+                DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709,
+            ),
+        };
+        unsafe {
+            locked(&self.lock, || self.context.Flush());
+            let (w, h) = self.size;
+            (self.swapchain).ResizeBuffers(0, w, h, format, DXGI_SWAP_CHAIN_FLAG(0))?;
+            (self.swapchain.cast::<IDXGISwapChain3>()?).SetColorSpace1(space)?;
+        }
+        if let Some(screen) = screen {
+            self.hdr = Some(Hdr {
+                screen,
+                sdr: crate::tonemap::SdrLayer::new(&self.d2d)?,
+                layer: None,
+            });
+        }
+        Ok(())
+    }
+
+    /// The HDR layer at the swap chain's size, cleared; None on an SDR screen.
+    fn layer(&mut self) -> Result<Option<ID3D11Texture2D>> {
+        let size = self.size;
+        let Some(hdr) = &mut self.hdr else {
+            return Ok(None);
+        };
+        if hdr.layer.as_ref().is_none_or(|l| l.size != size) {
+            let desc = D3D11_TEXTURE2D_DESC {
+                Width: size.0,
+                Height: size.1,
+                MipLevels: 1,
+                ArraySize: 1,
+                Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                SampleDesc: DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
+                Usage: D3D11_USAGE_DEFAULT,
+                BindFlags: (D3D11_BIND_RENDER_TARGET.0 | D3D11_BIND_SHADER_RESOURCE.0) as u32,
+                ..Default::default()
+            };
+            let (mut texture, mut view) = (None, None);
+            unsafe {
+                self.device
+                    .CreateTexture2D(&desc, None, Some(&mut texture))?;
+                let texture = texture.ok_or("no HDR layer")?;
+                self.device
+                    .CreateRenderTargetView(&texture, None, Some(&mut view))?;
+                let view = view.ok_or("no HDR layer view")?;
+                hdr.layer = Some(Layer {
+                    size,
+                    texture,
+                    view,
+                });
+            }
+        }
+        let layer = hdr.layer.as_ref().unwrap();
+        let ctx = &self.context;
+        locked(&self.lock, || unsafe {
+            ctx.ClearRenderTargetView(&layer.view, &[0.0; 4])
+        });
+        Ok(Some(layer.texture.clone()))
+    }
+
+    /// Puts the picture together on an HDR screen: black, the HDR10 video, then the layer.
+    fn compose(&mut self, backbuffer: &ID3D11Texture2D, layer: &ID3D11Texture2D) -> Result<()> {
+        let Some(hdr) = &self.hdr else {
+            return Ok(());
+        };
+        let video = self.hdr_video.take();
+        unsafe {
+            let target = self.d2d.CreateBitmapFromDxgiSurface(
+                &backbuffer.cast::<IDXGISurface>()?,
+                Some(&bitmap_props(
+                    DXGI_FORMAT_R16G16B16A16_FLOAT,
+                    D2D1_ALPHA_MODE_IGNORE,
+                    96.0,
+                    D2D1_BITMAP_OPTIONS_TARGET | D2D1_BITMAP_OPTIONS_CANNOT_DRAW,
+                )),
+            )?;
+            let ui = self.d2d.CreateBitmapFromDxgiSurface(
+                &layer.cast::<IDXGISurface>()?,
+                Some(&bitmap_props(
+                    DXGI_FORMAT_B8G8R8A8_UNORM,
+                    D2D1_ALPHA_MODE_PREMULTIPLIED,
+                    96.0,
+                    D2D1_BITMAP_OPTIONS_NONE,
+                )),
+            )?;
+            let ui = hdr.sdr.apply(&ui, hdr.screen.white)?;
+            let d2d = &self.d2d;
+            locked(&self.lock, || -> Result<()> {
+                d2d.SetTarget(&target);
+                d2d.SetDpi(96.0, 96.0);
+                d2d.BeginDraw();
+                d2d.Clear(Some(&D2D1_COLOR_F {
+                    r: 0.0,
+                    g: 0.0,
+                    b: 0.0,
+                    a: 1.0,
+                }));
+                if let Some((picture, area)) = &video {
+                    draw_area(d2d, picture, *area);
+                }
+                d2d.DrawImage(
+                    &ui,
+                    None,
+                    None,
+                    D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR,
+                    D2D1_COMPOSITE_MODE_SOURCE_OVER,
+                );
+                let ended = d2d.EndDraw(None, None);
+                d2d.SetTarget(None);
+                Ok(ended?)
+            })
+        }
     }
 
     pub fn library_layout(
@@ -344,9 +522,12 @@ impl Renderer {
             self.theme = theme;
         }
         let backbuffer: ID3D11Texture2D = unsafe { self.swapchain.GetBuffer(0)? };
+        // On an HDR screen video and interface go into the layer first.
+        let layer = self.layer()?;
+        let canvas = layer.as_ref().unwrap_or(&backbuffer);
         let area = to_pixels(scene.layout.video.scaled(dpi / 96.0));
         let picture = match frame {
-            Some(frame) => self.blit(frame, &backbuffer, self.size, area, adjust)?,
+            Some(frame) => self.blit(frame, canvas, self.size, area, adjust, layer.is_some())?,
             None => None,
         };
         let px = 96.0 / dpi;
@@ -354,20 +535,17 @@ impl Renderer {
             Rect::new(r.left as f32, r.top as f32, r.right as f32, r.bottom as f32).scaled(px)
         });
         unsafe {
-            let props = D2D1_BITMAP_PROPERTIES1 {
-                pixelFormat: D2D1_PIXEL_FORMAT {
-                    format: DXGI_FORMAT_B8G8R8A8_UNORM,
-                    alphaMode: D2D1_ALPHA_MODE_IGNORE,
-                },
-                dpiX: dpi,
-                dpiY: dpi,
-                bitmapOptions: D2D1_BITMAP_OPTIONS_TARGET | D2D1_BITMAP_OPTIONS_CANNOT_DRAW,
-                ..Default::default()
+            // The layer keeps alpha, so the HDR10 video shows through where nothing is drawn.
+            let alpha = match layer {
+                Some(_) => D2D1_ALPHA_MODE_PREMULTIPLIED,
+                None => D2D1_ALPHA_MODE_IGNORE,
             };
+            let options = D2D1_BITMAP_OPTIONS_TARGET | D2D1_BITMAP_OPTIONS_CANNOT_DRAW;
+            let props = bitmap_props(DXGI_FORMAT_B8G8R8A8_UNORM, alpha, dpi, options);
             // ponytail: a target bitmap per present; cache one per swap-chain buffer if it shows up in a profile.
             let target = self
                 .d2d
-                .CreateBitmapFromDxgiSurface(&backbuffer.cast::<IDXGISurface>()?, Some(&props))?;
+                .CreateBitmapFromDxgiSurface(&canvas.cast::<IDXGISurface>()?, Some(&props))?;
             let (d2d, painter) = (&self.d2d, &mut self.painter);
             locked(&self.lock, || -> Result<()> {
                 d2d.SetTarget(&target);
@@ -379,6 +557,9 @@ impl Renderer {
                 painted?;
                 Ok(ended?)
             })?;
+            if let Some(layer) = &layer {
+                self.compose(&backbuffer, layer)?;
+            }
             // Sync interval 1 waits for vblank, so frames land without tearing.
             self.swapchain.Present(1, DXGI_PRESENT(0)).ok()?;
         }
@@ -429,7 +610,7 @@ impl Renderer {
             right: w as i32,
             bottom: h as i32,
         };
-        self.blit(frame, &target, (w, h), area, &adjust)?;
+        self.blit(frame, &target, (w, h), area, &adjust, false)?;
         let ctx = &self.context;
         locked(&self.lock, || -> Result<Vec<u8>> {
             unsafe {
@@ -449,8 +630,9 @@ impl Renderer {
         .map(|pixels| (w, h, pixels))
     }
 
-    /// Converts one frame into `area` of `target`, a `size` texture, adjusted and letterboxed.
-    /// Returns where the picture landed.
+    /// Converts one frame into `area` of `target`, a `size` texture, adjusted and letterboxed;
+    /// with `hdr`, HDR10 frames are left in `hdr_video` for the HDR screen instead. Returns where
+    /// the picture landed.
     fn blit(
         &mut self,
         frame: &ff::frame::Video,
@@ -458,6 +640,7 @@ impl Renderer {
         size: (u32, u32),
         area: RECT,
         adjust: &VideoAdjust,
+        hdr: bool,
     ) -> Result<Option<RECT>> {
         let hardware = frame.format() == Pixel::D3D11;
         let (texture, slice, input_space) = if hardware {
@@ -623,11 +806,20 @@ impl Renderer {
         });
         unsafe { ManuallyDrop::drop(&mut streams[0].pInputSurface) };
         result?;
-        if wide.is_some()
-            && let Err(e) = self.draw_wide(target, area, hdr_peak(frame))
-        {
-            self.give_up_wide(&*e);
-            return Err(e);
+        if wide.is_some() {
+            let screen = self.hdr.as_ref().filter(|_| hdr).map(|h| h.screen.peak);
+            let drawn = self.wide_image(hdr_peak(frame), screen).and_then(|image| {
+                if screen.is_some() {
+                    self.hdr_video = Some((image, area));
+                    Ok(())
+                } else {
+                    self.draw_wide(target, area, &image)
+                }
+            });
+            if let Err(e) = drawn {
+                self.give_up_wide(&*e);
+                return Err(e);
+            }
         }
         Ok(Some(dest))
     }
@@ -664,51 +856,34 @@ impl Renderer {
         self.wide.as_ref().map(|w| w.texture.clone())
     }
 
-    /// Draws the area of the HDR10 texture, whose brightest light is `peak` nits, through the
-    /// colour effects into `target`.
-    fn draw_wide(&self, target: &ID3D11Texture2D, area: RECT, peak: f32) -> Result<()> {
+    /// The HDR10 texture, whose brightest light is `peak` nits, through the colour effects: for
+    /// an HDR `screen` that many nits bright, else for SDR.
+    fn wide_image(&self, peak: f32, screen: Option<f32>) -> Result<ID2D1Image> {
         let (Some(wide), Some(tonemap)) = (&self.wide, &self.tonemap) else {
-            return Ok(());
+            return Err("no HDR10 texture".into());
         };
-        let image = tonemap.apply(&wide.bitmap, peak)?;
+        Ok(tonemap.apply(&wide.bitmap, peak, screen)?)
+    }
+
+    /// Draws the area of the tone mapped HDR10 `image` into `target`.
+    fn draw_wide(&self, target: &ID3D11Texture2D, area: RECT, image: &ID2D1Image) -> Result<()> {
         unsafe {
-            let props = D2D1_BITMAP_PROPERTIES1 {
-                pixelFormat: D2D1_PIXEL_FORMAT {
-                    format: DXGI_FORMAT_B8G8R8A8_UNORM,
-                    alphaMode: D2D1_ALPHA_MODE_IGNORE,
-                },
-                dpiX: 96.0,
-                dpiY: 96.0,
-                bitmapOptions: D2D1_BITMAP_OPTIONS_TARGET | D2D1_BITMAP_OPTIONS_CANNOT_DRAW,
-                ..Default::default()
-            };
+            let props = bitmap_props(
+                DXGI_FORMAT_B8G8R8A8_UNORM,
+                D2D1_ALPHA_MODE_IGNORE,
+                96.0,
+                D2D1_BITMAP_OPTIONS_TARGET | D2D1_BITMAP_OPTIONS_CANNOT_DRAW,
+            );
             let out = self
                 .d2d
                 .CreateBitmapFromDxgiSurface(&target.cast::<IDXGISurface>()?, Some(&props))?;
-            let rect = D2D_RECT_F {
-                left: area.left as f32,
-                top: area.top as f32,
-                right: area.right as f32,
-                bottom: area.bottom as f32,
-            };
             let d2d = &self.d2d;
             locked(&self.lock, || -> Result<()> {
                 d2d.SetTarget(&out);
                 // Pixels: the texture and the target are the same size.
                 d2d.SetDpi(96.0, 96.0);
                 d2d.BeginDraw();
-                // The area of the image lands at the same place in the target.
-                let corner = windows_numerics::Vector2 {
-                    X: rect.left,
-                    Y: rect.top,
-                };
-                d2d.DrawImage(
-                    &image,
-                    Some(&corner),
-                    Some(&rect),
-                    D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR,
-                    D2D1_COMPOSITE_MODE_SOURCE_COPY,
-                );
+                draw_area(d2d, image, area);
                 let ended = d2d.EndDraw(None, None);
                 d2d.SetTarget(None);
                 Ok(ended?)
@@ -873,6 +1048,47 @@ pub fn is_bt709(frame: &ff::frame::Video) -> bool {
         ff::color::Space::Unspecified => frame.height() >= 720,
         _ => false,
     }
+}
+
+fn bitmap_props(
+    format: DXGI_FORMAT,
+    alpha: D2D1_ALPHA_MODE,
+    dpi: f32,
+    options: D2D1_BITMAP_OPTIONS,
+) -> D2D1_BITMAP_PROPERTIES1 {
+    D2D1_BITMAP_PROPERTIES1 {
+        pixelFormat: D2D1_PIXEL_FORMAT {
+            format,
+            alphaMode: alpha,
+        },
+        dpiX: dpi,
+        dpiY: dpi,
+        bitmapOptions: options,
+        ..Default::default()
+    }
+}
+
+/// Draws `area` of `image` at the same place in the target, which is as large as the image.
+unsafe fn draw_area(d2d: &ID2D1DeviceContext5, image: &ID2D1Image, area: RECT) {
+    let rect = D2D_RECT_F {
+        left: area.left as f32,
+        top: area.top as f32,
+        right: area.right as f32,
+        bottom: area.bottom as f32,
+    };
+    let corner = windows_numerics::Vector2 {
+        X: rect.left,
+        Y: rect.top,
+    };
+    unsafe {
+        d2d.DrawImage(
+            image,
+            Some(&corner),
+            Some(&rect),
+            D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR,
+            D2D1_COMPOSITE_MODE_SOURCE_COPY,
+        )
+    };
 }
 
 /// The 10-bit texture HDR10 frames are converted into, still PQ-encoded in BT.2020, and the

@@ -210,12 +210,6 @@ impl Item {
         }
     }
 
-    /// Whether myvlc can do it; the palette dims the others and won't let them go.
-    // ponytail: HDR needs output to an HDR screen.
-    pub fn supported(self) -> bool {
-        self != Item::Hdr
-    }
-
     /// Spacers and dividers can go in as often as wanted; the palette always offers them.
     pub fn repeats(self) -> bool {
         matches!(self, Item::Spacer | Item::Divider)

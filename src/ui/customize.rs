@@ -225,13 +225,13 @@ impl Ui {
         }
     }
 
-    /// A press on an item starts a drag; the dimmed ones stay put.
+    /// A press on an item starts a drag.
     pub(super) fn customize_down(&mut self, target: Target, x: f32, y: f32) {
         let Some(st) = self.customize.as_mut() else {
             return;
         };
         let (item, from) = match target {
-            Target::Palette(item) if item.supported() => (item, None),
+            Target::Palette(item) => (item, None),
             Target::Placed(z, i) => match st.draft.zone(z).get(i) {
                 Some(item) => (*item, Some((z, i))),
                 None => return,
@@ -307,8 +307,6 @@ pub(super) struct Resources {
     help_fg: ID2D1SolidColorBrush,
     label_fg: ID2D1SolidColorBrush,
     dash: ID2D1SolidColorBrush,
-    /// Over items that can't be picked, and the item being dragged.
-    dim: ID2D1SolidColorBrush,
     dashes: ID2D1StrokeStyle,
     title: IDWriteTextFormat,
     help: IDWriteTextFormat,
@@ -351,7 +349,6 @@ impl Resources {
             help_fg: brush(FG_HELP, 1.0)?,
             label_fg: brush(FG_LABEL, 1.0)?,
             dash: brush(DASH, 1.0)?,
-            dim: brush(BG_BODY, 0.6)?,
             dashes,
             title: format(16.0, DWRITE_TEXT_ALIGNMENT_LEADING)?,
             help: format(14.0, DWRITE_TEXT_ALIGNMENT_LEADING)?,
@@ -422,7 +419,7 @@ impl Painter {
             for (item, cell) in &g.cells {
                 let (cx, cy) = ((cell.l + cell.r) / 2.0, cell.t + 24.0);
                 let icon_box = Rect::around(cx, cy, ICON_BOX);
-                if item.supported() && hover(Target::Palette(*item)) {
+                if hover(Target::Palette(*item)) {
                     rt.FillRoundedRectangle(&rounded(icon_box, 4.0), &self.hover);
                 }
                 rt.DrawRoundedRectangle(&rounded(icon_box, 4.0), &r.dash, 1.0, &r.dashes);
@@ -438,9 +435,6 @@ impl Painter {
                     D2D1_DRAW_TEXT_OPTIONS_CLIP,
                     DWRITE_MEASURING_MODE_NATURAL,
                 );
-                if !item.supported() {
-                    rt.FillRectangle(&cell.d2d(), &r.dim);
-                }
             }
 
             let (cancel, save) = (cancel(g.h), save(g.h));
@@ -535,9 +529,7 @@ mod tests {
         ui.customize_down(Target::Placed(Zone::Left, 2), 0.0, 0.0);
         ui.customize_drop(960.0, 500.0);
         assert_eq!(ui.customize.as_ref().unwrap().draft.left.len(), 3);
-        // Save hands the draft over; dimmed items don't drag.
-        ui.customize_down(Target::Palette(Item::Hdr), 0.0, 0.0);
-        assert!(ui.customize.as_ref().unwrap().drag.is_none());
+        // Save hands the draft over.
         let Some(Action::SaveToolbar(t)) = ui.customize_click(Target::Save) else {
             panic!("save keeps the draft");
         };

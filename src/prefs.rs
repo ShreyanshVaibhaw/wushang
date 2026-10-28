@@ -187,6 +187,8 @@ pub struct Prefs {
     pub sub_timeline: bool,
     /// Index into `VISUALIZERS`.
     pub visualizer: usize,
+    /// HDR video in HDR on a screen in HDR mode; off tone maps it to SDR there too.
+    pub hdr: bool,
     // Recording. Indices into `SNAP_DIR`, `SNAP_FORMAT`, `RECORD_DIR` and `RECORD_FORMAT`.
     pub snap_dir: usize,
     pub snap_format: usize,
@@ -257,6 +259,7 @@ impl Default for Prefs {
             sub_styles: true,
             sub_timeline: false,
             visualizer: 0,
+            hdr: true,
             snap_dir: 0,
             snap_format: 0,
             record_dir: 0,
@@ -341,6 +344,7 @@ impl Prefs {
         line("sub_styles", self.sub_styles.to_string());
         line("sub_timeline", self.sub_timeline.to_string());
         line("visualizer", self.visualizer.to_string());
+        line("hdr", self.hdr.to_string());
         line("snap_dir", key(SNAP_DIR, self.snap_dir).into());
         line("snap_format", key(SNAP_FORMAT, self.snap_format).into());
         line("record_dir", key(RECORD_DIR, self.record_dir).into());
@@ -501,6 +505,7 @@ fn parse(text: &str) -> Prefs {
             "sub_font" if FONTS.contains(&v) => p.sub_font = v.into(),
             "sub_styles" => flag(&mut p.sub_styles),
             "sub_timeline" => flag(&mut p.sub_timeline),
+            "hdr" => flag(&mut p.hdr),
             "snap_dir" => choice(&mut p.snap_dir, SNAP_DIR),
             "snap_format" => choice(&mut p.snap_format, SNAP_FORMAT),
             "record_dir" => choice(&mut p.record_dir, RECORD_DIR),
@@ -585,6 +590,7 @@ mod tests {
             sub_styles: false,
             sub_timeline: true,
             visualizer: 2,
+            hdr: false,
             snap_dir: 2,
             snap_format: 1,
             record_dir: 1,

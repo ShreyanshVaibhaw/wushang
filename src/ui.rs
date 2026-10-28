@@ -1888,6 +1888,7 @@ impl Painter {
                         ToolItem::Shuffle => s.shuffle,
                         ToolItem::Favorite => s.favorite,
                         ToolItem::Record => s.recording,
+                        ToolItem::Hdr => s.panel.is_some_and(|p| p.hdr),
                         ToolItem::RightSidebar => l.queue.open,
                         _ => false,
                     };

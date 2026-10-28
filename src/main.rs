@@ -13,6 +13,7 @@ mod codepage;
 mod convert;
 mod disc;
 mod dsp;
+mod hdr;
 mod library;
 mod net;
 mod nv12;
@@ -101,6 +102,8 @@ static DURATION: AtomicU64 = AtomicU64::new(0);
 /// A file dropped on the window; the render loop opens it.
 static OPEN: Mutex<Option<PathBuf>> = Mutex::new(None);
 static RESIZED: AtomicBool = AtomicBool::new(false);
+/// Screens changed (HDR mode, brightness, layout) or the window moved: check for HDR again.
+static DISPLAY_CHANGED: AtomicBool = AtomicBool::new(false);
 /// Window style and placement saved while in borderless fullscreen.
 static WINDOWED: Mutex<Option<(isize, WINDOWPLACEMENT)>> = Mutex::new(None);
 /// The full window's placement, saved while it is the mini player.
@@ -773,6 +776,7 @@ impl App {
             visualizer: p.visualizer,
             sub_timeline: p.sub_timeline,
             sub_styles: p.sub_styles,
+            hdr: p.hdr,
             sub_speed: self.sub_speed as f32,
             sub_duration: self.sub_duration as f32,
             sub_font: p.sub_font,
@@ -871,6 +875,7 @@ impl App {
             PanelAction::SetReverse(on) => self.set_reverse(on),
             PanelAction::SetVisualizer(i) => self.change_prefs(hwnd, |p| p.visualizer = i),
             PanelAction::SetSubTimeline(on) => self.change_prefs(hwnd, |p| p.sub_timeline = on),
+            PanelAction::SetHdr(on) => self.change_prefs(hwnd, |p| p.hdr = on),
             PanelAction::SetResolution(i) => {
                 let i = i.or_else(|| ui::panels::best_video(&self.panel_data().video_sizes));
                 if i.is_some() {
@@ -1754,6 +1759,8 @@ fn run() -> Result<(), Box<dyn Error>> {
             let (w, h) = client_size(hwnd);
             renderer.resize(w, h)?;
         }
+        let hdr = PREFS.with_borrow(|p| p.hdr);
+        renderer.update_display(hwnd, hdr, DISPLAY_CHANGED.swap(false, Relaxed));
 
         app.step_reverse();
         let serial = shared.serial.load(Relaxed);
@@ -3275,12 +3282,19 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         WM_SIZE => RESIZED.store(true, Relaxed),
         // The render loop can't run while Windows moves or sizes the window; a timer stands in.
         WM_ENTERSIZEMOVE => unsafe { _ = SetTimer(Some(hwnd), MODAL_TIMER, 1, None) },
-        WM_EXITSIZEMOVE => unsafe { _ = KillTimer(Some(hwnd), MODAL_TIMER) },
+        WM_EXITSIZEMOVE => {
+            unsafe { _ = KillTimer(Some(hwnd), MODAL_TIMER) };
+            DISPLAY_CHANGED.store(true, Relaxed);
+        }
+        WM_DISPLAYCHANGE => DISPLAY_CHANGED.store(true, Relaxed),
         WM_TIMER if wparam.0 == MODAL_TIMER => modal_frame(),
         // Windows switched between light and dark apps.
-        WM_SETTINGCHANGE if prefs().theme == 2 => {
-            ui::theme::set(theme_of(&prefs()));
-            UI.with_borrow_mut(|ui| ui.dirty = true);
+        WM_SETTINGCHANGE => {
+            DISPLAY_CHANGED.store(true, Relaxed);
+            if prefs().theme == 2 {
+                ui::theme::set(theme_of(&prefs()));
+                UI.with_borrow_mut(|ui| ui.dirty = true);
+            }
         }
         WM_MOUSEMOVE | WM_NCMOUSEMOVE => {
             let (mut x, mut y) = mouse_position(lparam);
@@ -3620,6 +3634,10 @@ fn use_tool(app: &mut App, hwnd: HWND, item: ui::ToolItem) {
         T::MiniPlayer => MINI_REQUEST.set(Some(None)),
         T::Zoom => {
             PANEL_ACTIONS.with_borrow_mut(|p| p.push(PanelAction::SetZoom((app.zoom + 1) % 3)))
+        }
+        T::Hdr => {
+            let on = PREFS.with_borrow(|p| p.hdr);
+            PANEL_ACTIONS.with_borrow_mut(|p| p.push(PanelAction::SetHdr(!on)))
         }
         // The speed slider is on the settings popup's Playback tab.
         T::Speed => UI.with_borrow_mut(|ui| {
