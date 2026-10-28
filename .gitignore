@@ -6,5 +6,6 @@
 !/testdata/test_subs.mkv
 !/testdata/test_chapters.mkv
 !/testdata/tracks.srt
+!/testdata/styled.ass
 /.claude
 !/testdata/test_zlib_subs.mkv

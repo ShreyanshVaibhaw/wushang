@@ -1,5 +1,7 @@
 # Build inputs for ffmpeg-sys-next: FFmpeg headers/import libs and libclang for bindgen.
-# The FFmpeg here is the slim build from scripts/build-ffmpeg.sh.
+# The FFmpeg here is the slim build from scripts/build-ffmpeg.sh, and libass (loaded at run time,
+# copied next to the exe by build.rs) comes from scripts/build-libass.sh.
 [env]
 FFMPEG_DIR = 'D:\tools\ffmpeg-9.0.2-myvlc'
+LIBASS_DIR = 'D:\tools\libass-0.17.3'
 LIBCLANG_PATH = 'D:\tools\libclang-18.1.1'

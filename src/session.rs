@@ -164,6 +164,8 @@ pub struct Session {
     audio_track: Option<Decoder>,
     subtitle_track: Option<(usize, Arc<PacketQueue>)>,
     initial_subtitles: Option<SubtitleStream>,
+    /// Fonts attached to the file (Matroska keeps a release's fonts this way), by file name.
+    fonts: Vec<(String, Vec<u8>)>,
     /// Set on drop, so a network read that hangs gives up and the demuxer can be joined.
     cancel: Arc<AtomicBool>,
     /// Ask the demuxer to record or stream out, and hear back when that ends.
@@ -213,8 +215,13 @@ impl Session {
         let mut titles: [Vec<Option<String>>; 3] = Default::default();
         let mut codecs = HashMap::new();
         let mut forced_subtitles = None;
+        let mut fonts = Vec::new();
         for stream in input.streams() {
             let parameters = stream.parameters();
+            if parameters.medium() == ff::media::Type::Attachment {
+                fonts.extend(attached_font(&stream));
+                continue;
+            }
             let disposition = stream.disposition();
             let kind = match parameters.medium() {
                 // Cover art is a one-picture video stream; it is not a track to watch.
@@ -332,6 +339,7 @@ impl Session {
             audio_track: None,
             subtitle_track: None,
             initial_subtitles: None,
+            fonts,
             cancel,
             record: record::Control::default(),
             stream: record::Control::default(),
@@ -659,6 +667,11 @@ impl Session {
         Ok(None)
     }
 
+    /// The fonts attached to the file, handed out once.
+    pub fn take_fonts(&mut self) -> Vec<(String, Vec<u8>)> {
+        std::mem::take(&mut self.fonts)
+    }
+
     /// The subtitle track opened with the file (a default and forced one), handed out once.
     pub fn take_initial_subtitles(&mut self) -> Option<SubtitleStream> {
         self.initial_subtitles.take()
@@ -696,6 +709,27 @@ impl Session {
     pub fn chapters(&self) -> &[(f64, String)] {
         &self.chapters
     }
+}
+
+/// An attachment that is a font: its file name and bytes.
+fn attached_font(stream: &ff::Stream) -> Option<(String, Vec<u8>)> {
+    let metadata = stream.metadata();
+    let name = metadata.get("filename").unwrap_or_default().to_owned();
+    let mime = metadata
+        .get("mimetype")
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let lower = name.to_ascii_lowercase();
+    let id = stream.parameters().id();
+    let font = matches!(id, ff::codec::Id::TTF | ff::codec::Id::OTF)
+        || mime.contains("font")
+        || [".ttf", ".otf", ".ttc"].iter().any(|e| lower.ends_with(e));
+    let p = unsafe { &*stream.parameters().as_ptr() };
+    if !font || p.extradata.is_null() || p.extradata_size <= 0 {
+        return None;
+    }
+    let data = unsafe { std::slice::from_raw_parts(p.extradata, p.extradata_size as usize) };
+    Some((name, data.to_vec()))
 }
 
 /// The container's chapters with their "title" tag, else "Chapter N", earliest first.

@@ -75,6 +75,8 @@ The playlist button opens the queue panel from the design, in the settings panel
 The audio and subtitle buttons open the track popup from the design: video, audio and subtitle tracks (with names like "English" from the file's language tags), the output device, and external subtitle files, with + to load one by hand.
 "Add Audio File..." in the player menu's Audio submenu plays another file's sound with the video, like a dub or commentary kept beside it; it joins the audio track list under its file name and follows every seek.
 A subtitle file with the same name as the video, next to it or in a "Subs" folder, loads on its own, as in VLC.
+ASS and SSA subtitles, in the file or beside it, are drawn by libass as VLC and mpv draw them: their positions, fonts, colours, borders, shadows, rotation, karaoke and animation, with the fonts a Matroska file carries for them.
+Without `libass-9.dll` next to myvlc.exe they fall back to plain text like every other format.
 Old subtitle files in a Windows code page instead of UTF-8 are read in the right one: a language tag such as `film.ru.srt` names it, and otherwise myvlc tries the Western, Central European, Cyrillic, Greek, Turkish, Hebrew, Arabic, Baltic, Japanese, Chinese and Korean code pages and keeps the one whose text reads like real words.
 The gear opens the settings panel, with four tabs:
 
@@ -245,6 +247,19 @@ x86 assembly stays on, so software decoding is as fast as in a full build.
 Media Foundation makes `avcodec-63.dll` import `mfplat` and `ole32`, and capture makes `avdevice-63.dll` import `GDI32`, `USER32`, `OLEAUT32` and `SHLWAPI`.
 Apart from that, the DLLs import only `KERNEL32`, `msvcrt` and `bcrypt`.
 
+### Building libass
+
+[scripts/build-libass.sh](scripts/build-libass.sh) cross-compiles libass 0.17.3 the same way, with FreeType 2.13.3, FriBidi 1.0.16 and HarfBuzz 10.0.1 linked into one `libass-9.dll` (2.4 MB) that imports only `KERNEL32`, `USER32`, `GDI32` and `msvcrt`.
+Fonts come from Windows through DirectWrite, so there is no fontconfig.
+It needs `g++-mingw-w64-x86-64-win32` as well, since HarfBuzz is C++; the C++ runtime is linked in.
+The release tarballs go unpacked in `SRC`; libass's and FreeType's are GPG-signed by their maintainers.
+
+```bash
+SRC=/mnt/d/tools/src/ass PREFIX=/mnt/d/tools/libass-0.17.3 bash scripts/build-libass.sh
+```
+
+[.cargo/config.toml](.cargo/config.toml) names the folder as `LIBASS_DIR`, and [build.rs](build.rs) copies the DLL next to the exe; myvlc loads it at run time, so a build without it still runs.
+
 ## How it works
 
 ```text
@@ -273,6 +288,7 @@ The library page ([src/ui/browse.rs](src/ui/browse.rs)) is painted inside a Dire
 | audio output (mmdevice) | cpal on WASAPI shared mode | [src/audio.rs](src/audio.rs) |
 | audio filters (scaletempo, equalizer, mono/channel remap) | WSOLA speed, VLC's equalizer, stereo modes | [src/dsp.rs](src/dsp.rs) |
 | subtitle decoders and renderer (subsdec, freetype) | libavcodec subtitle decoders, Direct2D captions | [src/subs.rs](src/subs.rs), [src/captions.rs](src/captions.rs) |
+| libass_plugin | libass, loaded at run time | [src/ass.rs](src/ass.rs) |
 | video filters (transform, adjust, crop) | the D3D11 video processor's rotation, mirror and filters | [src/render.rs](src/render.rs) |
 | clock, late-picture dropping | audio master clock, skip to the newest due frame | [src/main.rs](src/main.rs) |
 | Qt interface | Direct2D + DirectWrite interface in a borderless Win32 window | [src/ui.rs](src/ui.rs), [src/ui/browse.rs](src/ui/browse.rs), [src/main.rs](src/main.rs) |
@@ -375,7 +391,7 @@ Opening the audio device took 1.2 to 3.5 s in these runs, and playback starts mo
 
 Each of these is marked with a `ponytail:` comment in the code, along with the upgrade path.
 
-- ASS and SSA subtitles show as plain centred text: positioning, colours, style-sheet italics and karaoke are ignored (libass would add them).
+- libass draws at the video's stored size, so on anamorphic video (non-square pixels) styled subtitles stretch with the picture.
 - Without a language tag, traditional Chinese (Big5) subtitles read as simplified (GBK), and Turkish or Baltic ones as Western, since the same bytes are valid in both.
 - Contrast and saturation go up to 2x, like VLC's adjust filter; brightness and hue use the GPU's full range.
 - HDR10 is always tone mapped to SDR, even on an HDR screen; there is no HDR output.

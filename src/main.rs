@@ -4,6 +4,7 @@
 //! demux thread -> video and audio decoder threads -> D3D11 renderer + Direct2D UI (this thread)
 //!                                                 -> WASAPI callback (drives the clock)
 
+mod ass;
 mod audio;
 mod bookmarks;
 mod captions;
@@ -532,6 +533,10 @@ impl App {
         let Some(session) = self.session.as_mut() else {
             return;
         };
+        // Fonts the file carries, which its styled subtitles ask for by name.
+        for (name, data) in session.take_fonts() {
+            ass::add_font(&name, &data);
+        }
         let initial = session.take_initial_subtitles();
         self.external = subs::find_external(&session.path)
             .into_iter()
@@ -546,12 +551,22 @@ impl App {
         }
     }
 
+    /// The canvas styled (ASS) subtitles are drawn on: the video's size, for audio a 1080p one.
+    // ponytail: anamorphic video (non-square pixels) draws them stretched with the picture;
+    // give libass the display size and the stored size apart if that shows.
+    fn subtitle_canvas(&self) -> (u32, u32) {
+        (self.session.as_ref())
+            .and_then(|s| s.video_size)
+            .unwrap_or((1920, 1080))
+    }
+
     fn decode_embedded(&mut self, stream: session::SubtitleStream) {
         let decoder = subs::spawn_embedded(
             stream.parameters,
             stream.time_base,
             stream.packets,
             self.shared.clone(),
+            self.subtitle_canvas(),
         );
         if let Some((old, _)) = self.embedded.replace(decoder) {
             _ = old.join();
@@ -560,11 +575,12 @@ impl App {
 
     fn show_external(&mut self, i: Option<usize>) {
         self.external_selected = None;
+        let canvas = self.subtitle_canvas();
         let Some((path, cues)) = i.and_then(|i| self.external.get_mut(i)) else {
             return;
         };
         if cues.is_none() {
-            match subs::load_external(path) {
+            match subs::load_external(path, canvas) {
                 Ok(c) => *cues = Some(c),
                 Err(e) => {
                     eprintln!("subtitles: {e}");

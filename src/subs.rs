@@ -61,9 +61,13 @@ const DEFAULT_DURATION: f64 = 5.0;
 /// one, which the demuxer delivers ahead of time, so they get a much longer guess.
 const PGS_HOLD: f64 = 60.0;
 
-/// A subtitle track's cues, filled by a decoder thread or loaded at once from a file.
+/// A subtitle track's cues, filled by a decoder thread or loaded at once from a file. An ASS or
+/// SSA track goes to libass instead, which draws each moment whole.
 #[derive(Default)]
-pub struct Cues(Mutex<Vec<Entry>>);
+pub struct Cues {
+    list: Mutex<Vec<Entry>>,
+    ass: Option<crate::ass::Track>,
+}
 
 struct Entry {
     cue: Cue,
@@ -73,9 +77,26 @@ struct Entry {
 }
 
 impl Cues {
-    /// Cues whose `[start, end)` contains `t`, earliest first.
+    /// Cues whose `[start, end)` contains `t`, earliest first. For libass, one picture of the
+    /// moment, its start the time it was first drawn for.
     pub fn active(&self, t: f64) -> Vec<Cue> {
-        let cues = self.0.lock().unwrap();
+        if let Some(track) = &self.ass {
+            let (width, height) = track.size();
+            return track
+                .render(t)
+                .map(|(at, picture)| Cue {
+                    start: at,
+                    end: f64::INFINITY,
+                    content: CueContent::Bitmap {
+                        width,
+                        height,
+                        rects: vec![picture],
+                    },
+                })
+                .into_iter()
+                .collect();
+        }
+        let cues = self.list.lock().unwrap();
         let started = cues.partition_point(|e| e.cue.start <= t);
         cues[..started]
             .iter()
@@ -85,17 +106,17 @@ impl Cues {
     }
 
     pub fn clear(&self) {
-        self.0.lock().unwrap().clear();
+        self.list.lock().unwrap().clear();
     }
 
     #[cfg(test)]
     pub fn len(&self) -> usize {
-        self.0.lock().unwrap().len()
+        self.list.lock().unwrap().len()
     }
 
     /// Adds a cue in start order. With `open`, its end is only a guess.
     fn insert(&self, mut cue: Cue, open: bool) {
-        let mut cues = self.0.lock().unwrap();
+        let mut cues = self.list.lock().unwrap();
         let at = cues.partition_point(|e| e.cue.start <= cue.start);
         if open && let Some(next) = cues.get(at) {
             cue.end = cue.end.min(next.cue.start).max(cue.start);
@@ -106,7 +127,7 @@ impl Cues {
 
     /// An empty subtitle at `t`: whatever is showing with a guessed end stops there.
     fn close(&self, t: f64) {
-        let mut cues = self.0.lock().unwrap();
+        let mut cues = self.list.lock().unwrap();
         let at = cues.partition_point(|e| e.cue.start < t);
         close_open(&mut cues[..at], t);
     }
@@ -127,15 +148,34 @@ fn close_open(earlier: &mut [Entry], t: f64) {
     }
 }
 
+/// Whether libass draws a track of codec `id`.
+fn styled(id: ff::codec::Id) -> bool {
+    matches!(id, ff::codec::Id::ASS | ff::codec::Id::SSA) && crate::ass::available()
+}
+
 /// Decodes an embedded subtitle stream's packets as the demuxer routes them. Stops when
 /// `shared.quitting()`. On `Msg::Flush` (seek) it clears the cues, since the demuxer sends the
-/// packets after the new position again.
+/// packets after the new position again. ASS and SSA go to libass, drawn on a `canvas` the
+/// video's size.
 pub fn spawn_embedded(
     parameters: ff::codec::Parameters,
     time_base: f64,
     packets: Arc<PacketQueue>,
     shared: Arc<Shared>,
+    canvas: (u32, u32),
 ) -> (JoinHandle<()>, Arc<Cues>) {
+    if styled(parameters.id()) {
+        let header = unsafe {
+            let p = &*parameters.as_ptr();
+            match p.extradata.is_null() {
+                true => &[][..],
+                false => std::slice::from_raw_parts(p.extradata, p.extradata_size as usize),
+            }
+        };
+        if let Some(track) = crate::ass::Track::new(header, canvas) {
+            return spawn_styled(track, time_base, packets, shared);
+        }
+    }
     let cues = Arc::new(Cues::default());
     // Open here rather than on the thread: the parameters point into the demuxer's live stream.
     let mut decoder = Decoder::open(parameters, time_base)
@@ -164,9 +204,61 @@ pub fn spawn_embedded(
     (handle, cues)
 }
 
+/// Hands an ASS track's packets to libass as the demuxer routes them. Each is one event in
+/// Matroska's layout, and libass skips one it has, so seeks need nothing.
+fn spawn_styled(
+    track: crate::ass::Track,
+    time_base: f64,
+    packets: Arc<PacketQueue>,
+    shared: Arc<Shared>,
+) -> (JoinHandle<()>, Arc<Cues>) {
+    let cues = Arc::new(Cues {
+        ass: Some(track),
+        ..Default::default()
+    });
+    let out = cues.clone();
+    let handle = thread::spawn(move || {
+        let track = out.ass.as_ref().unwrap();
+        while !shared.quitting() && !packets.closed() {
+            if let Some(Msg::Packet(p)) = packets.pop()
+                && let (Some(data), Some(pts)) = (p.data(), p.pts())
+            {
+                let duration = p.duration() as f64 * time_base;
+                track.add_event(data, pts as f64 * time_base, duration);
+            }
+        }
+    });
+    (handle, cues)
+}
+
 /// Reads a whole external subtitle file (.srt, .ass, .ssa, .vtt, .sub, .idx, .smi, .sup) with
-/// libavformat and decodes every cue up front.
-pub fn load_external(path: &Path) -> Result<Arc<Cues>, String> {
+/// libavformat and decodes every cue up front. An .ass or .ssa file goes to libass whole, drawn on
+/// a `canvas` the video's size.
+pub fn load_external(path: &Path, canvas: (u32, u32)) -> Result<Arc<Cues>, String> {
+    let ext = path.extension().map(|e| e.to_string_lossy().to_lowercase());
+    if matches!(ext.as_deref(), Some("ass" | "ssa"))
+        && crate::ass::available()
+        && let Ok(bytes) = std::fs::read(path)
+    {
+        // libass reads UTF-8; old .ssa files are often in a Windows code page.
+        let text = match std::str::from_utf8(&bytes) {
+            Ok(_) => bytes,
+            Err(_) => {
+                let language = crate::codepage::language_of(path);
+                let cp = crate::codepage::detect(&bytes, language.as_deref());
+                match crate::codepage::decode(&bytes, cp, false) {
+                    Some(text) => text.into_bytes(),
+                    None => bytes,
+                }
+            }
+        };
+        if let Some(track) = crate::ass::Track::from_file(&text, canvas) {
+            return Ok(Arc::new(Cues {
+                ass: Some(track),
+                ..Default::default()
+            }));
+        }
+    }
     let mut input = ff::format::input(path).map_err(|e| format!("cannot open {path:?}: {e}"))?;
     let stream = input
         .streams()
@@ -480,9 +572,8 @@ fn parse_ass_event(event: &str) -> Vec<Vec<Span>> {
 
 /// Strips `{...}` override blocks, keeping `\i` and `\b` (and `\r`, which resets them). `\N` and
 /// `\n` break lines, `\h` is a space, and vector drawings (`\p1` ... `\p0`) are dropped.
-/// ponytail: style-sheet italics/bold, positioning (\pos, \an, margins), colours and karaoke are
-/// ignored; every line is centred at the bottom. Hand the events to libass if typeset anime
-/// subtitles matter.
+/// Real ASS and SSA tracks go to libass (`ass.rs`); this reads the ASS events libavcodec makes
+/// of every other text format, and ASS itself when libass isn't there.
 fn parse_ass_text(text: &str) -> Vec<Vec<Span>> {
     let mut lines = vec![Vec::new()];
     let (mut italic, mut bold, mut drawing) = (false, false, false);
@@ -675,7 +766,7 @@ mod tests {
         // "Привет, мир!" and "До свидания." in Windows-1251.
         let srt = b"1\r\n00:00:01,000 --> 00:00:02,000\r\n\xcf\xf0\xe8\xe2\xe5\xf2, \xec\xe8\xf0!\r\n\r\n2\r\n00:00:03,000 --> 00:00:04,000\r\n\xc4\xee \xf1\xe2\xe8\xe4\xe0\xed\xe8\xff.\r\n\r\n";
         std::fs::write(&path, srt).unwrap();
-        let cues = load_external(&path).unwrap();
+        let cues = load_external(&path, (1920, 1080)).unwrap();
         assert_eq!(
             text(&cues.active(1.5)[0]),
             &vec![vec![span("Привет, мир!", false, false)]]
@@ -693,7 +784,7 @@ mod tests {
         // Windows-1252 bytes (0x92 is a curly apostrophe), as many old .srt files are.
         let srt = b"1\r\n00:00:01,000 --> 00:00:02,500\r\nIt\x92s <i>fine</i>\r\n\r\n2\r\n00:00:03,000 --> 00:00:04,000\r\nTwo\r\n<b>lines</b>\r\n\r\n";
         std::fs::write(&path, srt).unwrap();
-        let cues = load_external(&path).unwrap();
+        let cues = load_external(&path, (1920, 1080)).unwrap();
         assert_eq!(cues.len(), 2);
         let first = &cues.active(1.0)[0];
         assert!(
@@ -733,28 +824,36 @@ mod tests {
             Dialogue: 0,0:00:05.50,0:00:07.00,Default,,0,0,0,,Later, with commas\n\
             Dialogue: 0,0:00:01.25,0:00:03.00,Default,,0,0,0,,{\\i1}Leaning{\\i0} in\\Nnext line\n";
         std::fs::write(&path, ass).unwrap();
-        let cues = load_external(&path).unwrap();
-        assert_eq!(cues.len(), 2);
-        let first = &cues.active(2.0)[0];
-        assert!(
-            close(first.start, 1.25) && close(first.end, 3.0),
-            "{first:?}"
-        );
+        // libass draws the file, one picture per moment on the video-sized canvas.
+        let cues = load_external(&path, (1920, 1080)).unwrap();
+        let shown = |t: f64| match cues.active(t).as_slice() {
+            [
+                Cue {
+                    content:
+                        CueContent::Bitmap {
+                            width: 1920,
+                            height: 1080,
+                            rects,
+                        },
+                    ..
+                },
+            ] => rects.len() == 1,
+            [] => false,
+            other => panic!("{other:?}"),
+        };
+        assert!(!shown(1.0) && shown(2.0) && !shown(4.0) && shown(6.0) && !shown(7.5));
+
+        // Without libass, and for every other text format, the events are read as text.
         assert_eq!(
-            text(first),
-            &vec![
+            parse_ass_event("0,0,Default,,0,0,0,,{\\i1}Leaning{\\i0} in\\Nnext line"),
+            vec![
                 vec![span("Leaning", true, false), span(" in", false, false)],
                 vec![span("next line", false, false)]
             ]
         );
-        let second = &cues.active(6.0)[0];
-        assert!(
-            close(second.start, 5.5) && close(second.end, 7.0),
-            "{second:?}"
-        );
         assert_eq!(
-            text(second),
-            &vec![vec![span("Later, with commas", false, false)]]
+            parse_ass_event("Dialogue: 0,0:00:05.50,0:00:07.00,Default,,0,0,0,,Later, with commas"),
+            vec![vec![span("Later, with commas", false, false)]]
         );
     }
 
@@ -763,7 +862,7 @@ mod tests {
         let path = temp_dir("vtt").join("movie.en.vtt");
         let vtt = "WEBVTT\n\n00:00.500 --> 00:02.000\n<i>Over</i> here\n\n00:03.000 --> 00:04.000 align:start\nThere\n";
         std::fs::write(&path, vtt).unwrap();
-        let cues = load_external(&path).unwrap();
+        let cues = load_external(&path, (1920, 1080)).unwrap();
         assert_eq!(cues.len(), 2);
         let first = &cues.active(1.0)[0];
         assert!(
@@ -856,6 +955,7 @@ mod tests {
             f64::from(stream.time_base()),
             queue.clone(),
             shared.clone(),
+            (1920, 1080),
         );
         for (s, packet) in input.packets() {
             if s.index() == index {
@@ -894,6 +994,7 @@ mod tests {
             f64::from(stream.time_base()),
             queue.clone(),
             shared.clone(),
+            (1920, 1080),
         );
         for (s, packet) in input.packets() {
             if s.index() == index {
@@ -986,8 +1087,13 @@ mod tests {
         }
         let shared = Arc::new(Shared::new());
         let queue = Arc::new(PacketQueue::default());
-        let (thread, cues) =
-            spawn_embedded(parameters, 1.0 / 90000.0, queue.clone(), shared.clone());
+        let (thread, cues) = spawn_embedded(
+            parameters,
+            1.0 / 90000.0,
+            queue.clone(),
+            shared.clone(),
+            (720, 480),
+        );
         for (pts, x) in [(90000, 100), (3 * 90000, 300)] {
             let mut packet = ff::Packet::copy(&dvd_packet(x, 400, 64, 20, 1000));
             packet.set_pts(Some(pts));
