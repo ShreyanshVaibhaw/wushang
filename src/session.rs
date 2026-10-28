@@ -426,6 +426,20 @@ impl Session {
         video && audio
     }
 
+    /// The selected video's picture size as shown: the stored width stretched by the pixels'
+    /// shape, which anamorphic video (DVDs, broadcasts) stores apart.
+    pub fn display_size(&self) -> Option<(u32, u32)> {
+        let (w, h) = self.video_size?;
+        let stream = self.video_track.as_ref()?.stream;
+        // SAFETY: the parameters are valid while the session holds them.
+        let sar = unsafe { (*self.codecs[&stream].parameters.as_ptr()).sample_aspect_ratio };
+        if sar.num <= 0 || sar.den <= 0 {
+            return Some((w, h));
+        }
+        let shown = f64::from(w) * f64::from(sar.num) / f64::from(sar.den);
+        Some((shown.round() as u32, h))
+    }
+
     /// Where playback is in the media. The clock runs ahead by the audio delay (that is how the
     /// delay shifts the picture), so take it back off.
     pub fn position(&self) -> Option<f64> {

@@ -618,13 +618,14 @@ impl App {
         }
     }
 
-    /// The canvas styled (ASS) subtitles are drawn on: the video's size, for audio a 1080p one.
-    // ponytail: anamorphic video (non-square pixels) draws them stretched with the picture;
-    // give libass the display size and the stored size apart if that shows.
-    fn subtitle_canvas(&self) -> (u32, u32) {
-        (self.session.as_ref())
-            .and_then(|s| s.video_size)
-            .unwrap_or((1920, 1080))
+    /// The canvas styled (ASS) subtitles are drawn on: the video's stored and shown sizes, for
+    /// audio a 1080p one.
+    fn subtitle_canvas(&self) -> ass::Canvas {
+        let session = self.session.as_ref();
+        match session.and_then(|s| Some((s.video_size?, s.display_size()?))) {
+            Some((stored, shown)) => ass::Canvas { stored, shown },
+            None => (1920, 1080).into(),
+        }
     }
 
     fn decode_embedded(&mut self, stream: session::SubtitleStream) {

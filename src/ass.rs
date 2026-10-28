@@ -143,7 +143,25 @@ pub fn add_font(name: &str, data: &[u8]) {
     unsafe { (lib.api.add_font)(*library, name.as_ptr(), data.as_ptr().cast(), size) };
 }
 
-/// One subtitle track and the renderer that draws it, at `size`, the video's size.
+/// The picture styled subtitles are drawn for: the video's stored size, and the size it shows
+/// at, wider for anamorphic video, whose pixels aren't square (a 16:9 DVD stores 720x576).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Canvas {
+    pub stored: (u32, u32),
+    pub shown: (u32, u32),
+}
+
+/// Square pixels: shown as stored.
+impl From<(u32, u32)> for Canvas {
+    fn from(size: (u32, u32)) -> Self {
+        Canvas {
+            stored: size,
+            shown: size,
+        }
+    }
+}
+
+/// One subtitle track and the renderer that draws it, at the video's shown size.
 pub struct Track(Mutex<Inner>);
 
 struct Inner {
@@ -159,7 +177,7 @@ unsafe impl Send for Inner {}
 impl Track {
     /// A track to feed event by event, with `header` (the codec private data: script info and
     /// styles) up front.
-    pub fn new(header: &[u8], size: (u32, u32)) -> Option<Track> {
+    pub fn new(header: &[u8], canvas: Canvas) -> Option<Track> {
         let lib = lib()?;
         let track = unsafe { (lib.api.new_track)(*lib.library.lock().unwrap()) };
         if track.is_null() {
@@ -168,11 +186,11 @@ impl Track {
         unsafe {
             (lib.api.process_codec_private)(track, header.as_ptr().cast(), header.len() as c_int)
         };
-        Track::with(track, size)
+        Track::with(track, canvas)
     }
 
     /// A whole .ass or .ssa file.
-    pub fn from_file(text: &[u8], size: (u32, u32)) -> Option<Track> {
+    pub fn from_file(text: &[u8], canvas: Canvas) -> Option<Track> {
         let lib = lib()?;
         let mut copy = text.to_vec();
         let track = unsafe {
@@ -187,10 +205,10 @@ impl Track {
         if track.is_null() {
             return None;
         }
-        Track::with(track, size)
+        Track::with(track, canvas)
     }
 
-    fn with(track: *mut c_void, size: (u32, u32)) -> Option<Track> {
+    fn with(track: *mut c_void, canvas: Canvas) -> Option<Track> {
         let lib = lib()?;
         unsafe {
             let renderer = (lib.api.renderer_init)(*lib.library.lock().unwrap());
@@ -207,13 +225,16 @@ impl Track {
                 std::ptr::null(),
                 1,
             );
-            let (w, h) = (size.0.max(2) as c_int, size.1.max(2) as c_int);
-            (lib.api.set_frame_size)(renderer, w, h);
-            (lib.api.set_storage_size)(renderer, w, h);
+            // libass draws at the shown size and undoes the stretch the stored size implies, so
+            // text on anamorphic video keeps its shape.
+            let px = |(w, h): (u32, u32)| (w.max(2) as c_int, h.max(2) as c_int);
+            let ((fw, fh), (sw, sh)) = (px(canvas.shown), px(canvas.stored));
+            (lib.api.set_frame_size)(renderer, fw, fh);
+            (lib.api.set_storage_size)(renderer, sw, sh);
             Some(Track(Mutex::new(Inner {
                 track,
                 renderer,
-                size,
+                size: canvas.shown,
                 last: None,
             })))
         }
@@ -363,7 +384,7 @@ mod tests {
         );
         let file =
             std::fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/testdata/styled.ass")).unwrap();
-        let track = Track::from_file(&file, (1920, 1080)).unwrap();
+        let track = Track::from_file(&file, (1920, 1080).into()).unwrap();
         assert!(
             track.render(0.2).is_none(),
             "nothing before the first event"
@@ -398,12 +419,55 @@ mod tests {
             Style: Default,Arial,40,&H00FFFFFF,&H00FFFFFF,&H00000000,&H00000000,0,0,0,0,100,100,\
             0,0,1,2,0,2,10,10,10,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, \
             MarginR, MarginV, Effect, Text\n";
-        let track = Track::new(header, (1280, 720)).unwrap();
+        let track = Track::new(header, (1280, 720).into()).unwrap();
         track.add_event(b"0,0,Default,,0,0,0,,Hello", 1.0, 2.0);
         // Sent again after a seek: still one line.
         track.add_event(b"0,0,Default,,0,0,0,,Hello", 1.0, 2.0);
         let (_, p) = track.render(1.5).unwrap();
         assert!(p.y > 500, "the line sits at the bottom, at {}", p.y);
         assert!(track.render(3.5).is_none());
+    }
+
+    #[test]
+    fn anamorphic_video_follows_the_scripts_layout() {
+        // Letters keep the shape they had on the picture the script was laid out on (LayoutRes,
+        // else the stored size), as VSFilter drew them and old scripts make up for: a script laid
+        // out at the shown shape keeps its letters, one laid out on the stored pixels stretches.
+        let header = |layout: &str| {
+            format!(
+                "[Script Info]\nPlayResX: 720\nPlayResY: 576\n{layout}\n[V4+ Styles]\n\
+                 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, \
+                 OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, \
+                 Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, \
+                 MarginV, Encoding\n\
+                 Style: Default,Arial,40,&H00FFFFFF,&H00FFFFFF,&H00000000,&H00000000,0,0,0,0,\
+                 100,100,0,0,1,0,0,2,10,10,10,1\n\n[Events]\n\
+                 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
+            )
+        };
+        let laid_out = header("LayoutResX: 1024\nLayoutResY: 576\n");
+        // A line's width over its height, drawn on `canvas`.
+        let shape = |header: &str, canvas: Canvas| {
+            let track = Track::new(header.as_bytes(), canvas).unwrap();
+            track.add_event(b"0,0,Default,,0,0,0,,Hello there", 1.0, 2.0);
+            let (_, p) = track.render(1.5).unwrap();
+            f64::from(p.w) / f64::from(p.h)
+        };
+        // 720x576 stored, shown 1024 wide: 1024/720 = 1.42 times wider.
+        let anamorphic = Canvas {
+            stored: (720, 576),
+            shown: (1024, 576),
+        };
+        let square = shape(&laid_out, (1024, 576).into());
+        let kept = shape(&laid_out, anamorphic) / square;
+        assert!(
+            (kept - 1.0).abs() < 0.08,
+            "laid out: {kept:.2} times as wide"
+        );
+        let stretched = shape(&header(""), anamorphic) / square;
+        assert!(
+            stretched > 1.25,
+            "VSFilter's stretch: {stretched:.2} times as wide"
+        );
     }
 }

@@ -79,6 +79,7 @@ The audio and subtitle buttons open the track popup from the design: video, audi
 "Add Audio File..." in the player menu's Audio submenu plays another file's sound with the video, like a dub or commentary kept beside it; it joins the audio track list under its file name and follows every seek.
 A subtitle file with the same name as the video, next to it or in a "Subs" folder, loads on its own, as in VLC.
 ASS and SSA subtitles, in the file or beside it, are drawn by libass as VLC and mpv draw them: their positions, fonts, colours, borders, shadows, rotation, karaoke and animation, with the fonts a Matroska file carries for them.
+On anamorphic video (DVDs and broadcasts store 16:9 in 720x576) libass draws at the shown size, and letters keep the shape they had where the script was laid out, as VSFilter and mpv show them.
 Without `libass-9.dll` next to myvlc.exe they fall back to plain text like every other format.
 Old subtitle files in a Windows code page instead of UTF-8 are read in the right one: a language tag such as `film.ru.srt` names it, and otherwise myvlc tries the Western, Central European, Cyrillic, Greek, Turkish, Hebrew, Arabic, Baltic, Japanese, Chinese and Korean code pages and keeps the one whose text reads like real words.
 The gear opens the settings panel, with four tabs:
@@ -415,7 +416,6 @@ Opening the audio device took 1.2 to 3.5 s in these runs, and playback starts mo
 
 Each of these is marked with a `ponytail:` comment in the code, along with the upgrade path.
 
-- libass draws at the video's stored size, so on anamorphic video (non-square pixels) styled subtitles stretch with the picture.
 - DVDs play their main title only, without menus or the other titles, and DVD images (.iso) don't open; Blu-ray menus (BD-J) don't play either.
 - Without a language tag, traditional Chinese (Big5) subtitles read as simplified (GBK), and Turkish or Baltic ones as Western, since the same bytes are valid in both.
 - Contrast and saturation go up to 2x, like VLC's adjust filter; brightness and hue use the GPU's full range.

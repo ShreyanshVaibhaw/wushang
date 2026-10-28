@@ -199,7 +199,7 @@ pub fn spawn_embedded(
     time_base: f64,
     packets: Arc<PacketQueue>,
     shared: Arc<Shared>,
-    canvas: (u32, u32),
+    canvas: impl Into<crate::ass::Canvas>,
 ) -> (JoinHandle<()>, Arc<Cues>) {
     if styled(parameters.id()) {
         let header = unsafe {
@@ -209,7 +209,7 @@ pub fn spawn_embedded(
                 false => std::slice::from_raw_parts(p.extradata, p.extradata_size as usize),
             }
         };
-        if let Some(track) = crate::ass::Track::new(header, canvas) {
+        if let Some(track) = crate::ass::Track::new(header, canvas.into()) {
             return spawn_styled(track, time_base, packets, shared);
         }
     }
@@ -271,7 +271,11 @@ fn spawn_styled(
 /// Reads a whole external subtitle file (.srt, .ass, .ssa, .vtt, .sub, .idx, .smi, .sup) with
 /// libavformat and decodes every cue up front. An .ass or .ssa file goes to libass whole, drawn on
 /// a `canvas` the video's size.
-pub fn load_external(path: &Path, canvas: (u32, u32)) -> Result<Arc<Cues>, String> {
+pub fn load_external(
+    path: &Path,
+    canvas: impl Into<crate::ass::Canvas>,
+) -> Result<Arc<Cues>, String> {
+    let canvas = canvas.into();
     let ext = path.extension().map(|e| e.to_string_lossy().to_lowercase());
     if matches!(ext.as_deref(), Some("ass" | "ssa"))
         && crate::ass::styling()
