@@ -332,7 +332,7 @@ myvlc asks the GPU for an AV1 decoder profile first.
 If it has one, FFmpeg's own AV1 decoder runs on D3D11VA like every other codec; if not, libdav1d decodes on every CPU core.
 
 A stream the GPU turns down after all, such as 10-bit H.264, which no GPU decodes, or a 4:4:4 AV1, is reopened in software on every core (libdav1d for AV1) and decoded again from the last keyframe.
-The decoder thread repacks software frames to NV12 with swscale, splitting each frame across the cores, so the render thread only copies them to the GPU.
+The decoder thread repacks software frames to NV12, or P010 for 10-bit video so it keeps its precision, with swscale, splitting each frame across the cores, so the render thread only copies them to the GPU.
 On the test laptop a 4K60 10-bit H.264 clip went from 90 dropped frames of 300 to about 50; the rest is the CPU's limit for decoding and repacking at once.
 
 HDR10 (PQ) video gets tone mapped to the SDR screen, because video processors either can't do it or wash it out (the test laptop's Intel one does).
@@ -421,7 +421,7 @@ Each of these is marked with a `ponytail:` comment in the code, along with the u
 - Contrast and saturation go up to 2x, like VLC's adjust filter; brightness and hue use the GPU's full range.
 - HDR10 is always tone mapped to SDR, even on an HDR screen; there is no HDR output.
 - SDR BT.2020 and HLG go through the video processor's own conversion, which on the test laptop's Intel GPU leaves saturated colours paler than they should be, and HLG's highlights clip.
-- Software frames reach the GPU as 8-bit NV12, so 10-bit video loses its extra precision there, and 4K60 10-bit H.264 drops frames on a laptop CPU.
+- 4K60 10-bit H.264 decodes in software, which drops frames on a laptop CPU.
 - Audio devices must mix in f32, which every WASAPI shared-mode device seen so far does.
 - The audio callback takes a mutex.
 - The stereo Test sound plays through Windows' default device at the system volume, not the chosen device or myvlc's volume.

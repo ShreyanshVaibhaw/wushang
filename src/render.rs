@@ -181,10 +181,11 @@ struct Processor {
     filters: [Option<D3D11_VIDEO_PROCESSOR_FILTER_RANGE>; 4],
 }
 
-/// Software frames go to the GPU as NV12 (see `nv12`), so the video processor converts them to
-/// RGB and applies the colour filters exactly as for hardware frames.
+/// Software frames go to the GPU as NV12 or P010 (see `nv12`), so the video processor converts
+/// them to RGB and applies the colour filters exactly as for hardware frames.
 struct Upload {
     size: (u32, u32),
+    p010: bool,
     /// CPU-writable copy, then the texture the video processor reads.
     staging: ID3D11Texture2D,
     texture: ID3D11Texture2D,
@@ -765,25 +766,36 @@ impl Renderer {
         Ok(())
     }
 
-    /// Copies a software frame to the GPU as NV12; returns the texture and its colours.
+    /// Copies a software frame to the GPU as NV12 or P010; returns the texture and its colours.
     fn upload(&mut self, frame: &ff::frame::Video) -> Result<(ID3D11Texture2D, Colors)> {
         let converted;
-        let nv12 = if frame.format() == Pixel::NV12 {
+        let nv12 = if matches!(frame.format(), Pixel::NV12 | Pixel::P010LE) {
             frame
         } else {
             converted = self.nv12.convert(frame)?;
             &converted
         };
         let size = (nv12.width(), nv12.height());
-        // NV12 textures need even sizes; the source rect never reads the padding.
+        // P010 is NV12 with each sample in 16 bits.
+        let p010 = nv12.format() == Pixel::P010LE;
+        let sample = if p010 { 2 } else { 1 };
+        // NV12 and P010 textures need even sizes; the source rect never reads the padding.
         let (tex_w, tex_h) = ((size.0 + 1) & !1, (size.1 + 1) & !1);
-        if self.upload.as_ref().is_none_or(|u| u.size != size) {
+        if self
+            .upload
+            .as_ref()
+            .is_none_or(|u| (u.size, u.p010) != (size, p010))
+        {
             let mut desc = D3D11_TEXTURE2D_DESC {
                 Width: tex_w,
                 Height: tex_h,
                 MipLevels: 1,
                 ArraySize: 1,
-                Format: DXGI_FORMAT_NV12,
+                Format: if p010 {
+                    DXGI_FORMAT_P010
+                } else {
+                    DXGI_FORMAT_NV12
+                },
                 SampleDesc: DXGI_SAMPLE_DESC {
                     Count: 1,
                     Quality: 0,
@@ -805,6 +817,7 @@ impl Renderer {
             }
             self.upload = Some(Upload {
                 size,
+                p010,
                 staging: staging.ok_or("no staging texture")?,
                 texture: texture.ok_or("no upload texture")?,
             });
@@ -821,7 +834,10 @@ impl Renderer {
                 let base = mapped.pData as *mut u8;
                 // The interleaved UV rows start after the texture's full height of Y rows.
                 let uv = base.add(pitch * tex_h as usize);
-                let planes = [(0, base, h, w), (1, uv, h.div_ceil(2), w.div_ceil(2) * 2)];
+                let planes = [
+                    (0, base, h, w * sample),
+                    (1, uv, h.div_ceil(2), w.div_ceil(2) * 2 * sample),
+                ];
                 for (plane, dst, rows, bytes) in planes {
                     let (src, stride) = (nv12.data(plane), nv12.stride(plane));
                     for row in 0..rows {

@@ -1,34 +1,47 @@
-//! Software frames repacked into NV12 for the GPU's video processor, which converts them to RGB
-//! and applies the colour filters as for hardware frames (drivers skip those filters on RGB
-//! input). The decoder thread does it, off the render thread: a 4K frame takes several
-//! milliseconds even split across every core.
-//!
-//! ponytail: 10-bit video is repacked to 8-bit too, the slowest swscale path and a loss of
-//! precision; upload P010 textures for 10-bit sources if 4K60 10-bit software playback matters.
+//! Software frames repacked into NV12, or P010 for 10-bit and deeper YUV, for the GPU's video
+//! processor, which converts them to RGB and applies the colour filters as for hardware frames
+//! (drivers skip those filters on RGB input). The decoder thread does it, off the render thread:
+//! a 4K frame takes several milliseconds even split across every core.
 
 use ff::ffi;
 use ff::format::Pixel;
 use ffmpeg_next as ff;
 
-/// Converts frames to NV12, keeping a swscale context for the current format and size.
+/// Converts frames to NV12 or P010, keeping a swscale context for the current format and size.
 #[derive(Default)]
 pub struct Nv12 {
     scaler: Option<((Pixel, u32, u32), Scaler)>,
 }
 
+/// What `frame` goes to the GPU as: P010 for YUV deeper than 8 bits, which keeps 10-bit video's
+/// precision (and is a faster swscale path), else NV12.
+pub fn target(frame: Pixel) -> Pixel {
+    let deep = unsafe {
+        let desc = ffi::av_pix_fmt_desc_get(frame.into());
+        !desc.is_null() && (*desc).comp[0].depth > 8
+    };
+    if deep && !is_rgb(frame) {
+        Pixel::P010LE
+    } else {
+        Pixel::NV12
+    }
+}
+
 impl Nv12 {
-    /// `frame` as NV12 with its timestamps, aspect ratio and colour tags. YUV keeps its matrix
-    /// and range, so only the planes move; RGB becomes BT.709 studio range and is tagged so.
+    /// `frame` as NV12 or P010 (see `target`) with its timestamps, aspect ratio and colour tags.
+    /// YUV keeps its matrix and range, so only the planes move; RGB becomes BT.709 studio range
+    /// and is tagged so.
     pub fn convert(&mut self, frame: &ff::frame::Video) -> Result<ff::frame::Video, ff::Error> {
-        if frame.format() == Pixel::NV12 {
+        let to = target(frame.format());
+        if frame.format() == to {
             return Ok(frame.clone());
         }
         let key = (frame.format(), frame.width(), frame.height());
         if self.scaler.as_ref().is_none_or(|(k, _)| *k != key) {
-            self.scaler = Some((key, Scaler::new(frame)?));
+            self.scaler = Some((key, Scaler::new(frame, to)?));
         }
         let (_, scaler) = self.scaler.as_mut().unwrap();
-        let mut out = ff::frame::Video::new(Pixel::NV12, frame.width(), frame.height());
+        let mut out = ff::frame::Video::new(to, frame.width(), frame.height());
         unsafe {
             let err = ffi::sws_scale_frame(scaler.0, out.as_mut_ptr(), frame.as_ptr());
             if err < 0 {
@@ -44,15 +57,15 @@ impl Nv12 {
     }
 }
 
-/// A swscale context for one format and size into NV12, splitting each frame across every
-/// core.
+/// A swscale context for one format and size into NV12 or P010, splitting each frame across
+/// every core.
 struct Scaler(*mut ffi::SwsContext);
 
 // Only the decoder thread that made it uses it.
 unsafe impl Send for Scaler {}
 
 impl Scaler {
-    fn new(frame: &ff::frame::Video) -> Result<Self, ff::Error> {
+    fn new(frame: &ff::frame::Video, to: Pixel) -> Result<Self, ff::Error> {
         let (w, h) = (frame.width() as i32, frame.height() as i32);
         unsafe {
             let ctx = ffi::sws_alloc_context();
@@ -63,7 +76,7 @@ impl Scaler {
             (*ctx).flags = ffi::SwsFlags::SWS_BILINEAR as u32;
             ((*ctx).src_w, (*ctx).src_h, (*ctx).dst_w, (*ctx).dst_h) = (w, h, w, h);
             (*ctx).src_format = ffi::AVPixelFormat::from(frame.format()) as i32;
-            (*ctx).dst_format = ffi::AVPixelFormat::AV_PIX_FMT_NV12 as i32;
+            (*ctx).dst_format = ffi::AVPixelFormat::from(to) as i32;
             // 0 picks one slice thread per core.
             (*ctx).threads = 0;
             let err = ffi::sws_init_context(ctx, std::ptr::null_mut(), std::ptr::null_mut());
@@ -115,10 +128,22 @@ mod tests {
         let mut src = ff::frame::Video::new(Pixel::YUV420P10LE, 64, 36);
         src.set_pts(Some(42));
         src.set_color_range(ff::color::Range::JPEG);
+        // 10-bit stays 10-bit: P010 keeps each sample in the top bits of 16.
+        unsafe { std::ptr::write_bytes(src.data_mut(0).as_mut_ptr(), 0, src.data(0).len()) };
+        src.data_mut(0)[..2].copy_from_slice(&1023u16.to_le_bytes());
         let out = Nv12::default().convert(&src).unwrap();
         assert_eq!(
             (out.format(), out.width(), out.height()),
-            (Pixel::NV12, 64, 36)
+            (Pixel::P010LE, 64, 36)
+        );
+        assert_eq!(
+            u16::from_le_bytes([out.data(0)[0], out.data(0)[1]]) >> 6,
+            1023
+        );
+        let eight = ff::frame::Video::new(Pixel::YUV420P, 64, 36);
+        assert_eq!(
+            Nv12::default().convert(&eight).unwrap().format(),
+            Pixel::NV12
         );
         assert_eq!(
             (out.pts(), out.color_range()),
