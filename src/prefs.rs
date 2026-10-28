@@ -63,6 +63,28 @@ pub const NET_TIMEOUT: Choices = &[
     ("30", "30 seconds"),
     ("60", "1 minute"),
 ];
+/// Where snapshots go: Pictures\myvlc, the desktop, or the folder of the file they come from.
+pub const SNAP_DIR: Choices = &[
+    ("pictures", "Pictures\\myvlc"),
+    ("desktop", "Desktop"),
+    ("beside", "Next to the file"),
+];
+/// Where recordings go, the same way.
+pub const RECORD_DIR: Choices = &[
+    ("videos", "Videos\\myvlc"),
+    ("desktop", "Desktop"),
+    ("beside", "Next to the file"),
+];
+pub const SNAP_FORMAT: Choices = &[("png", "PNG"), ("jpg", "JPEG")];
+/// MPEG-TS keeps what was written if myvlc stops mid-recording, but holds fewer codecs.
+pub const RECORD_FORMAT: Choices = &[("mkv", "Matroska (.mkv)"), ("ts", "MPEG-TS (.ts)")];
+/// The first port streaming tries; it takes the next free one when that is busy.
+pub const STREAM_PORT: Choices = &[
+    ("8080", "8080"),
+    ("8000", "8000"),
+    ("8554", "8554"),
+    ("9000", "9000"),
+];
 /// Subtitle fonts to pick from; Inter comes with myvlc, the rest with Windows.
 pub const FONTS: [&str; 8] = [
     "Inter",
@@ -165,6 +187,16 @@ pub struct Prefs {
     pub sub_timeline: bool,
     /// Index into `VISUALIZERS`.
     pub visualizer: usize,
+    // Recording. Indices into `SNAP_DIR`, `SNAP_FORMAT`, `RECORD_DIR` and `RECORD_FORMAT`.
+    pub snap_dir: usize,
+    pub snap_format: usize,
+    pub record_dir: usize,
+    pub record_format: usize,
+    /// One of `STREAM_PORT`.
+    pub stream_port: u16,
+    // Extensions.
+    /// Hand libass the fonts a Matroska file carries for its styled subtitles.
+    pub embedded_fonts: bool,
     // Library.
     pub show_hidden: bool,
     // Performance.
@@ -225,6 +257,12 @@ impl Default for Prefs {
             sub_styles: true,
             sub_timeline: false,
             visualizer: 0,
+            snap_dir: 0,
+            snap_format: 0,
+            record_dir: 0,
+            record_format: 0,
+            stream_port: 8080,
+            embedded_fonts: true,
             show_hidden: false,
             hw_decoding: true,
             net_reconnect: true,
@@ -303,6 +341,15 @@ impl Prefs {
         line("sub_styles", self.sub_styles.to_string());
         line("sub_timeline", self.sub_timeline.to_string());
         line("visualizer", self.visualizer.to_string());
+        line("snap_dir", key(SNAP_DIR, self.snap_dir).into());
+        line("snap_format", key(SNAP_FORMAT, self.snap_format).into());
+        line("record_dir", key(RECORD_DIR, self.record_dir).into());
+        line(
+            "record_format",
+            key(RECORD_FORMAT, self.record_format).into(),
+        );
+        line("stream_port", self.stream_port.to_string());
+        line("embedded_fonts", self.embedded_fonts.to_string());
         line("show_hidden", self.show_hidden.to_string());
         line("hw_decoding", self.hw_decoding.to_string());
         line("net_reconnect", self.net_reconnect.to_string());
@@ -454,6 +501,18 @@ fn parse(text: &str) -> Prefs {
             "sub_font" if FONTS.contains(&v) => p.sub_font = v.into(),
             "sub_styles" => flag(&mut p.sub_styles),
             "sub_timeline" => flag(&mut p.sub_timeline),
+            "snap_dir" => choice(&mut p.snap_dir, SNAP_DIR),
+            "snap_format" => choice(&mut p.snap_format, SNAP_FORMAT),
+            "record_dir" => choice(&mut p.record_dir, RECORD_DIR),
+            "record_format" => choice(&mut p.record_format, RECORD_FORMAT),
+            "stream_port" => {
+                if let Ok(n) = v.parse::<u16>()
+                    && STREAM_PORT.iter().any(|c| c.0.parse::<u16>() == Ok(n))
+                {
+                    p.stream_port = n;
+                }
+            }
+            "embedded_fonts" => flag(&mut p.embedded_fonts),
             "visualizer" => {
                 if let Ok(n) = v.parse::<usize>() {
                     p.visualizer = n.min(VISUALIZERS.len() - 1);
@@ -526,6 +585,12 @@ mod tests {
             sub_styles: false,
             sub_timeline: true,
             visualizer: 2,
+            snap_dir: 2,
+            snap_format: 1,
+            record_dir: 1,
+            record_format: 1,
+            stream_port: 9000,
+            embedded_fonts: false,
             show_hidden: true,
             hw_decoding: false,
             net_reconnect: false,

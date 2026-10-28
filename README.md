@@ -119,8 +119,9 @@ The window opens the way it was launched, so a shortcut set to "Run: Minimized",
 
 ### Snapshots
 
-Shift+S, "Take Snapshot" in the player menu's Video submenu, or the snapshot button from Customize Player saves the frame on screen as a PNG in `Pictures\myvlc`.
+Shift+S, "Take Snapshot" in the player menu's Video submenu, or the snapshot button from Customize Player saves the frame on screen as a PNG in `Pictures\myvlc`; Settings' Recording page can make it a JPEG, or save it on the desktop or next to the file.
 R, "Record" in the player menu, or the record button from Customize Player records what plays into a Matroska file in `Videos\myvlc`, copied packet for packet without re-encoding, until R is pressed again or the media ends.
+The Recording page can switch it to MPEG-TS, which keeps what was written if myvlc stops mid-recording but holds fewer codecs, and save it on the desktop or next to the file.
 The file holds what was on screen: it starts at the keyframe before the picture (copied video can only start on one), packets go in as playback reaches them rather than as the demuxer reads ahead, and a seek while recording carries on in the same file instead of jumping in it.
 Network streams record too; the recording button lights while it runs.
 It is the full-resolution frame with flips, rotation, crop, aspect ratio and colour adjustments as shown, but not zoom or the interface.
@@ -180,6 +181,7 @@ Neither plays encrypted discs (CSS on DVDs, AACS on Blu-rays), so commercial dis
 ### Streaming to other devices
 
 "Stream to Other Devices" in the player menu, or "Stream" in a file's right-click menu, serves what plays over HTTP as MPEG-TS, copied without re-encoding, to any number of players on the network: VLC, mpv, Kodi or a TV opens the address the corner shows, like `http://192.168.1.101:8080/`.
+It listens on port 8080, or the next free one; the Recording page picks another starting port.
 While it runs, the player menu's "Streaming" submenu shows that address, how many players are connected, and Stop Streaming; the stream also stops with its media.
 Like a recording it follows playback, so pausing or seeking here pauses or moves the stream.
 H.264 and HEVC get their parameter sets repeated before every keyframe, so a player that connects midway starts playing at the next one.
@@ -196,7 +198,9 @@ Video gets about 0.08 bits per pixel per frame (5 Mb/s for 1080p at 30 frames a 
 ### Settings
 
 Ctrl+P or Settings in the "..." menu opens the Settings window from the design's "Settings" frames: categories on the left, their options on the right, and a search box that finds an option in any category.
-Every option it lists does something; the design's categories with nothing behind them yet (Recording, Extensions) are dimmed.
+Every option it lists does something.
+Extensions holds myvlc's optional add-on, libass: whether ASS and SSA keep their own styling, and whether it uses the fonts a Matroska file carries.
+VLC's Lua extensions don't run in myvlc.
 Changes apply at once and are kept in `settings.txt` next to the library state.
 
 - General: dark, light or system theme, and the accent colour.

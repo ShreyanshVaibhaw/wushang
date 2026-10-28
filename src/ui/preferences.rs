@@ -3,8 +3,8 @@
 //! copy of `Prefs`; each change goes out whole as [`PrefsAction::Changed`], and main.rs applies
 //! and saves it.
 //!
-//! Only settings myvlc acts on are listed. Recording and Extensions have none yet and
-//! show dimmed, like the panels' disabled rows. General has the design's theme and accent rows
+//! Only settings myvlc acts on are listed. Extensions are myvlc's optional add-ons (libass), not
+//! VLC's Lua extensions, which myvlc doesn't run. General has the design's theme and accent rows
 //! but not its interface language, as there is only English. The design's (i) marks are left
 //! out, as there is nothing behind them. Sizes are DIPs from the 1046x864 frames. On a short window the
 //! frame gets shorter first (the options scroll, the sidebar tightens), then scales down.
@@ -101,13 +101,9 @@ impl Category {
             Category::Network => "Network Settings",
             Category::Performance => "Performance Settings",
             Category::General => "Global Settings",
-            _ => "Settings",
+            Category::Recording => "Recording & Streaming",
+            Category::Extensions => "Extensions",
         }
-    }
-
-    /// Whether myvlc has anything to set here.
-    fn enabled(self) -> bool {
-        !matches!(self, Category::Recording | Category::Extensions)
     }
 
     fn icon(self) -> usize {
@@ -176,6 +172,13 @@ pub enum Ctl {
     HwDecoding,
     NetReconnect,
     NetTimeout,
+    SnapDir,
+    SnapFormat,
+    RecordDir,
+    RecordFormat,
+    StreamPort,
+    SubStyles,
+    EmbeddedFonts,
 }
 
 const SPEED_TICKS: [&str; 8] = ["0.25", "0.5", "0.75", "1", "1.25", "1.5", "1.75", "2"];
@@ -234,6 +237,8 @@ impl Ctl {
             Ctl::Shadow => p.sub_shadow,
             Ctl::ShowHidden => p.show_hidden,
             Ctl::NetReconnect => p.net_reconnect,
+            Ctl::SubStyles => p.sub_styles,
+            Ctl::EmbeddedFonts => p.embedded_fonts,
             _ => return None,
         })
     }
@@ -255,6 +260,8 @@ impl Ctl {
             Ctl::Shadow => &mut p.sub_shadow,
             Ctl::ShowHidden => &mut p.show_hidden,
             Ctl::NetReconnect => &mut p.net_reconnect,
+            Ctl::SubStyles => &mut p.sub_styles,
+            Ctl::EmbeddedFonts => &mut p.embedded_fonts,
             _ => return,
         };
         *f = on;
@@ -347,6 +354,11 @@ impl Ctl {
             Ctl::Outline => labels(prefs::OUTLINE),
             Ctl::HwDecoding => HW.iter().map(|s| (*s).to_owned()).collect(),
             Ctl::NetTimeout => labels(prefs::NET_TIMEOUT),
+            Ctl::SnapDir => labels(prefs::SNAP_DIR),
+            Ctl::SnapFormat => labels(prefs::SNAP_FORMAT),
+            Ctl::RecordDir => labels(prefs::RECORD_DIR),
+            Ctl::RecordFormat => labels(prefs::RECORD_FORMAT),
+            Ctl::StreamPort => labels(prefs::STREAM_PORT),
             _ => return None,
         })
     }
@@ -396,6 +408,13 @@ impl Ctl {
             Ctl::HwDecoding => Some(usize::from(!p.hw_decoding)),
             Ctl::NetTimeout => {
                 (prefs::NET_TIMEOUT.iter()).position(|c| c.0.parse::<u32>() == Ok(p.net_timeout))
+            }
+            Ctl::SnapDir => Some(p.snap_dir),
+            Ctl::SnapFormat => Some(p.snap_format),
+            Ctl::RecordDir => Some(p.record_dir),
+            Ctl::RecordFormat => Some(p.record_format),
+            Ctl::StreamPort => {
+                (prefs::STREAM_PORT.iter()).position(|c| c.0.parse::<u16>() == Ok(p.stream_port))
             }
             _ => None,
         }
@@ -464,6 +483,15 @@ impl Ctl {
             Ctl::NetTimeout => {
                 if let Some(Ok(s)) = prefs::NET_TIMEOUT.get(i).map(|c| c.0.parse()) {
                     p.net_timeout = s;
+                }
+            }
+            Ctl::SnapDir => p.snap_dir = i,
+            Ctl::SnapFormat => p.snap_format = i,
+            Ctl::RecordDir => p.record_dir = i,
+            Ctl::RecordFormat => p.record_format = i,
+            Ctl::StreamPort => {
+                if let Some(Ok(port)) = prefs::STREAM_PORT.get(i).map(|c| c.0.parse()) {
+                    p.stream_port = port;
                 }
             }
             _ => {}
@@ -564,11 +592,7 @@ impl State {
         State {
             prefs,
             devices,
-            category: if category.enabled() {
-                category
-            } else {
-                Category::Playback
-            },
+            category,
             scroll: 0.0,
             list: None,
             list_scroll: 0.0,
@@ -739,11 +763,7 @@ impl Geometry {
         if self.search.contains(x, y) {
             return Target::Search;
         }
-        if let Some((c, _)) = self
-            .items
-            .iter()
-            .find(|(c, r)| c.enabled() && r.contains(x, y))
-        {
+        if let Some((c, _)) = self.items.iter().find(|(_, r)| r.contains(x, y)) {
             return Target::Category(*c);
         }
         if self.content.contains(x, y)
@@ -845,9 +865,14 @@ impl Builder<'_> {
     }
 
     fn toggle(&mut self, label: &'static str, ctl: Ctl) {
-        if let Some(cy) = self.start(label, 23.0, 23.0, false) {
+        self.toggle_if(label, ctl, true);
+    }
+
+    /// A toggle, dimmed and inert unless `on`.
+    fn toggle_if(&mut self, label: &'static str, ctl: Ctl, on: bool) {
+        if let Some(cy) = self.start(label, 23.0, 23.0, !on) {
             let r = Rect::new(CTRL_R - 64.0, cy - 14.0, CTRL_R, cy + 14.0);
-            self.push(Kind::Toggle, r, Some(ctl), false);
+            self.push(Kind::Toggle, r, Some(ctl), !on);
         }
     }
 
@@ -988,7 +1013,32 @@ impl Builder<'_> {
                 self.toggle("Reconnect when a stream drops", Ctl::NetReconnect);
                 self.choice("Give up on a stalled connection after", Ctl::NetTimeout);
             }
-            Category::Recording | Category::Extensions => {}
+            Category::Recording => {
+                self.section("Snapshots");
+                self.choice("Save snapshots to", Ctl::SnapDir);
+                self.choice("Snapshot format", Ctl::SnapFormat);
+                self.section("Recordings");
+                self.choice("Save recordings to", Ctl::RecordDir);
+                self.choice("Recording format", Ctl::RecordFormat);
+                self.section("Streaming");
+                self.choice("Stream on port", Ctl::StreamPort);
+            }
+            Category::Extensions => {
+                // Without libass-9.dll there is nothing to turn on.
+                let libass = crate::ass::available();
+                self.section("Styled Subtitles (libass)");
+                self.toggle_if(
+                    "Draw ASS and SSA with their own styling",
+                    Ctl::SubStyles,
+                    libass,
+                );
+                let fonts = libass && p.sub_styles;
+                self.toggle_if(
+                    "Use fonts carried by Matroska files",
+                    Ctl::EmbeddedFonts,
+                    fonts,
+                );
+            }
         }
     }
 }
@@ -1347,8 +1397,7 @@ pub(super) struct Resources {
     placeholder_fg: ID2D1SolidColorBrush,
     tick_fg: ID2D1SolidColorBrush,
     swatch: ID2D1SolidColorBrush,
-    /// The sidebar box and content colours at 1 - DIM, laid over dimmed things.
-    box_veil: ID2D1SolidColorBrush,
+    /// The content colour at 1 - DIM, laid over dimmed rows.
     content_veil: ID2D1SolidColorBrush,
     title: IDWriteTextFormat,
     heading: IDWriteTextFormat,
@@ -1412,7 +1461,6 @@ impl Resources {
             placeholder_fg: brush(FG_PLACEHOLDER, 1.0)?,
             tick_fg: brush(FG_TICK, 1.0)?,
             swatch: brush(0xFFFFFF, 1.0)?,
-            box_veil: brush(BG_BOX, 1.0 - DIM)?,
             content_veil: brush(BG_CONTENT, 1.0 - DIM)?,
             title: format(17.0, regular, lead)?,
             heading: format(16.0, medium, lead)?,
@@ -1521,9 +1569,6 @@ impl Painter {
                 let fg = if on { &r.selected_fg } else { &r.label_fg };
                 let tr = Rect::new(58.0, cy - 12.0, item.r - 8.0, cy + 12.0);
                 self.put(rt, c.name(), &r.item, tr, fg);
-                if !c.enabled() {
-                    rt.FillRectangle(&item.inset(-2.0).d2d(), &r.box_veil);
-                }
             }
             rt.PopAxisAlignedClip();
 
@@ -1963,13 +2008,13 @@ mod tests {
             panic!("a toggle changes the settings");
         };
         assert!(p.two_pass);
-        // Disabled categories can't be picked.
+        // Every category opens, Recording among them.
         let g = ui.layout.preferences.as_ref().unwrap();
         let (recording, item) = g.items[11];
         assert_eq!(recording, Category::Recording);
         let (cx, cy) = centre(item);
         let hit = g.hit(g.origin.0 + cx * g.scale, g.origin.1 + cy * g.scale);
-        assert_eq!(hit, Target::Body);
+        assert_eq!(hit, Target::Category(Category::Recording));
     }
 
     #[test]

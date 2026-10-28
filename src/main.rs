@@ -416,7 +416,8 @@ impl App {
         self.play(path, queue)
     }
 
-    /// Starts recording the open file into Videos\myvlc, or stops; the notice says where it went.
+    /// Starts recording the open file (into Videos\myvlc unless Settings says otherwise), or
+    /// stops; the notice says where it went.
     fn toggle_record(&mut self) {
         // A notice about the last recording would otherwise be lost under the new one's.
         self.take_recordings();
@@ -427,15 +428,15 @@ impl App {
             session.set_recording(None);
             return;
         }
-        let dir = snapshot::known_folder(&windows::Win32::UI::Shell::FOLDERID_Videos)
-            .map(|d| d.join("myvlc"))
-            .map_err(|e| e.message())
-            .and_then(|dir| {
-                std::fs::create_dir_all(&dir)
-                    .map(|()| dir)
-                    .map_err(|e| e.to_string())
-            });
-        let dir = match dir {
+        let (dir, ext) = PREFS.with_borrow(|p| {
+            let key = prefs::RECORD_DIR.get(p.record_dir).map_or("", |c| c.0);
+            let own = &windows::Win32::UI::Shell::FOLDERID_Videos;
+            let ext = prefs::RECORD_FORMAT
+                .get(p.record_format)
+                .map_or("mkv", |c| c.0);
+            (snapshot::output_dir(key, own, &session.path), ext)
+        });
+        let dir = match dir.map_err(|e| e.message()) {
             Ok(dir) => dir,
             Err(e) => {
                 self.notice = Some((format!("Can't record ({e})"), Instant::now()));
@@ -444,7 +445,7 @@ impl App {
         };
         let stem = snapshot::stem(&session.path, &session.title);
         let seconds = session.position().unwrap_or(0.0);
-        let path = snapshot::free_path(&dir, &snapshot::file_name(&stem, seconds), "mkv");
+        let path = snapshot::free_path(&dir, &snapshot::file_name(&stem, seconds), ext);
         let name = path
             .file_name()
             .unwrap_or_default()
@@ -550,7 +551,8 @@ impl App {
             return;
         }
         // Every network interface, so other devices reach it; Windows may ask to let it through.
-        let server = match stream::Server::start(std::net::Ipv4Addr::UNSPECIFIED.into()) {
+        let port = PREFS.with_borrow(|p| p.stream_port);
+        let server = match stream::Server::start(std::net::Ipv4Addr::UNSPECIFIED.into(), port) {
             Ok(server) => server,
             Err(e) => {
                 self.notice = Some((format!("Can't stream ({e})"), Instant::now()));
@@ -590,9 +592,13 @@ impl App {
         let Some(session) = self.session.as_mut() else {
             return;
         };
-        // Fonts the file carries, which its styled subtitles ask for by name.
-        for (name, data) in session.take_fonts() {
-            ass::add_font(&name, &data);
+        // Fonts the file carries, which its styled subtitles ask for by name, unless Settings'
+        // Extensions turned them off.
+        let fonts = session.take_fonts();
+        if p.embedded_fonts {
+            for (name, data) in fonts {
+                ass::add_font(&name, &data);
+            }
         }
         let initial = session.take_initial_subtitles();
         self.external = subs::find_external(&session.path)
@@ -3725,7 +3731,25 @@ fn take_snapshot(app: &App, renderer: &mut render::Renderer) {
     match renderer.snapshot(&current.frame, &app.adjust) {
         Ok(picture) => {
             let stem = snapshot::stem(&session.path, &session.title);
-            snapshot::save(picture, &stem, seconds, app.notices.0.clone());
+            let (dir, jpeg) = PREFS.with_borrow(|p| {
+                let key = prefs::SNAP_DIR.get(p.snap_dir).map_or("", |c| c.0);
+                let own = &windows::Win32::UI::Shell::FOLDERID_Pictures;
+                (
+                    snapshot::output_dir(key, own, &session.path),
+                    p.snap_format == 1,
+                )
+            });
+            match dir {
+                Ok(dir) => {
+                    snapshot::save(picture, dir, &stem, seconds, jpeg, app.notices.0.clone())
+                }
+                Err(e) => {
+                    _ = app
+                        .notices
+                        .0
+                        .send(format!("Can't save the snapshot ({})", e.message()))
+                }
+            }
         }
         Err(e) => _ = app.notices.0.send(format!("Can't take a snapshot ({e})")),
     }

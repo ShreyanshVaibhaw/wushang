@@ -1,5 +1,5 @@
-//! Snapshots: the frame on screen saved as a PNG in Pictures\myvlc, named after the file and the
-//! moment in it, like "Holiday 1m05s.png".
+//! Snapshots: the frame on screen saved as a PNG or JPEG (in Pictures\myvlc unless Settings
+//! says otherwise), named after the file and the moment in it, like "Holiday 1m05s.png".
 
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::Sender;
@@ -9,20 +9,30 @@ use windows::Win32::Graphics::Imaging::*;
 use windows::Win32::System::Com::{
     CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx, CoTaskMemFree,
 };
-use windows::Win32::UI::Shell::{FOLDERID_Pictures, KF_FLAG_DEFAULT, SHGetKnownFolderPath};
+use windows::Win32::UI::Shell::{FOLDERID_Desktop, KF_FLAG_DEFAULT, SHGetKnownFolderPath};
 use windows::core::{GUID, HSTRING};
 
-/// Writes `picture` (width, height, BGRA rows) on a thread of its own, so a 4K PNG doesn't
-/// stall playback, then sends the line the player shows about it.
-pub fn save(picture: (u32, u32, Vec<u8>), stem: &str, seconds: f64, done: Sender<String>) {
+/// Writes `picture` (width, height, BGRA rows) into `dir` on a thread of its own, so a 4K PNG
+/// doesn't stall playback, then sends the line the player shows about it. `jpeg` picks JPEG.
+pub fn save(
+    picture: (u32, u32, Vec<u8>),
+    dir: PathBuf,
+    stem: &str,
+    seconds: f64,
+    jpeg: bool,
+    done: Sender<String>,
+) {
     let name = file_name(stem, seconds);
     std::thread::spawn(move || {
         let saved = (|| -> windows::core::Result<PathBuf> {
             unsafe { CoInitializeEx(None, COINIT_MULTITHREADED).ok()? };
-            let dir = known_folder(&FOLDERID_Pictures)?.join("myvlc");
-            std::fs::create_dir_all(&dir)?;
-            let path = free_path(&dir, &name, "png");
-            write_png(&path, &picture)?;
+            let (ext, container) = if jpeg {
+                ("jpg", GUID_ContainerFormatJpeg)
+            } else {
+                ("png", GUID_ContainerFormatPng)
+            };
+            let path = free_path(&dir, &name, ext);
+            write_image(&path, &picture, &container)?;
             Ok(path)
         })();
         _ = done.send(match saved {
@@ -65,6 +75,23 @@ pub fn free_path(dir: &Path, name: &str, ext: &str) -> PathBuf {
         .unwrap()
 }
 
+/// The folder to save in for a `prefs::SNAP_DIR` or `RECORD_DIR` key, made if missing: a myvlc
+/// folder in `own` (Pictures or Videos), the desktop, or the folder `media` is in. A stream has
+/// no folder, so "beside" sends it to `own` too.
+pub fn output_dir(key: &str, own: &GUID, media: &Path) -> windows::core::Result<PathBuf> {
+    let beside = (!crate::net::is_address(media))
+        .then(|| media.parent())
+        .flatten()
+        .filter(|p| !p.as_os_str().is_empty());
+    let dir = match (key, beside) {
+        ("desktop", _) => known_folder(&FOLDERID_Desktop)?,
+        ("beside", Some(dir)) => dir.to_owned(),
+        _ => known_folder(own)?.join("myvlc"),
+    };
+    std::fs::create_dir_all(&dir)?;
+    Ok(dir)
+}
+
 /// A known folder such as Pictures, wherever it was moved to (OneDrive often has it).
 pub fn known_folder(id: &GUID) -> windows::core::Result<PathBuf> {
     unsafe {
@@ -75,8 +102,12 @@ pub fn known_folder(id: &GUID) -> windows::core::Result<PathBuf> {
     }
 }
 
-fn write_png(path: &Path, (w, h, bgra): &(u32, u32, Vec<u8>)) -> windows::core::Result<()> {
-    // PNG has no use for the alpha the video processor leaves opaque.
+fn write_image(
+    path: &Path,
+    (w, h, bgra): &(u32, u32, Vec<u8>),
+    container: &GUID,
+) -> windows::core::Result<()> {
+    // Neither PNG nor JPEG has a use for the alpha the video processor leaves opaque.
     let bgr: Vec<u8> = (bgra.as_chunks::<4>().0.iter())
         .flat_map(|&[b, g, r, _]| [b, g, r])
         .collect();
@@ -85,7 +116,7 @@ fn write_png(path: &Path, (w, h, bgra): &(u32, u32, Vec<u8>)) -> windows::core::
             CoCreateInstance(&CLSID_WICImagingFactory, None, CLSCTX_INPROC_SERVER)?;
         let stream = wic.CreateStream()?;
         stream.InitializeFromFilename(&HSTRING::from(path.as_os_str()), GENERIC_WRITE.0)?;
-        let encoder = wic.CreateEncoder(&GUID_ContainerFormatPng, std::ptr::null())?;
+        let encoder = wic.CreateEncoder(container, std::ptr::null())?;
         encoder.Initialize(&stream, WICBitmapEncoderNoCache)?;
         let mut frame = None;
         encoder.CreateNewFrame(&mut frame, std::ptr::null_mut())?;
@@ -121,12 +152,12 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         assert_eq!(free_path(&dir, "a", "png"), dir.join("a.png"));
         unsafe { CoInitializeEx(None, COINIT_MULTITHREADED).ok().unwrap() };
-        write_png(
-            &dir.join("a.png"),
-            &(2, 1, vec![0, 0, 255, 255, 255, 0, 0, 255]),
-        )
-        .unwrap();
+        let picture = (2, 1, vec![0, 0, 255, 255, 255, 0, 0, 255]);
+        write_image(&dir.join("a.png"), &picture, &GUID_ContainerFormatPng).unwrap();
         assert_eq!(free_path(&dir, "a", "png"), dir.join("a (2).png"));
+        write_image(&dir.join("a.jpg"), &picture, &GUID_ContainerFormatJpeg).unwrap();
+        let jpeg = std::fs::read(dir.join("a.jpg")).unwrap();
+        assert_eq!(jpeg[..2], [0xFF, 0xD8], "a JPEG starts with SOI");
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

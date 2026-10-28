@@ -11,7 +11,7 @@
 //! of a file, which is what players and TVs read from a network.
 
 use std::collections::VecDeque;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use ff::codec::Id;
@@ -28,7 +28,7 @@ const RUN_GAP: f64 = 0.2;
 
 /// Where the copy goes.
 pub enum Sink {
-    /// A Matroska file.
+    /// A Matroska file, or MPEG-TS for a .ts path.
     File(PathBuf),
     /// MPEG-TS for the players connected to a stream.
     Stream(Arc<stream::Broadcast>),
@@ -132,7 +132,8 @@ impl Recorder {
     pub fn start(input: &ff::format::context::Input, sink: &Sink) -> Result<Recorder, String> {
         let (out, path) = match sink {
             Sink::File(path) => {
-                let out = ff::format::output_as(path, "matroska")
+                let format = if is_ts(path) { "mpegts" } else { "matroska" };
+                let out = ff::format::output_as(path, format)
                     .map_err(|e| format!("can't record to {}: {e}", path.display()))?;
                 (out, Some(path.clone()))
             }
@@ -147,7 +148,8 @@ impl Recorder {
                 )
             }
         };
-        let streaming = path.is_none();
+        // MPEG-TS, streamed or to a file, holds fewer codecs and wants H.264/HEVC in Annex B.
+        let ts = path.as_deref().is_none_or(is_ts);
         let mut out = out;
         let fail = |e: ff::Error| format!("can't copy this media: {e}");
         let mut routes = Vec::new();
@@ -159,7 +161,7 @@ impl Recorder {
             let wanted = matches!(medium, Type::Video | Type::Audio | Type::Subtitle)
                 && !cover
                 && parameters.id() != ff::codec::Id::None
-                && (!streaming || in_mpegts(parameters.id()));
+                && (!ts || in_mpegts(parameters.id()));
             if !wanted {
                 routes.push(None);
                 continue;
@@ -167,7 +169,7 @@ impl Recorder {
             let mut ost = out
                 .add_stream(ff::encoder::find(ff::codec::Id::None))
                 .map_err(fail)?;
-            let filter = if streaming {
+            let filter = if ts {
                 Filter::new(parameters.id(), &parameters)
             } else {
                 None
@@ -191,12 +193,14 @@ impl Recorder {
             }));
         }
         if kept.is_empty() {
-            return Err(if streaming {
-                "this media's video and sound can't go in a network stream; convert it to MP4 first"
-                    .into()
-            } else {
-                "nothing in this media can be recorded".into()
-            });
+            return Err(match (&path, ts) {
+                (None, _) => {
+                    "this media's video and sound can't go in a network stream; convert it to MP4 first"
+                }
+                (Some(_), true) => "this media can't go in MPEG-TS; record to Matroska instead",
+                (Some(_), false) => "nothing in this media can be recorded",
+            }
+            .into());
         }
         out.write_header().map_err(fail)?;
         // The muxer picks the output time bases while writing the header.
@@ -370,6 +374,12 @@ pub fn stop(recorder: &mut Option<Recorder>, control: &Control, playhead: f64) {
 }
 
 /// Codecs MPEG-TS carries and players expect in it.
+/// A recording path that asks for MPEG-TS.
+fn is_ts(path: &Path) -> bool {
+    path.extension()
+        .is_some_and(|e| e.eq_ignore_ascii_case("ts"))
+}
+
 fn in_mpegts(id: Id) -> bool {
     matches!(
         id,
@@ -395,7 +405,7 @@ mod tests {
     #[test]
     fn streams_mpeg_ts_a_player_joining_midway_can_play() {
         use std::io::{Read, Write};
-        let server = stream::Server::start(std::net::Ipv4Addr::LOCALHOST.into()).unwrap();
+        let server = stream::Server::start(std::net::Ipv4Addr::LOCALHOST.into(), 8080).unwrap();
         // A keyframe every 2 s, the first of them IDR: a late player needs the parameter sets
         // repeated at the others.
         let clip = Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/test_60s.mp4");
@@ -452,6 +462,27 @@ mod tests {
         assert!(frames >= 30, "only {frames} frames decoded");
         drop(check);
         std::fs::remove_file(&ts).unwrap();
+    }
+
+    #[test]
+    fn records_mpeg_ts_for_a_ts_path() {
+        let clip = Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/test_60s.mp4");
+        let out = std::env::temp_dir().join(format!("myvlc-record-{}.ts", std::process::id()));
+        let mut input = ff::format::input(&clip).unwrap();
+        let mut recorder = Recorder::start(&input, &Sink::File(out.clone())).unwrap();
+        for (_, packet) in input.packets().take(120) {
+            recorder.push(&packet);
+        }
+        recorder.play_to(f64::INFINITY);
+        recorder.finish(0.0).unwrap();
+        let check = ff::format::input(&out).unwrap();
+        assert_eq!(check.format().name(), "mpegts");
+        let names: Vec<&str> = (check.streams())
+            .map(|s| s.parameters().id().name())
+            .collect();
+        assert_eq!(names, ["h264", "aac"]);
+        drop(check);
+        std::fs::remove_file(&out).unwrap();
     }
 
     #[test]

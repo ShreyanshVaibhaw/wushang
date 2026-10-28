@@ -17,7 +17,6 @@ use std::time::Duration;
 /// Chunks a player may fall behind by (the muxer writes about 32 KB at a time) before it is
 /// let go, rather than handed a stream with holes in it.
 const BACKLOG: usize = 256;
-const FIRST_PORT: u16 = 8080;
 
 /// The players connected now, each fed through a channel of its own.
 #[derive(Default)]
@@ -79,11 +78,12 @@ pub struct Server {
 }
 
 impl Server {
-    /// Listens on `ip`, on port 8080 or the first free one after it.
-    pub fn start(ip: IpAddr) -> io::Result<Server> {
-        let listener = (FIRST_PORT..FIRST_PORT + 20)
+    /// Listens on `ip`, on port `first` or the first free one of the 19 after it.
+    pub fn start(ip: IpAddr, first: u16) -> io::Result<Server> {
+        let last = first.saturating_add(19);
+        let listener = (first..=last)
             .find_map(|port| TcpListener::bind(SocketAddr::new(ip, port)).ok())
-            .ok_or_else(|| io::Error::other("no free port from 8080 to 8099"))?;
+            .ok_or_else(|| io::Error::other(format!("no free port from {first} to {last}")))?;
         let port = listener.local_addr()?.port();
         listener.set_nonblocking(true)?;
         let broadcast = Arc::new(Broadcast::default());
@@ -169,7 +169,7 @@ mod tests {
 
     #[test]
     fn every_player_gets_the_bytes_from_when_it_joined() {
-        let server = Server::start(IpAddr::V4(Ipv4Addr::LOCALHOST)).unwrap();
+        let server = Server::start(IpAddr::V4(Ipv4Addr::LOCALHOST), 8080).unwrap();
         let (port, broadcast) = (server.port, server.broadcast.clone());
         let connect = || {
             let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
