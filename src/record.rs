@@ -133,7 +133,13 @@ impl Recorder {
         let (out, path) = match sink {
             Sink::File(path) => {
                 let format = if is_ts(path) { "mpegts" } else { "matroska" };
-                let out = ff::format::output_as(path, format)
+                // ffmpeg-next panics on a path that isn't valid Unicode or holds a NUL, and
+                // this runs with the record lock held, which would poison it.
+                let name = path
+                    .to_str()
+                    .filter(|p| !p.contains('\0'))
+                    .ok_or_else(|| format!("can't record to {}", path.display()))?;
+                let out = ff::format::output_as(name, format)
                     .map_err(|e| format!("can't record to {}: {e}", path.display()))?;
                 (out, Some(path.clone()))
             }
@@ -279,15 +285,16 @@ impl Recorder {
         // (a keyframe starting a run two frames before it shows, room for B-frames); other
         // streams decode as they show. Decode times must always rise.
         let last = self.routes[packet.stream()].as_ref().unwrap().last_dts;
+        // Saturating: a crafted time stamp near i64::MAX mustn't overflow.
         let mut dts = packet.dts().map(shift).or(match (last, route.video) {
-            (Some(l), true) => Some(l + 1),
-            (None, true) => pts.map(|p| p - 2 * duration.max(1)),
+            (Some(l), true) => Some(l.saturating_add(1)),
+            (None, true) => pts.map(|p| p.saturating_sub(duration.max(1).saturating_mul(2))),
             (_, false) => pts,
         });
         if let (Some(d), Some(l)) = (dts, last)
             && d <= l
         {
-            dts = Some(l + 1);
+            dts = Some(l.saturating_add(1));
         }
         let mut copy = packet.clone();
         copy.set_pts(pts);

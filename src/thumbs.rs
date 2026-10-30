@@ -38,13 +38,13 @@ pub struct MediaInfo {
     pub genre: Option<String>,
 }
 
-/// Opens a file. ffmpeg-next unwraps the path as UTF-8, so other paths are refused here instead.
-/// Files only: a stream address would download from the network just for a thumbnail or tags.
+/// Opens a file. Files only: a stream address would download from the network just for a
+/// thumbnail or tags.
 fn open(path: &Path) -> Option<ff::format::context::Input> {
     if crate::net::is_address(path) {
         return None;
     }
-    ff::format::input(path.to_str()?).ok()
+    crate::session::open_file(path).ok()
 }
 
 /// A real video stream: cover art also comes as a video stream, flagged as an attached picture.
@@ -54,7 +54,7 @@ fn is_video(s: &ff::Stream) -> bool {
 
 /// Reads a tag from a raw dictionary. FFmpeg matches keys case-insensitively. The value is read
 /// lossily because ffmpeg-next's own `get` assumes UTF-8, which a broken file can violate.
-fn tag(dict: *const ffi::AVDictionary, key: &CStr) -> Option<String> {
+pub fn tag(dict: *const ffi::AVDictionary, key: &CStr) -> Option<String> {
     unsafe {
         let entry = ffi::av_dict_get(dict, key.as_ptr(), std::ptr::null(), 0);
         if entry.is_null() {
@@ -218,6 +218,11 @@ fn scale_cover(mut frame: ff::frame::Video, width: u32, height: u32) -> Option<T
     );
     let cw = ((f64::from(sw) * scale).round() as u32).max(width);
     let ch = ((f64::from(sh) * scale).round() as u32).max(height);
+    // A picture far thinner than the thumbnail (a crafted 16384x1 cover) would scale up to
+    // gigabytes before the crop; it gets no thumbnail instead.
+    if cw > 8192 || ch > 8192 {
+        return None;
+    }
     // The mjpeg decoder hands out the deprecated full-range YUVJ formats, which make swscale warn.
     // The planes are laid out the same, so relabel them and pass the range on its own instead.
     let (format, full) = match frame.format() {
@@ -396,8 +401,9 @@ pub fn still_at(path: &Path, secs: f64, width: u32) -> Option<Thumbnail> {
     let (w, h) = (f64::from(frame.width()), f64::from(frame.height()));
     // Anamorphic video shows wider than it is stored.
     let aspect = frame.aspect_ratio();
+    // Clamped like `Session::display_size`: no real pixel is more than ten times wider than tall.
     let sar = if aspect.numerator() > 0 && aspect.denominator() > 0 {
-        f64::from(aspect)
+        f64::from(aspect).clamp(0.1, 10.0)
     } else {
         1.0
     };

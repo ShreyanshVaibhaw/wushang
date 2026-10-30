@@ -13,6 +13,8 @@ use std::path::Path;
 use crate::captions::CaptionStyle;
 
 const FILE: &str = "settings.txt";
+/// A settings file was there but couldn't be read, so none is written this run.
+static UNREADABLE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 const HEADER: &str = "# wushang settings v1";
 
 /// A list of choices: (stored key, label).
@@ -121,6 +123,9 @@ pub struct Prefs {
     pub check_updates: bool,
     // Interface.
     pub on_top: bool,
+    /// The control bar shows the time left ("-01:02:03") instead of the duration; a click on
+    /// it switches.
+    pub time_left: bool,
     pub remember_window: bool,
     /// The window's last restored rect in screen pixels (left, top, width, height), and whether
     /// it was maximized.
@@ -220,6 +225,7 @@ impl Default for Prefs {
             accent: crate::ui::theme::DEFAULT_ACCENT,
             check_updates: true,
             on_top: false,
+            time_left: false,
             remember_window: true,
             window: None,
             auto_hide: 0,
@@ -280,15 +286,28 @@ impl Default for Prefs {
 impl Prefs {
     /// Reads `dir`\settings.txt; anything missing or unreadable keeps its default.
     pub fn load(dir: &Path) -> Prefs {
-        fs::read_to_string(dir.join(FILE)).map_or_else(|_| Prefs::default(), |t| parse(&t))
+        match fs::read(dir.join(FILE)) {
+            Ok(bytes) => parse(&String::from_utf8_lossy(&bytes)),
+            Err(e) => {
+                // There but unreadable (another program has it locked): saving the defaults
+                // over it would lose every setting, so this run leaves it alone.
+                if e.kind() != io::ErrorKind::NotFound {
+                    eprintln!("wushang: can't read settings, so this run won't save them: {e}");
+                    UNREADABLE.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+                Prefs::default()
+            }
+        }
     }
 
-    /// Writes settings.txt through a temporary file, so a crash mid-write keeps the old one.
+    /// Writes settings.txt through a temporary file, so neither a crash nor a power cut leaves
+    /// it half written.
     pub fn save(&self, dir: &Path) -> io::Result<()> {
+        if UNREADABLE.load(std::sync::atomic::Ordering::Relaxed) {
+            return Ok(());
+        }
         fs::create_dir_all(dir)?;
-        let tmp = dir.join(format!("{FILE}.tmp"));
-        fs::write(&tmp, self.to_text())?;
-        fs::rename(tmp, dir.join(FILE))
+        crate::library::write_replacing(&dir.join(FILE), self.to_text().as_bytes())
     }
 
     fn to_text(&self) -> String {
@@ -299,6 +318,7 @@ impl Prefs {
         line("accent", format!("#{:06X}", self.accent));
         line("check_updates", self.check_updates.to_string());
         line("on_top", self.on_top.to_string());
+        line("time_left", self.time_left.to_string());
         line("remember_window", self.remember_window.to_string());
         if let Some(([x, y, w, h], max)) = self.window {
             line("window", format!("{x} {y} {w} {h} {max}"));
@@ -322,7 +342,8 @@ impl Prefs {
         line("start_fullscreen", self.start_fullscreen.to_string());
         line("keep_awake", self.keep_awake.to_string());
         line("aspect", self.aspect.clone());
-        line("device", self.device.clone());
+        // The sound device's name comes from its driver; a line break in it would start a line.
+        line("device", self.device.replace(['\r', '\n'], " "));
         line(
             "startup_volume",
             key(STARTUP_VOLUME, self.startup_volume).into(),
@@ -429,6 +450,7 @@ fn parse(text: &str) -> Prefs {
             "accent" => colour(&mut p.accent),
             "check_updates" => flag(&mut p.check_updates),
             "on_top" => flag(&mut p.on_top),
+            "time_left" => flag(&mut p.time_left),
             "remember_window" => flag(&mut p.remember_window),
             "window" => {
                 let parts: Vec<&str> = v.split_whitespace().collect();
@@ -554,6 +576,7 @@ mod tests {
             theme: 2,
             accent: 0x144297,
             on_top: true,
+            time_left: true,
             window: Some(([-1200, 40, 1600, 900], true)),
             auto_hide: 1,
             hide_after: 6.0,

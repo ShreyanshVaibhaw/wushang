@@ -38,12 +38,13 @@ impl Bookmarks {
         let mut text = format!("{HEADER}\n");
         for b in &self.items {
             let name = b.name.replace(['\t', '\r', '\n'], " ");
-            text += &format!("{}\t{:.3}\t{name}\n", b.path.display(), b.seconds);
+            let path = b.path.display().to_string();
+            // A stream address with a tab or newline in it would split into other records.
+            if !path.contains(['\t', '\r', '\n']) {
+                text += &format!("{path}\t{:.3}\t{name}\n", b.seconds);
+            }
         }
-        // Write then rename, so a crash mid-write leaves the old file whole.
-        let tmp = self.file.with_extension("txt.tmp");
-        fs::write(&tmp, text)?;
-        fs::rename(&tmp, &self.file)
+        crate::library::write_replacing(&self.file, text.as_bytes())
     }
 
     /// `path`'s bookmarks, earliest first.

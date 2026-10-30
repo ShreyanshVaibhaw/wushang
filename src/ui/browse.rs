@@ -469,7 +469,8 @@ pub(super) fn layout(
 
 /// Adds the overlay panel to a player layout: section rail, history, breadcrumb and the list.
 pub(super) fn overlay(p: &Painter, l: &mut Layout, b: &Browse) {
-    let panel = Rect::new(l.video.l, l.video.t, l.video.l + OVERLAY_W, l.video.b);
+    let c = l.content;
+    let panel = Rect::new(c.l, c.t, c.l + OVERLAY_W, c.b);
     let (x0, t) = (panel.l + RAIL_W, panel.t);
     for (i, section) in SECTIONS.iter().enumerate() {
         l.buttons.push((Hit::Nav(*section), rail_icon(panel, i)));

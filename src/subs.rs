@@ -149,8 +149,11 @@ impl Cues {
     fn insert(&self, mut cue: Cue, open: bool) {
         let mut cues = self.list.lock().unwrap();
         let at = cues.partition_point(|e| e.cue.start <= cue.start);
-        // After a seek the demuxer and its preroll may both send a cue; it shows once.
-        let same = cues.partition_point(|e| e.cue.start < cue.start);
+        // After a seek the demuxer and its preroll may both send a cue; it shows once. Only the
+        // last few cues at that start are compared, so thousands sharing one start stay cheap.
+        let same = cues
+            .partition_point(|e| e.cue.start < cue.start)
+            .max(at.saturating_sub(16));
         if cues[same..at].iter().any(|e| e.cue.content == cue.content) {
             return;
         }
@@ -281,6 +284,11 @@ pub fn load_external(
     canvas: impl Into<crate::ass::Canvas>,
 ) -> Result<Arc<Cues>, String> {
     let canvas = canvas.into();
+    // Subtitle files run to kilobytes; one this big is not a subtitle file, and reading it
+    // whole would stall the window and eat memory.
+    if std::fs::metadata(path).is_ok_and(|m| m.len() > 64 << 20) {
+        return Err(format!("{} is too big for a subtitle file", path.display()));
+    }
     let ext = path.extension().map(|e| e.to_string_lossy().to_lowercase());
     if matches!(ext.as_deref(), Some("ass" | "ssa"))
         && crate::ass::styling()
@@ -305,7 +313,7 @@ pub fn load_external(
             }));
         }
     }
-    let mut input = ff::format::input(path).map_err(|e| format!("cannot open {path:?}: {e}"))?;
+    let mut input = crate::session::open_file(path)?;
     let stream = input
         .streams()
         .best(ff::media::Type::Subtitle)
@@ -640,11 +648,18 @@ fn parse_ass_text(text: &str) -> Vec<Vec<Span>> {
         run.clear();
     };
     let mut rest = text;
+    // Once no '}' is left, later '{'s stay text without searching again, so a cue of nothing
+    // but '{' costs linear time, not quadratic.
+    let mut closes = true;
     while let Some(c) = rest.chars().next() {
         let line = lines.last_mut().unwrap();
-        if c == '{'
-            && let Some(close) = rest.find('}')
-        {
+        let close = if c == '{' && closes {
+            rest.find('}')
+        } else {
+            None
+        };
+        closes &= c != '{' || close.is_some();
+        if let Some(close) = close {
             flush(&mut run, line, italic, bold);
             for tag in rest[1..close].split('\\').map(str::trim) {
                 // A flag is the tag letter plus digits only, so \blur, \bord and \iclip don't count.

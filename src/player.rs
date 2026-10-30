@@ -185,8 +185,21 @@ struct Seek {
     /// Last target requested. The clock is unknown right after a seek, so a second key press
     /// builds on this instead of jumping back to the start.
     last: f64,
-    /// The pending seek is `Shared::seek_quick`'s.
-    quick: bool,
+    /// How the pending seek lands.
+    kind: SeekKind,
+}
+
+#[derive(Clone, Copy, Default, PartialEq, Debug)]
+enum SeekKind {
+    /// On the frame at the target, decoding there from the keyframe before it.
+    #[default]
+    Exact,
+    /// On the keyframe at or before the target, for a dragged seek bar.
+    Quick,
+    /// A skip (arrow keys, skip buttons, wheel): on the nearest keyframe in its direction
+    /// (forward or not), and playback carries on from there at once, as in mpv. Exact would
+    /// first decode up to seconds of video from the keyframe before, a visible stall.
+    Jump(bool),
 }
 
 impl Shared {
@@ -266,7 +279,7 @@ impl Shared {
         let mut seek = self.seek.lock().unwrap();
         seek.last = target.max(0.0);
         seek.pending = Some(seek.last);
-        seek.quick = false;
+        seek.kind = SeekKind::Exact;
     }
 
     /// A seek that shows the keyframe at or before `target` rather than the frame at it: fast
@@ -275,7 +288,7 @@ impl Shared {
         let mut seek = self.seek.lock().unwrap();
         seek.last = target.max(0.0);
         seek.pending = Some(seek.last);
-        seek.quick = true;
+        seek.kind = SeekKind::Quick;
     }
 
     pub fn toggle_pause(&self) {
@@ -289,13 +302,18 @@ impl Shared {
         let from = self.clock.get().unwrap_or(seek.last);
         seek.last = (from + delta).max(0.0);
         seek.pending = Some(seek.last);
-        seek.quick = false;
+        // No move at all re-reads where playback is (a recording starting), exactly.
+        seek.kind = if delta == 0.0 {
+            SeekKind::Exact
+        } else {
+            SeekKind::Jump(delta > 0.0)
+        };
     }
 
-    /// The seek the demuxer should do, and whether it is quick.
-    fn take_seek(&self) -> Option<(f64, bool)> {
+    /// The seek the demuxer should do, and how it lands.
+    fn take_seek(&self) -> Option<(f64, SeekKind)> {
         let mut seek = self.seek.lock().unwrap();
-        seek.pending.take().map(|t| (t, seek.quick))
+        seek.pending.take().map(|t| (t, seek.kind))
     }
 }
 
@@ -589,6 +607,8 @@ pub fn spawn_demuxer(
         let mut playhead = 0.0;
         // Subtitle streams already sent what shows at the reading position from before it.
         let mut prerolled: Vec<usize> = Vec::new();
+        // After a jump, the video stream whose first packet sets where playback starts.
+        let mut jump_floor: Option<usize> = None;
         while !shared.quitting() {
             playhead = shared.clock.get().unwrap_or(playhead);
             for (control, recorder) in copies.iter().zip(&mut recorders) {
@@ -599,7 +619,7 @@ pub fn spawn_demuxer(
                     r.play_to(playhead);
                 }
             }
-            let (target, quick) = if follower {
+            let (target, kind) = if follower {
                 let now = shared.serial.load(Relaxed);
                 let target = (now != followed).then(|| {
                     followed = now;
@@ -609,13 +629,24 @@ pub fn spawn_demuxer(
             } else {
                 shared.take_seek().unzip()
             };
-            let quick = quick.unwrap_or(false);
+            let kind = kind.unwrap_or_default();
             if let Some(target) = target {
-                // Lands on the keyframe at or before the target; the decoders skip up to the target.
+                // Lands on the keyframe at or before the target; the decoders skip up to the
+                // target, unless the seek is quick or a jump.
                 let ts = (target.max(0.0) * f64::from(ffi::AV_TIME_BASE)) as i64;
                 let played = routes.lock().unwrap().first().map(|r| r.stream);
+                // A jump needs a picture to land on; without video every packet is one.
+                let video = match kind {
+                    SeekKind::Jump(_) => video_route(&input, &routes),
+                    _ => None,
+                };
                 let sought = match played.filter(|_| follower) {
                     Some(stream) => seek_stream(&mut input, stream, ts),
+                    // Forward to the first keyframe after the target. Near the end there may
+                    // be none, and the one before it serves.
+                    None if video.is_some() && kind == SeekKind::Jump(true) => {
+                        input.seek(ts, ts..).or_else(|_| input.seek(ts, ..ts + 1))
+                    }
                     None => input.seek(ts, ..ts + 1),
                 };
                 if let Err(e) = sought {
@@ -626,7 +657,8 @@ pub fn spawn_demuxer(
                     followed
                 } else {
                     shared.seek_floor.store(target.max(0.0).to_bits(), Relaxed);
-                    shared.exact.store(!quick, Relaxed);
+                    shared.exact.store(kind == SeekKind::Exact, Relaxed);
+                    jump_floor = video;
                     shared.serial.fetch_add(1, Relaxed) + 1
                 };
                 for r in routes.lock().unwrap().iter() {
@@ -642,7 +674,7 @@ pub fn spawn_demuxer(
                 eof = false;
                 // Quick seeks come many a second from a dragged seek bar; the exact one that
                 // ends the drag reads the subtitles before it.
-                if !quick {
+                if kind != SeekKind::Quick {
                     prerolled.clear();
                 }
             }
@@ -679,6 +711,16 @@ pub fn spawn_demuxer(
             let mut packet = ff::Packet::empty();
             match packet.read(&mut input) {
                 Ok(()) => {
+                    // The keyframe a jump landed on: sound starts there too, not at the target.
+                    if jump_floor == Some(packet.stream()) {
+                        jump_floor = None;
+                        if let (Some(ts), Some(stream)) =
+                            (packet.pts().or(packet.dts()), input.stream(packet.stream()))
+                        {
+                            let at = ts as f64 * f64::from(stream.time_base());
+                            shared.seek_floor.store(at.max(0.0).to_bits(), Relaxed);
+                        }
+                    }
                     for r in recorders.iter_mut().flatten() {
                         r.push(&packet);
                     }
@@ -771,10 +813,11 @@ fn spawn_preroll(
             {
                 return;
             }
-            let Some(pts) = packet.pts() else {
+            // A stream that appeared after opening (MPEG-TS, FLV) has no base here.
+            let (Some(pts), Some(base)) = (packet.pts(), bases.get(packet.stream())) else {
                 continue;
             };
-            let t = pts as f64 * bases[packet.stream()];
+            let t = pts as f64 * base;
             // Video comes in decoding order, a few frames ahead of its own times.
             if t > at + 1.0 {
                 return;
@@ -790,6 +833,19 @@ fn spawn_preroll(
 
 /// Seeks `input` to the keyframe of `stream` at or before `ts` (in `AV_TIME_BASE` units). A file
 /// with video otherwise seeks on that video's keyframes, which can be seconds before `ts`.
+/// The routed video stream, not counting cover art.
+fn video_route(input: &ff::format::context::Input, routes: &Routes) -> Option<usize> {
+    let routes = routes.lock().unwrap();
+    routes.iter().map(|r| r.stream).find(|&i| {
+        input.stream(i).is_some_and(|s| {
+            s.parameters().medium() == ff::media::Type::Video
+                && !s
+                    .disposition()
+                    .contains(ff::format::stream::Disposition::ATTACHED_PIC)
+        })
+    })
+}
+
 fn seek_stream(
     input: &mut ff::format::context::Input,
     stream: usize,
@@ -937,6 +993,22 @@ pub fn spawn_video_decoder(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn skips_jump_to_keyframes_and_the_seek_bar_lands_exactly() {
+        let shared = Shared::new();
+        shared.seek_by(10.0);
+        assert_eq!(shared.take_seek(), Some((10.0, SeekKind::Jump(true))));
+        shared.seek_by(-4.0);
+        assert_eq!(shared.take_seek(), Some((6.0, SeekKind::Jump(false))));
+        shared.seek_by(0.0);
+        assert_eq!(shared.take_seek(), Some((6.0, SeekKind::Exact)));
+        shared.seek_to(30.0);
+        assert_eq!(shared.take_seek(), Some((30.0, SeekKind::Exact)));
+        shared.seek_quick(31.0);
+        assert_eq!(shared.take_seek(), Some((31.0, SeekKind::Quick)));
+        assert_eq!(shared.take_seek(), None);
+    }
 
     #[test]
     fn bounded_queue_drops_oldest_packets_but_keeps_markers() {

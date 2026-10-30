@@ -4,6 +4,7 @@
 
 use std::collections::HashMap;
 use std::error::Error;
+use std::ffi::CStr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering::Relaxed;
@@ -104,7 +105,7 @@ pub fn open_input(
         return ff::format::input(&url).map_err(|e| format!("can't play the disc: {e}"));
     }
     if !net::is_url_path(path) {
-        return ff::format::input(path).map_err(|e| format!("cannot open {path:?}: {e}"));
+        return open_file(path);
     }
     let url = path.to_string_lossy();
     let micros = (u64::from(options.timeout) * 1_000_000).to_string();
@@ -130,6 +131,41 @@ pub fn open_input(
     let cancel = cancel.clone();
     ff::format::input_with_interrupt_and_dictionary(path, move || cancel.load(Relaxed), dict)
         .map_err(|e| format!("cannot open {}: {e}", net::redact(&url)))
+}
+
+/// Opens a local file. The `file:` prefix keeps FFmpeg from reading the path as another of its
+/// protocols (`concat:`, `data:`), and the formats that open more connections (HLS and SDP
+/// playlists, RTSP) are left out, so a playlist posing as a video can't make wushang reach a
+/// server, a Windows share (and its sign-in) included.
+pub fn open_file(path: &Path) -> Result<ff::format::context::Input, String> {
+    // ffmpeg-next panics on a path that isn't valid Unicode.
+    let Some(p) = path.to_str() else {
+        return Err(format!("{} has a name wushang can't open", path.display()));
+    };
+    let mut options = ff::Dictionary::new();
+    options.set("format_whitelist", local_formats());
+    ff::format::input_with_dictionary(&format!("file:{p}"), options)
+        .map_err(|e| format!("cannot open {path:?}: {e}"))
+}
+
+/// Every demuxer this FFmpeg has except hls, sdp and rtsp, comma-separated.
+fn local_formats() -> &'static str {
+    static FORMATS: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    FORMATS.get_or_init(|| {
+        let mut names = Vec::new();
+        let mut opaque = std::ptr::null_mut();
+        loop {
+            let format = unsafe { ff::ffi::av_demuxer_iterate(&mut opaque) };
+            if format.is_null() {
+                break;
+            }
+            let name = unsafe { CStr::from_ptr((*format).name) }.to_string_lossy();
+            if !["hls", "sdp", "rtsp"].contains(&&*name) {
+                names.push(name.into_owned());
+            }
+        }
+        names.join(",")
+    })
 }
 
 /// Whether `path` is a live stream FFmpeg doesn't reconnect itself (it does http and HLS), so
@@ -274,15 +310,9 @@ impl Session {
                 forced_subtitles = Some(stream.index());
             }
             let metadata = stream.metadata();
-            let tag = |key: &str| {
-                metadata
-                    .get(key)
-                    .map(str::trim)
-                    .filter(|v| !v.is_empty())
-                    .map(str::to_owned)
-            };
-            let language = tag("language").filter(|l| !l.eq_ignore_ascii_case("und"));
-            titles[kind as usize].push(tag("title"));
+            let tag = |key: &CStr| meta(&metadata, key);
+            let language = tag(c"language").filter(|l| !l.eq_ignore_ascii_case("und"));
+            titles[kind as usize].push(tag(c"title"));
             tracks[kind as usize].push(TrackInfo {
                 stream: stream.index(),
                 label: String::new(),
@@ -339,11 +369,9 @@ impl Session {
             _ if capture => "Capture".to_owned(),
             _ if disc => crate::disc::title(path),
             // A stream's own title ("icy-name" for radio) beats its address.
-            Some(url) => (input.metadata().get("icy-name"))
-                .or(input.metadata().get("title"))
-                .map(str::trim)
-                .filter(|t| !t.is_empty())
-                .map_or_else(|| net::url_name(url), str::to_owned),
+            Some(url) => meta(&input.metadata(), c"icy-name")
+                .or_else(|| meta(&input.metadata(), c"title"))
+                .unwrap_or_else(|| net::url_name(url)),
             None => path
                 .file_stem()
                 .unwrap_or(path.as_os_str())
@@ -443,8 +471,10 @@ impl Session {
         if sar.num <= 0 || sar.den <= 0 {
             return Some((w, h));
         }
-        let shown = f64::from(w) * f64::from(sar.num) / f64::from(sar.den);
-        Some((shown.round() as u32, h))
+        // Real pixel shapes stay well inside 1:10 to 10:1. A crafted one would make the subtitle
+        // canvas, which this sizes, billions of pixels wide.
+        let sar = (f64::from(sar.num) / f64::from(sar.den)).clamp(0.1, 10.0);
+        Some(((f64::from(w) * sar).round() as u32, h))
     }
 
     /// Where playback is in the media. The clock runs ahead by the audio delay (that is how the
@@ -599,7 +629,7 @@ impl Session {
             return first.ok_or_else(|| format!("{path:?} has no audio track"));
         }
         let base = EXTERNAL * (self.externals.len() + 1);
-        let input = ff::format::input(path).map_err(|e| format!("cannot open {path:?}: {e}"))?;
+        let input = open_file(path)?;
         let name = path
             .file_name()
             .unwrap_or_default()
@@ -615,18 +645,12 @@ impl Session {
                 continue;
             }
             let metadata = stream.metadata();
-            let tag = |key: &str| {
-                metadata
-                    .get(key)
-                    .map(str::trim)
-                    .filter(|v| !v.is_empty())
-                    .map(str::to_owned)
-            };
-            titles.push(tag("title"));
+            let tag = |key: &CStr| meta(&metadata, key);
+            titles.push(tag(c"title"));
             added.push(TrackInfo {
                 stream: base + stream.index(),
                 label: String::new(),
-                language: tag("language").filter(|l| !l.eq_ignore_ascii_case("und")),
+                language: tag(c"language").filter(|l| !l.eq_ignore_ascii_case("und")),
                 codec: parameters.id().name().to_owned(),
                 default: false,
                 size: picture_size(&parameters),
@@ -784,9 +808,8 @@ impl Session {
 /// An attachment that is a font: its file name and bytes.
 fn attached_font(stream: &ff::Stream) -> Option<(String, Vec<u8>)> {
     let metadata = stream.metadata();
-    let name = metadata.get("filename").unwrap_or_default().to_owned();
-    let mime = metadata
-        .get("mimetype")
+    let name = meta(&metadata, c"filename").unwrap_or_default();
+    let mime = meta(&metadata, c"mimetype")
         .unwrap_or_default()
         .to_ascii_lowercase();
     let lower = name.to_ascii_lowercase();
@@ -809,17 +832,19 @@ fn read_chapters(input: &ff::format::context::Input) -> Vec<(f64, String)> {
         .enumerate()
         .map(|(i, c)| {
             let start = c.start() as f64 * f64::from(c.time_base());
-            let title = c
-                .metadata()
-                .get("title")
-                .map(str::trim)
-                .filter(|t| !t.is_empty())
-                .map_or_else(|| format!("Chapter {}", i + 1), str::to_owned);
+            let title =
+                meta(&c.metadata(), c"title").unwrap_or_else(|| format!("Chapter {}", i + 1));
             (start.max(0.0), title)
         })
         .collect();
     chapters.sort_by(|a, b| a.0.total_cmp(&b.0));
     chapters
+}
+
+/// A tag, trimmed, None when empty. Never ffmpeg-next's `get`: it hands back file bytes as a
+/// `&str` without checking they are UTF-8, which a crafted file turns into undefined behaviour.
+fn meta(dict: &ff::DictionaryRef, key: &CStr) -> Option<String> {
+    crate::thumbs::tag(unsafe { dict.as_ptr() }, key)
 }
 
 impl Drop for Session {
@@ -954,6 +979,35 @@ mod tests {
     use std::sync::atomic::AtomicBool;
     use std::thread;
     use std::time::{Duration, Instant};
+
+    /// A downloaded HLS playlist pulling its segment from elsewhere: plain FFmpeg follows it
+    /// (here to a local file; in an attack to a \\server\share, which signs the user in there),
+    /// `open_file` won't. FFmpeg itself only takes HLS from .m3u8, .m3u and .hls names.
+    #[test]
+    fn a_downloaded_playlist_opens_nothing_else() {
+        let dir = std::env::temp_dir().join(format!("wushang-hls-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let segment = Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/test_h264.mp4");
+        let fake = dir.join("holiday.m3u8");
+        std::fs::write(
+            &fake,
+            format!(
+                "#EXTM3U\n#EXT-X-TARGETDURATION:10\n#EXTINF:5,\n{}\n#EXT-X-ENDLIST\n",
+                segment.display()
+            ),
+        )
+        .unwrap();
+        let plain = ff::format::input(&fake).expect("plain FFmpeg opens it as HLS");
+        assert_eq!(plain.format().name(), "hls");
+        drop(plain);
+        assert!(open_file(&fake).is_err());
+        assert!(open_file(&segment).is_ok(), "real files still open");
+        assert!(
+            open_file(Path::new("concat:a|b")).is_err(),
+            "no protocol names"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     /// Made with the GPL ffmpeg from test_h264.mp4: 5 s of 640x360 H.264 with a keyframe every
     /// 0.5 s, a 440 Hz English and an 880 Hz Japanese AAC track (English default), and

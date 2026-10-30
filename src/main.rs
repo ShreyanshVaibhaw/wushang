@@ -49,8 +49,8 @@ use std::time::{Duration, Instant};
 use ffmpeg_next as ff;
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Dwm::{
-    DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND, DwmExtendFrameIntoClientArea,
-    DwmSetWindowAttribute,
+    DWM_WINDOW_CORNER_PREFERENCE, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_DONOTROUND, DWMWCP_ROUND,
+    DwmExtendFrameIntoClientArea, DwmSetWindowAttribute,
 };
 use windows::Win32::Graphics::Gdi::{
     BLACK_BRUSH, GetMonitorInfoW, GetStockObject, HBRUSH, MONITOR_DEFAULTTONEAREST,
@@ -154,6 +154,10 @@ thread_local! {
     static MINI_REQUEST: std::cell::Cell<Option<Option<Page>>> = const { std::cell::Cell::new(None) };
     /// Where the mini player last was: its left and bottom edges on screen, in pixels.
     static MINI_SPOT: std::cell::Cell<Option<(i32, i32)>> = const { std::cell::Cell::new(None) };
+    /// The mini player's card in DIPs, as the user last sized it (the design's at first).
+    static MINI_CARD: std::cell::Cell<(f32, f32)> = const { std::cell::Cell::new((ui::mini::W, ui::mini::H)) };
+    /// Whether the mini player window is sized with its queue open.
+    static MINI_QUEUE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 fn prefs() -> Prefs {
@@ -168,6 +172,9 @@ const SLEEP_END_OF_FILE: usize = 5;
 const DEFAULT_ZOOM: usize = 1;
 
 fn main() {
+    // Take the current folder out of the DLL search, so a DLL planted beside a video the user
+    // double-clicks (in Downloads, say) can't load into wushang. Ours sit beside the exe.
+    unsafe { _ = windows::Win32::System::LibraryLoader::SetDllDirectoryW(w!("")) };
     use_parent_console();
     let result = run();
     update::finish();
@@ -1363,10 +1370,15 @@ impl App {
             // Above 32 means it started.
             if done.0 as usize <= 32 {
                 let quoted = HSTRING::from(format!("\"{}\"", path.display()));
+                // By full path: a bare name is looked up in the current folder first, where a
+                // download could have put a notepad.exe of its own.
+                let root = std::env::var_os("SystemRoot").unwrap_or_else(|| r"C:\Windows".into());
+                let notepad =
+                    HSTRING::from(Path::new(&root).join(r"System32\notepad.exe").as_os_str());
                 ShellExecuteW(
                     Some(hwnd),
                     w!("open"),
-                    w!("notepad.exe"),
+                    &notepad,
                     &quoted,
                     None,
                     SW_SHOWNORMAL,
@@ -2086,7 +2098,8 @@ fn run() -> Result<(), Box<dyn Error>> {
                         || (w, h) != (old.width, old.height)
                         || ui.queue_stale(queue_data.as_ref());
                     changed.then(|| {
-                        let mut layout = Layout::mini(w, h, ui.queue.open);
+                        let card = MINI_CARD.get().1;
+                        let mut layout = Layout::mini(w, h, card, ui.queue.open);
                         if let Some(q) = &queue_data {
                             layout.add_mini_queue(&ui.queue, q);
                         }
@@ -2168,6 +2181,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                     position: ui.seek_preview().map_or(last_position, |f| f * duration),
                     duration,
                     live: duration <= 0.0 && session.is_some_and(|s| net::is_address(&s.path)),
+                    time_left: PREFS.with_borrow(|p| p.time_left),
                     // Reverse playback pauses underneath, but it is playing.
                     paused: paused && app.reverse.is_none(),
                     volume: shared.volume(),
@@ -2407,7 +2421,10 @@ fn handle(app: &mut App, hwnd: HWND, hit: Hit) {
                 Entry::Header { more: Some(p), .. } => go(p),
                 Entry::Header { more: None, .. } => {}
                 Entry::Folder { place, .. } => {
-                    if let Place::Folder(_, dir) = &place {
+                    // Visits are history too, kept only when Settings says to.
+                    if let Place::Folder(_, dir) = &place
+                        && PREFS.with_borrow(|p| p.save_recent)
+                    {
                         app.library.visit_folder(dir);
                         app.library_changed = true;
                     }
@@ -2722,9 +2739,13 @@ fn menu_action(app: &mut App, hwnd: HWND, action: MenuAction) {
         }
         MenuAction::ShowInExplorer(path) => {
             use std::os::windows::process::CommandExt;
-            // explorer.exe wants the quotes inside its one argument, so it goes in raw.
+            // explorer.exe wants the quotes inside its one argument, so it goes in raw. No real
+            // file name holds a quote, and one from a feed's address could end the argument and
+            // add others, so such a path never gets here.
             let select = format!("/select,\"{}\"", path.display());
-            if let Err(e) = std::process::Command::new("explorer.exe")
+            if path.to_string_lossy().contains('"') {
+                eprintln!("explorer: not a file");
+            } else if let Err(e) = std::process::Command::new("explorer.exe")
                 .raw_arg(select)
                 .spawn()
             {
@@ -3272,8 +3293,13 @@ fn pick_folder(hwnd: HWND) -> Option<PathBuf> {
 /// rounded corners, snapping and minimize/maximize animations.
 /// The window's own title, for the taskbar and Alt+Tab: the file playing, then the app.
 fn window_title(session: Option<&Session>) -> String {
-    match session.and_then(|s| s.path.file_name()) {
-        Some(name) => format!("{} - wushang", name.to_string_lossy()),
+    match session {
+        // A stream's own name: its address could carry a user name and password.
+        Some(s) if net::is_address(&s.path) => format!("{} - wushang", s.title),
+        Some(s) => match s.path.file_name() {
+            Some(name) => format!("{} - wushang", name.to_string_lossy()),
+            None => "wushang".to_owned(),
+        },
         None => "wushang".to_owned(),
     }
 }
@@ -3330,13 +3356,7 @@ fn create_window(title: &str, (video_w, video_h): (u32, u32)) -> windows::core::
             cyBottomHeight: 0,
         };
         _ = DwmExtendFrameIntoClientArea(hwnd, &margins);
-        let round = DWMWCP_ROUND;
-        _ = DwmSetWindowAttribute(
-            hwnd,
-            DWMWA_WINDOW_CORNER_PREFERENCE,
-            (&raw const round).cast(),
-            4,
-        );
+        set_corners(hwnd, DWMWCP_ROUND);
         // Re-run WM_NCCALCSIZE now that the window procedure removes the frame.
         _ = SetWindowPos(
             hwnd,
@@ -3502,7 +3522,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             let scale = unsafe { GetDpiForWindow(hwnd) }.max(96) as f32 / 96.0;
             // Narrower than this and the control bar's seek bar has no room left.
             let min = if is_mini() {
-                (ui::mini::W, ui::mini::H)
+                let queue = if MINI_QUEUE.get() {
+                    ui::mini::QUEUE_H
+                } else {
+                    0.0
+                };
+                (ui::mini::W, ui::mini::H + queue)
             } else {
                 MIN_SIZE
             };
@@ -3523,7 +3548,23 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 )
             };
         }
-        WM_SIZE => RESIZED.store(true, Relaxed),
+        WM_SIZE => {
+            RESIZED.store(true, Relaxed);
+            // The mini player keeps the size it is dragged to, queue apart.
+            if is_mini() {
+                let scale = unsafe { GetDpiForWindow(hwnd) }.max(96) as f32 / 96.0;
+                let (w, h) = client_size(hwnd);
+                let queue = if MINI_QUEUE.get() {
+                    ui::mini::QUEUE_H
+                } else {
+                    0.0
+                };
+                MINI_CARD.set((
+                    (w as f32 / scale).max(ui::mini::W),
+                    (h as f32 / scale - queue).max(ui::mini::H),
+                ));
+            }
+        }
         // The render loop can't run while Windows moves or sizes the window; a timer stands in.
         WM_ENTERSIZEMOVE => unsafe { _ = SetTimer(Some(hwnd), MODAL_TIMER, 1, None) },
         WM_EXITSIZEMOVE => {
@@ -3726,7 +3767,7 @@ fn nc_hit_test(hwnd: HWND, lparam: LPARAM) -> u32 {
     unsafe { _ = ScreenToClient(hwnd, &mut p) };
     let (w, h) = client_size(hwnd);
     let (w, h) = (w as i32, h as i32);
-    let resizable = !is_fullscreen() && !is_mini() && !unsafe { IsZoomed(hwnd) }.as_bool();
+    let resizable = !is_fullscreen() && !unsafe { IsZoomed(hwnd) }.as_bool();
     if resizable {
         let edge = (6.0 * unsafe { GetDpiForWindow(hwnd) }.max(96) as f32 / 96.0) as i32;
         let (left, right, top, bottom) = (p.x < edge, p.x >= w - edge, p.y < edge, p.y >= h - edge);
@@ -3766,6 +3807,7 @@ fn act(hwnd: HWND, shared: &Shared, action: Option<Action>) {
     match action {
         Action::Click(Hit::Play) => shared.toggle_pause(),
         Action::Click(Hit::Speaker) => shared.toggle_mute(),
+        Action::Click(Hit::Duration) => PREFS.with_borrow_mut(|p| p.time_left = !p.time_left),
         Action::Click(Hit::Minimize) => unsafe { _ = ShowWindow(hwnd, SW_MINIMIZE) },
         Action::Click(Hit::Maximize) => {
             let zoomed = unsafe { IsZoomed(hwnd) }.as_bool();
@@ -4157,14 +4199,12 @@ fn is_mini() -> bool {
     MINI.lock().unwrap().is_some()
 }
 
-/// The mini player's size in pixels: the card, and its queue when that's open.
+/// The mini player's size in pixels: the card as last sized, and its queue when that's open.
 fn mini_size(hwnd: HWND, queue: bool) -> (i32, i32) {
     let scale = unsafe { GetDpiForWindow(hwnd) }.max(96) as f32 / 96.0;
-    let h = ui::mini::H + if queue { ui::mini::QUEUE_H } else { 0.0 };
-    (
-        (ui::mini::W * scale).round() as i32,
-        (h * scale).round() as i32,
-    )
+    let (w, h) = MINI_CARD.get();
+    let h = h + if queue { ui::mini::QUEUE_H } else { 0.0 };
+    ((w * scale).round() as i32, (h * scale).round() as i32)
 }
 
 /// Shrinks the window to the mini player, above other windows: where it last was, or at the
@@ -4203,6 +4243,7 @@ fn enter_mini(hwnd: HWND) {
         ui.overlay = false;
         ui.show(Page::Mini);
     });
+    MINI_QUEUE.set(false);
     let (w, h) = mini_size(hwnd, false);
     let work = monitor.rcWork;
     let margin = 16 * w / 391;
@@ -4227,8 +4268,12 @@ fn exit_mini(hwnd: HWND, page: Page) {
     set_topmost(hwnd, prefs().on_top);
 }
 
-/// Grows the mini player up for its queue and back, keeping its bottom edge.
+/// Grows the mini player up for its queue and back, keeping its bottom edge. Otherwise its
+/// size is the user's.
 fn fit_mini(hwnd: HWND, queue: bool) {
+    if MINI_QUEUE.replace(queue) == queue {
+        return;
+    }
     let (w, h) = mini_size(hwnd, queue);
     let mut r = RECT::default();
     if unsafe { GetWindowRect(hwnd, &mut r) }.is_err() || r.bottom - r.top == h {
@@ -4236,6 +4281,17 @@ fn fit_mini(hwnd: HWND, queue: bool) {
     }
     let flags = SWP_NOZORDER | SWP_NOACTIVATE;
     unsafe { _ = SetWindowPos(hwnd, None, r.left, r.bottom - h, w, h, flags) };
+}
+
+fn set_corners(hwnd: HWND, corners: DWM_WINDOW_CORNER_PREFERENCE) {
+    unsafe {
+        _ = DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_WINDOW_CORNER_PREFERENCE,
+            (&raw const corners).cast(),
+            4,
+        );
+    }
 }
 
 /// Borderless fullscreen on the window's monitor, and back.
@@ -4262,6 +4318,8 @@ fn toggle_fullscreen(hwnd: HWND) {
                     *windowed = Some((style, placement));
                     drop(windowed);
                     SetWindowLongPtrW(hwnd, GWL_STYLE, style & !(WS_OVERLAPPEDWINDOW.0 as isize));
+                    // Square corners, so the video reaches the screen's corners.
+                    set_corners(hwnd, DWMWCP_DONOTROUND);
                     let r = monitor.rcMonitor;
                     let flags = SWP_NOOWNERZORDER | SWP_FRAMECHANGED;
                     _ = SetWindowPos(
@@ -4278,6 +4336,7 @@ fn toggle_fullscreen(hwnd: HWND) {
             Some((style, placement)) => {
                 drop(windowed);
                 SetWindowLongPtrW(hwnd, GWL_STYLE, style);
+                set_corners(hwnd, DWMWCP_ROUND);
                 _ = SetWindowPlacement(hwnd, &placement);
                 let flags =
                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_FRAMECHANGED;

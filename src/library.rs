@@ -270,6 +270,22 @@ pub struct Library {
     picks: HashMap<String, TrackPrefs>,
     /// Which subfolders hold media, for folder listings.
     media_dirs: MediaDirs,
+    /// state.txt is there but couldn't be read (another program had it locked, say), so saving
+    /// this nearly empty library would wipe it.
+    unreadable: bool,
+}
+
+/// Replaces `file` with `bytes` through a temporary file, flushed to disk before the rename, so
+/// neither a crash nor a power cut can leave it half written.
+pub fn write_replacing(file: &Path, bytes: &[u8]) -> io::Result<()> {
+    let mut name = file.as_os_str().to_owned();
+    name.push(".tmp");
+    let tmp = PathBuf::from(name);
+    let mut f = fs::File::create(&tmp)?;
+    io::Write::write_all(&mut f, bytes)?;
+    f.sync_all()?;
+    drop(f);
+    fs::rename(tmp, file)
 }
 
 impl Library {
@@ -307,11 +323,19 @@ impl Library {
             stations: None,
             picks: HashMap::new(),
             media_dirs: MediaDirs::default(),
+            unreadable: false,
         };
         match fs::read(dir.join(STATE_FILE)) {
             Ok(bytes) => lib.parse(&String::from_utf8_lossy(&bytes)),
-            Err(e) if seed && e.kind() == ErrorKind::NotFound => lib.seed_roots(),
-            Err(_) => {}
+            Err(e) if e.kind() == ErrorKind::NotFound => {
+                if seed {
+                    lib.seed_roots();
+                }
+            }
+            Err(e) => {
+                eprintln!("wushang: can't read the library, so this run won't save it: {e}");
+                lib.unreadable = true;
+            }
         }
         lib
     }
@@ -410,48 +434,62 @@ impl Library {
     /// Writes state.txt through a temporary file, so a crash mid-write keeps the old state.
     /// Paths that are not valid Unicode are left out.
     pub fn save(&self) -> io::Result<()> {
+        if self.unreadable {
+            return Ok(());
+        }
         let mut out = format!("{STATE_HEADER}\n");
+        // One record per line. Paths and URLs can come from feeds and media files, and a tab or
+        // newline in one would split it into records of the attacker's choosing, so such a
+        // record is left out.
+        let mut put = |fields: &[&str]| {
+            if !fields.iter().any(|f| f.contains(['\t', '\n', '\r'])) {
+                out += &fields.join("\t");
+                out.push('\n');
+            }
+        };
         for (kind, roots) in [("videos", &self.video_roots), ("music", &self.music_roots)] {
             for p in roots.iter().filter_map(|p| p.to_str()) {
-                writeln!(out, "root\t{kind}\t{p}").unwrap();
+                put(&["root", kind, p]);
             }
         }
         for r in &self.recent {
             if let Some(p) = r.path.to_str() {
-                writeln!(out, "recent\t{p}\t{}\t{}", r.position, r.duration).unwrap();
+                put(&[
+                    "recent",
+                    p,
+                    &r.position.to_string(),
+                    &r.duration.to_string(),
+                ]);
             }
         }
         for (kind, counts) in [("visit", &self.visits), ("plays", &self.plays)] {
             for (p, n) in counts {
                 if let Some(p) = p.to_str() {
-                    writeln!(out, "{kind}\t{p}\t{n}").unwrap();
+                    put(&[kind, p, &n.to_string()]);
                 }
             }
         }
         for (name, n) in &self.playlist_plays {
-            writeln!(out, "playlist\t{name}\t{n}").unwrap();
+            put(&["playlist", name, &n.to_string()]);
         }
         for (name, p) in &self.thumbnails {
             if let Some(p) = p.to_str() {
-                writeln!(out, "thumb\t{name}\t{p}").unwrap();
+                put(&["thumb", name, p]);
             }
         }
         for p in self.favorites.iter().filter_map(|p| p.to_str()) {
-            writeln!(out, "favorite\t{p}").unwrap();
+            put(&["favorite", p]);
         }
         for (scope, t) in &self.picks {
             let value = |v: &Option<String>| v.clone().unwrap_or_else(|| "-".into());
-            let (audio, subtitles) = (value(&t.audio), value(&t.subtitles));
-            writeln!(out, "tracks\t{scope}\t{audio}\t{subtitles}").unwrap();
+            put(&["tracks", scope, &value(&t.audio), &value(&t.subtitles)]);
         }
         for a in &self.addresses {
             let name = a.name.replace(['\t', '\n', '\r'], " ");
-            writeln!(out, "address\t{}\t{}\t{name}", a.kind.key(), a.url).unwrap();
+            put(&["address", a.kind.key(), &a.url, &name]);
         }
         fs::create_dir_all(&self.dir)?;
-        let tmp = self.dir.join("state.txt.tmp");
-        fs::write(&tmp, out)?;
-        fs::rename(tmp, self.dir.join(STATE_FILE))
+        write_replacing(&self.dir.join(STATE_FILE), out.as_bytes())
     }
 
     fn root_list(&self, section: Section) -> &[PathBuf] {
@@ -991,7 +1029,10 @@ impl Library {
         let path = abs(path);
         let line = path
             .to_str()
-            .ok_or_else(|| io::Error::new(ErrorKind::InvalidInput, "path is not valid Unicode"))?;
+            .filter(|p| !p.contains(['\n', '\r']))
+            .ok_or_else(|| {
+                io::Error::new(ErrorKind::InvalidInput, "path can't go in a playlist")
+            })?;
         let mut text = match fs::read_to_string(&file) {
             Ok(text) => text,
             Err(e) if e.kind() == ErrorKind::NotFound => String::new(),
@@ -1004,7 +1045,7 @@ impl Library {
         }
         writeln!(text, "{line}").unwrap();
         fs::create_dir_all(self.playlist_dir())?;
-        fs::write(file, text)
+        write_replacing(&file, text.as_bytes())
     }
 
     /// The files of a playlist in order. Relative lines resolve against the playlists folder.
@@ -1105,7 +1146,7 @@ impl Library {
         for line in lines[..start].iter().chain(&lines[at + 1..]) {
             writeln!(out, "{line}").unwrap();
         }
-        fs::write(file, out)
+        write_replacing(&file, out.as_bytes())
     }
 
     pub fn playlist_thumbnail(&self, name: &str) -> Option<&Path> {
@@ -1332,6 +1373,10 @@ fn track_media(t: &Track) -> Entry {
 
 /// The file or folder name, or the whole path for a drive root like `D:\`.
 fn name_of(path: &Path) -> String {
+    // A stream's name comes from its path, never its user name and password.
+    if net::is_url_path(path) {
+        return net::url_name(&path.to_string_lossy());
+    }
     path.file_name().map_or_else(
         || path.display().to_string(),
         |n| n.to_string_lossy().into_owned(),
@@ -1339,6 +1384,12 @@ fn name_of(path: &Path) -> String {
 }
 
 fn stem_of(path: &Path) -> String {
+    if net::is_url_path(path) {
+        let name = name_of(path);
+        return Path::new(&name)
+            .file_stem()
+            .map_or(name.clone(), |s| s.to_string_lossy().into_owned());
+    }
     path.file_stem()
         .map_or_else(|| name_of(path), |n| n.to_string_lossy().into_owned())
 }
@@ -1513,8 +1564,9 @@ fn search_dirs(state: &Mutex<DirSearch>) {
 pub fn music_files(roots: &[PathBuf]) -> Vec<PathBuf> {
     let mut seen = HashSet::new();
     let mut out = Vec::new();
+    let mut folders = Folders::default();
     for root in roots {
-        walk(root, MUSIC_SCAN_DEPTH, &mut |p| {
+        walk(root, MUSIC_SCAN_DEPTH, &mut folders, &mut |p| {
             if media_kind(&p) == Some(MediaKind::Audio) && seen.insert(p.clone()) {
                 out.push(p);
             }
@@ -1525,20 +1577,46 @@ pub fn music_files(roots: &[PathBuf]) -> Vec<PathBuf> {
 
 /// Whether `dir` or its subfolders, `depth` levels in all, hold any media file.
 fn has_media(dir: &Path, depth: usize) -> bool {
-    let (dirs, files) = list_dir(dir);
-    files.iter().any(|(_, p)| media_kind(p).is_some())
-        || depth > 1 && dirs.iter().any(|(_, d)| has_media(d, depth - 1))
+    fn search(dir: &Path, depth: usize, folders: &mut Folders) -> bool {
+        if !folders.first_visit(dir) {
+            return false;
+        }
+        let (dirs, files) = list_dir(dir);
+        files.iter().any(|(_, p)| media_kind(p).is_some())
+            || depth > 1 && dirs.iter().any(|(_, d)| search(d, depth - 1, folders))
+    }
+    search(dir, depth, &mut Folders::default())
+}
+
+/// The folders a walk has been in. Junctions and links are followed, so without this a folder
+/// with a few links back to itself would be walked an exponential number of times.
+#[derive(Default)]
+struct Folders(HashSet<PathBuf>);
+
+impl Folders {
+    /// Most folders one walk lists: a share can make up endless ones that resolve to no
+    /// folder seen before.
+    const MAX: usize = 100_000;
+
+    /// Whether to go into `dir`: not seen before, by where it really is, and under the cap.
+    fn first_visit(&mut self, dir: &Path) -> bool {
+        let real = fs::canonicalize(dir).unwrap_or_else(|_| dir.to_owned());
+        self.0.len() < Self::MAX && self.0.insert(real)
+    }
 }
 
 /// Calls `found` for every visible file in `dir` and up to `depth` levels below it.
-fn walk(dir: &Path, depth: usize, found: &mut impl FnMut(PathBuf)) {
+fn walk(dir: &Path, depth: usize, folders: &mut Folders, found: &mut impl FnMut(PathBuf)) {
+    if !folders.first_visit(dir) {
+        return;
+    }
     let (dirs, files) = list_dir(dir);
     for (_, p) in files {
         found(p);
     }
     if depth > 0 {
         for (_, d) in dirs {
-            walk(&d, depth - 1, found);
+            walk(&d, depth - 1, folders, found);
         }
     }
 }
@@ -1817,6 +1895,40 @@ mod tests {
             assert!(lib.add_to_playlist(bad, &a).is_err(), "{bad:?}");
         }
         assert_eq!(lib.playlists().len(), 2);
+    }
+
+    #[test]
+    fn tabs_and_newlines_cannot_forge_saved_records() {
+        let tmp = TempDir::new();
+        let mut lib = Library::open(&tmp.0, false);
+        let forged = PathBuf::from(
+            "http://evil.example/a\nfavorite\t\\\\evil\\share\nroot\tmusic\t\\\\evil\\s",
+        );
+        lib.record_position(&forged, 5.0, 60.0);
+        lib.set_track_pref(
+            "C:\\Videos",
+            true,
+            Some("en\nroot\tvideos\t\\\\evil\\s".into()),
+        );
+        lib.record_position(Path::new(r"C:\Videos\ok.mp4"), 5.0, 60.0);
+        lib.save().unwrap();
+
+        let reloaded = Library::open(&tmp.0, false);
+        assert!(reloaded.favorites.is_empty());
+        assert!(reloaded.video_roots.is_empty() && reloaded.music_roots.is_empty());
+        let recent: Vec<_> = reloaded.recent.iter().map(|r| r.path.clone()).collect();
+        assert_eq!(recent, [PathBuf::from(r"C:\Videos\ok.mp4")]);
+    }
+
+    #[test]
+    fn an_unreadable_library_is_not_overwritten() {
+        let tmp = TempDir::new();
+        // A folder where state.txt should be: reading it fails, but not with NotFound.
+        fs::create_dir_all(tmp.0.join(STATE_FILE)).unwrap();
+        let mut lib = Library::open(&tmp.0, false);
+        lib.record_position(Path::new(r"C:\a.mp4"), 1.0, 2.0);
+        lib.save().unwrap();
+        assert!(tmp.0.join(STATE_FILE).is_dir());
     }
 
     #[test]
@@ -2206,6 +2318,27 @@ mod tests {
         assert_eq!(labels(&lib.entries(&Place::Genres)), "Pop|Rock");
         assert_eq!(lib.entries(&Place::Genre("Rock".into())).len(), 2);
         assert_eq!(lib.entries(&Place::Songs).len(), 5);
+    }
+
+    #[test]
+    fn junction_loops_are_walked_once() {
+        let tmp = TempDir::new();
+        let song = tmp.touch(r"M\song.mp3");
+        let m = tmp.0.join("M");
+        // Ten junctions back to the folder itself: following each at every level would mean
+        // 10^8 listings before the depth cap stopped it.
+        for i in 0..10 {
+            let link = m.join(format!("loop{i}"));
+            let made = std::process::Command::new("cmd")
+                .args(["/c", "mklink", "/J"])
+                .arg(&link)
+                .arg(&m)
+                .output()
+                .unwrap();
+            assert!(made.status.success(), "mklink /J failed");
+        }
+        assert_eq!(music_files(std::slice::from_ref(&m)), [song]);
+        assert!(has_media(&m, MEDIA_SEARCH_DEPTH));
     }
 
     #[test]

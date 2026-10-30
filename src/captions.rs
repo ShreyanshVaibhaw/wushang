@@ -348,9 +348,16 @@ fn upload(
         dpiY: 96.0,
     };
     let rt: &ID2D1RenderTarget = ctx;
+    // A rect bigger than the GPU takes is left out rather than failing the whole picture. The
+    // size check runs in u64, where w * h * 4 can't wrap past the pixels actually there.
+    let max = unsafe { rt.GetMaximumBitmapSize() };
     rects
         .iter()
-        .filter(|r| r.w > 0 && r.h > 0 && r.bgra.len() >= (r.w * r.h * 4) as usize)
+        .filter(|r| {
+            (1..=max).contains(&r.w)
+                && (1..=max).contains(&r.h)
+                && r.bgra.len() as u64 >= u64::from(r.w) * u64::from(r.h) * 4
+        })
         .map(|r| {
             let size = D2D_SIZE_U {
                 width: r.w,

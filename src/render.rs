@@ -534,8 +534,16 @@ impl Renderer {
         let layer = self.layer()?;
         let canvas = layer.as_ref().unwrap_or(&backbuffer);
         let area = to_pixels(scene.layout.video.scaled(dpi / 96.0));
+        // A frame the GPU won't take (wider than its 16384 limit, say) is skipped, and the
+        // interface still paints, so a crafted file can't freeze or close the window.
         let picture = match frame {
-            Some(frame) => self.blit(frame, canvas, self.size, area, adjust, layer.is_some())?,
+            Some(frame) => self
+                .blit(frame, canvas, self.size, area, adjust, layer.is_some())
+                .unwrap_or_else(|e| {
+                    static TOLD: std::sync::Once = std::sync::Once::new();
+                    TOLD.call_once(|| eprintln!("video frame: {e}"));
+                    None
+                }),
             None => None,
         };
         let px = 96.0 / dpi;

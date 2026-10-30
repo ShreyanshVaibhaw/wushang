@@ -57,6 +57,16 @@ pub fn is_url(s: &str) -> bool {
     !rest.is_empty() && SCHEMES.iter().any(|k| scheme.eq_ignore_ascii_case(k))
 }
 
+/// Whether a feed or the radio directory may hand wushang `s` to play: http or https only, and
+/// nothing a file name could carry (a `file://` link to someone's share, a webcam's `dshow://`).
+/// Tabs and newlines would also split the saved library's records.
+fn is_web_url(s: &str) -> bool {
+    let web = ["http://", "https://"]
+        .iter()
+        .any(|p| s.get(..p.len()).is_some_and(|h| h.eq_ignore_ascii_case(p)));
+    web && host_of(s).is_some() && !s.chars().any(|c| c.is_whitespace() || c.is_control())
+}
+
 /// Whether a path the app carries around is really a stream address.
 pub fn is_url_path(path: &Path) -> bool {
     path.to_str().is_some_and(is_url)
@@ -118,7 +128,12 @@ pub fn host_of(url: &str) -> Option<String> {
 /// `https://example.com/a/My%20Show.mp4?x=1` is `My Show.mp4`.
 pub fn url_name(url: &str) -> String {
     let no_query = url.split(['?', '#']).next().unwrap_or(url);
-    let last = no_query.rsplit('/').next().unwrap_or("");
+    // Only the path counts, so `user:password@host` never becomes the name on screen.
+    let path = match no_query.split_once("://") {
+        Some((_, rest)) => rest.split_once('/').map_or("", |(_, path)| path),
+        None => no_query,
+    };
+    let last = path.rsplit('/').next().unwrap_or("");
     let name = percent_decode(last);
     if name.is_empty() || name == url {
         host_of(url).unwrap_or_else(|| url.to_owned())
@@ -258,7 +273,11 @@ pub fn parse_feed(text: &str, feed_url: &str) -> Feed {
         let Some(url) = enclosure_url(&block) else {
             continue;
         };
-        let url = resolve(feed_url, &url);
+        // Some feeds leave spaces in their links unescaped.
+        let url = resolve(feed_url, &url).replace(' ', "%20");
+        if !is_web_url(&url) {
+            continue;
+        }
         let title = tag_text(&block, "title")
             .filter(|t| !t.is_empty())
             .unwrap_or_else(|| url_name(&url));
@@ -299,7 +318,7 @@ pub fn parse_stations(text: &str) -> Vec<Station> {
             .filter(|u| !u.is_empty())
             .or_else(|| attr(tag, "url"))
             .unwrap_or_default();
-        if name.is_empty() || url.is_empty() || out.iter().any(|s: &Station| s.url == url) {
+        if name.is_empty() || !is_web_url(&url) || out.iter().any(|s: &Station| s.url == url) {
             continue;
         }
         out.push(Station {
@@ -508,11 +527,12 @@ pub fn fetch(url: &str, timeout: Duration, max: usize) -> Result<Vec<u8>, String
             return Err(format!("network: {}", windows::core::Error::from_thread()));
         }
         let request = Handle(request);
-        // Feeds and directories redirect between hosts; follow like a browser.
+        // Feeds and directories redirect between hosts; follow, but never from https down to
+        // http, where anyone on the network could swap what comes back (an update, say).
         _ = WinHttpSetOption(
             Some(request.0 as *const _),
             WINHTTP_OPTION_REDIRECT_POLICY,
-            Some(&WINHTTP_OPTION_REDIRECT_POLICY_ALWAYS.to_ne_bytes()),
+            Some(&WINHTTP_OPTION_REDIRECT_POLICY_DISALLOW_HTTPS_TO_HTTP.to_ne_bytes()),
         );
         WinHttpSendRequest(request.0, None, None, 0, 0, 0)
             .and_then(|()| WinHttpReceiveResponse(request.0, std::ptr::null_mut()))
@@ -656,6 +676,7 @@ mod tests {
         );
         assert_eq!(url_name("https://example.com/"), "example.com");
         assert_eq!(url_name("https://user:pw@example.com:8080/x"), "x");
+        assert_eq!(url_name("rtsp://admin:secret@cam.local:554"), "cam.local");
         assert_eq!(
             host_of("https://user@example.com:8080/x").as_deref(),
             Some("example.com")
@@ -758,5 +779,26 @@ mod tests {
             ]
         );
         assert!(parse_stations("<stations/>").is_empty());
+    }
+
+    #[test]
+    fn feeds_and_stations_only_hand_over_web_addresses() {
+        let rss = r#"<rss><channel><title>Bad</title>
+<item><title>Share</title><enclosure url="file://evil/share/x.mp3"/></item>
+<item><title>Webcam</title><enclosure url="dshow://video=Camera"/></item>
+<item><title>Split</title><enclosure url="tcp://evil:9000/&#10;favorite&#9;\\evil\s"/></item>
+<item><title>Spaced</title><enclosure url="https://cdn.example/My Show.mp3"/></item>
+</channel></rss>"#;
+        let urls: Vec<_> = parse_feed(rss, "https://example.com/feed")
+            .episodes
+            .into_iter()
+            .map(|e| e.url)
+            .collect();
+        assert_eq!(urls, ["https://cdn.example/My%20Show.mp3"]);
+        let xml = r#"<stations>
+<station name="Share" url="file://evil/share/x"/>
+<station name="Split" url="http://a.example/&#10;root&#9;music&#9;\\evil\s"/>
+</stations>"#;
+        assert!(parse_stations(xml).is_empty());
     }
 }

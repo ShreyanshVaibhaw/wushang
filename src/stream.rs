@@ -17,6 +17,8 @@ use std::time::Duration;
 /// Chunks a player may fall behind by (the muxer writes about 32 KB at a time) before it is
 /// let go, rather than handed a stream with holes in it.
 const BACKLOG: usize = 256;
+/// Players served at once; more connections are closed straight away.
+const MAX_PLAYERS: usize = 16;
 
 /// The players connected now, each fed through a channel of its own.
 #[derive(Default)]
@@ -89,13 +91,20 @@ impl Server {
         let broadcast = Arc::new(Broadcast::default());
         let stop = Arc::new(AtomicBool::new(false));
         let (b, s) = (broadcast.clone(), stop.clone());
+        // Anyone on the network can connect, so the players served at once are capped.
+        let players = Arc::new(AtomicUsize::new(0));
         let thread = thread::spawn(move || {
             while !s.load(Relaxed) {
                 match listener.accept() {
-                    Ok((socket, _)) => {
-                        let b = b.clone();
-                        thread::spawn(move || serve(socket, &b));
+                    Ok((socket, _)) if players.load(Relaxed) < MAX_PLAYERS => {
+                        let (b, players) = (b.clone(), players.clone());
+                        players.fetch_add(1, Relaxed);
+                        thread::spawn(move || {
+                            serve(socket, &b);
+                            players.fetch_sub(1, Relaxed);
+                        });
                     }
+                    Ok(_) => {}
                     Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
                         thread::sleep(Duration::from_millis(50));
                     }
@@ -131,10 +140,17 @@ impl Drop for Server {
 fn serve(mut socket: TcpStream, broadcast: &Broadcast) {
     _ = socket.set_nonblocking(false);
     _ = socket.set_read_timeout(Some(Duration::from_secs(5)));
-    // The request line and headers; the path doesn't matter.
+    // A player that stops reading is let go rather than holding its thread for good.
+    _ = socket.set_write_timeout(Some(Duration::from_secs(10)));
+    // The request line and headers; the path doesn't matter. The whole request gets five
+    // seconds, so a byte every few seconds can't keep a connection open.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
     let mut request = Vec::new();
     let mut byte = [0u8; 1];
     while !request.ends_with(b"\r\n\r\n") && request.len() < 16 * 1024 {
+        if std::time::Instant::now() > deadline {
+            return;
+        }
         match socket.read(&mut byte) {
             Ok(1) => request.push(byte[0]),
             _ => return,

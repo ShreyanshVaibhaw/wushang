@@ -3,8 +3,8 @@
 //!
 //! Installing downloads the release's zip, unpacks it with Windows' own tar.exe, and swaps the
 //! files in beside the running exe. Windows lets a running exe and its loaded DLLs be renamed, so
-//! each old file steps aside as `<name>.old` and the new one takes its place; the next start
-//! deletes the `.old` files. Then wushang quits as usual (saving everything) and starts again.
+//! each old file steps aside as `<name>.wushang-old` and the new one takes its place; the next
+//! start deletes those. Then wushang quits as usual (saving everything) and starts again.
 
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -17,7 +17,9 @@ use std::{env, fs, thread};
 use crate::net;
 
 const LATEST: &str = "https://api.github.com/repos/ShreyanshVaibhaw/wushang/releases/latest";
-/// The release asset to install: `wushang-<version>-windows-x64.zip`.
+/// The release asset to install: `wushang-<version>-windows-x64.zip`, from this repository's
+/// releases and nowhere else.
+const ASSET_PREFIX: &str = "https://github.com/ShreyanshVaibhaw/wushang/releases/download/";
 const ASSET_SUFFIX: &str = "-windows-x64.zip";
 /// Largest download accepted; a release is about 15 MB.
 const MAX_DOWNLOAD: usize = 200 << 20;
@@ -57,7 +59,7 @@ fn newer(json: &str, current: &str) -> Option<Release> {
     let version = tag.trim_start_matches('v').to_owned();
     let url = json_strings(json, "browser_download_url")
         .into_iter()
-        .find(|u| u.ends_with(ASSET_SUFFIX))?;
+        .find(|u| u.starts_with(ASSET_PREFIX) && u.ends_with(ASSET_SUFFIX) && !u.contains(".."))?;
     (version_parts(&version)? > version_parts(current)?).then_some(Release { version, url })
 }
 
@@ -163,10 +165,46 @@ fn files_under(dir: &Path) -> std::io::Result<Vec<PathBuf>> {
     Ok(out)
 }
 
+/// What a replaced file is renamed to until the next start deletes it. The suffix is wushang's
+/// own because wushang may sit in a folder of other people's files (unzipped into Downloads),
+/// and only its leftovers may go.
+const ASIDE: &str = ".wushang-old";
+
+/// The files 1.0.0 and 1.0.1 shipped, which their updater set aside as `<name>.old`.
+// ponytail: only for updates made by those versions; drop once nobody runs them.
+const OLD_ASIDE: [&str; 18] = [
+    "wushang.exe",
+    "avcodec-63.dll",
+    "avdevice-63.dll",
+    "avformat-63.dll",
+    "avutil-61.dll",
+    "swresample-7.dll",
+    "swscale-10.dll",
+    "libass-9.dll",
+    "Inter-OFL.txt",
+    "LICENSE",
+    "THIRD_PARTY_NOTICES.md",
+    "Apache-2.0.txt",
+    "FreeType-FTL.txt",
+    "HarfBuzz.txt",
+    "LGPL-2.1.txt",
+    "dav1d.txt",
+    "libass.txt",
+    "zlib.txt",
+];
+
 fn aside(path: &Path) -> PathBuf {
     let mut name = path.file_name().unwrap_or_default().to_owned();
-    name.push(".old");
+    name.push(ASIDE);
     path.with_file_name(name)
+}
+
+/// Whether `name` is a file an update set aside, which the next start may delete.
+fn is_aside(name: &str) -> bool {
+    name.ends_with(ASIDE)
+        || name
+            .strip_suffix(".old")
+            .is_some_and(|n| OLD_ASIDE.iter().any(|o| o.eq_ignore_ascii_case(n)))
 }
 
 /// Puts every file from `from` in `to`, moving the ones it replaces aside. On any failure the
@@ -200,7 +238,7 @@ fn swap(from: &Path, to: &Path) -> std::io::Result<()> {
     result
 }
 
-/// Deletes the `.old` files a previous update left beside the exe. One still held by the exiting
+/// Deletes the files a previous update set aside beside the exe. One still held by the exiting
 /// old process stays until next time.
 pub fn clean_up() {
     let Some(dir) = env::current_exe()
@@ -214,7 +252,11 @@ pub fn clean_up() {
             continue;
         };
         for path in entries.flatten().map(|e| e.path()) {
-            if path.extension().is_some_and(|x| x == "old") {
+            if path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(is_aside)
+            {
                 _ = fs::remove_file(path);
             }
         }
@@ -240,8 +282,8 @@ mod tests {
     use super::*;
 
     const JSON: &str = r#"{"url":"x","tag_name": "v1.2.0","assets":[
-        {"name":"a.txt","browser_download_url":"https://github.com/o/r/releases/download/v1.2.0/a.txt"},
-        {"name":"z","browser_download_url" : "https:\/\/github.com\/o\/r\/releases\/download\/v1.2.0\/wushang-1.2.0-windows-x64.zip"}]}"#;
+        {"name":"a.txt","browser_download_url":"https://github.com/ShreyanshVaibhaw/wushang/releases/download/v1.2.0/a.txt"},
+        {"name":"z","browser_download_url" : "https:\/\/github.com\/ShreyanshVaibhaw\/wushang\/releases\/download\/v1.2.0\/wushang-1.2.0-windows-x64.zip"}]}"#;
 
     #[test]
     fn a_newer_release_is_offered_with_its_zip() {
@@ -249,7 +291,7 @@ mod tests {
         assert_eq!(r.version, "1.2.0");
         assert_eq!(
             r.url,
-            "https://github.com/o/r/releases/download/v1.2.0/wushang-1.2.0-windows-x64.zip"
+            "https://github.com/ShreyanshVaibhaw/wushang/releases/download/v1.2.0/wushang-1.2.0-windows-x64.zip"
         );
         assert_eq!(newer(JSON, "1.2.0"), None, "same version");
         assert_eq!(
@@ -261,6 +303,19 @@ mod tests {
             newer(&JSON.replace("v1.2.0\"", "v1.2.0-beta\""), "1.0.0"),
             None
         );
+        // Only this repository's release downloads install.
+        let elsewhere = JSON.replace("ShreyanshVaibhaw\\/wushang", "evil\\/wushang");
+        assert_eq!(newer(&elsewhere, "1.0.0"), None);
+    }
+
+    #[test]
+    fn only_update_leftovers_are_cleaned_up() {
+        assert!(is_aside("wushang.exe.wushang-old"));
+        assert!(is_aside("avcodec-63.dll.old"));
+        assert!(is_aside("LICENSE.old"));
+        assert!(!is_aside("report.docx.old"));
+        assert!(!is_aside("notes.old"));
+        assert!(!is_aside("wushang.exe"));
     }
 
     #[test]
@@ -279,7 +334,7 @@ mod tests {
             "new exe"
         );
         assert_eq!(
-            fs::read_to_string(app.join("wushang.exe.old")).unwrap(),
+            fs::read_to_string(app.join("wushang.exe.wushang-old")).unwrap(),
             "old exe"
         );
         assert_eq!(

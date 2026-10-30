@@ -453,6 +453,13 @@ pub fn spawn_decoder(
                     chain = Some((Chain::new(format.rate, format.channels), generation));
                     resampler = None;
                 }
+                // Real audio never runs this slow. A file claiming 1 Hz would size the resampler's
+                // output for hundreds of millions of samples per frame and run out of memory.
+                if frame.rate() < 1000 {
+                    static TOLD: std::sync::Once = std::sync::Once::new();
+                    TOLD.call_once(|| eprintln!("audio: {} Hz is no sample rate", frame.rate()));
+                    continue;
+                }
                 let layout = label_layout(&mut frame);
                 let stale = resampler.as_ref().is_none_or(|r| {
                     let i = r.input();

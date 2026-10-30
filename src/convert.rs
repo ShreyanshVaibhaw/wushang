@@ -97,9 +97,13 @@ fn run(
     progress: &AtomicU32,
     cancel: &AtomicBool,
 ) -> Result<(), String> {
-    let mut ictx = ff::format::input(input).map_err(|e| format!("can't open the file: {e}"))?;
+    // ffmpeg-next panics on a path that isn't valid Unicode, so those stop here.
+    let Some(output) = output.to_str() else {
+        return Err("wushang can't write a file whose name isn't valid Unicode".into());
+    };
+    let mut ictx = crate::session::open_file(input)?;
     let mut octx = ff::format::output_as(output, target.extension())
-        .map_err(|e| format!("can't write {}: {e}", output.display()))?;
+        .map_err(|e| format!("can't write {output}: {e}"))?;
     let global_header = octx
         .format()
         .flags()
@@ -144,7 +148,14 @@ fn run(
         None => None,
     };
 
-    octx.set_metadata(ictx.metadata().to_owned());
+    // FFmpeg copies the tags itself: ffmpeg-next's iterator would read them as UTF-8 unchecked.
+    unsafe {
+        ff::ffi::av_dict_copy(
+            &mut (*octx.as_mut_ptr()).metadata,
+            (*ictx.as_ptr()).metadata,
+            0,
+        );
+    }
     let mut options = ff::Dictionary::new();
     if target == Target::Mp4 {
         // The index up front, so the file starts playing before it has all arrived.

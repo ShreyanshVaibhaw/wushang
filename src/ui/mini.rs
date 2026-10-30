@@ -24,6 +24,10 @@ pub struct Card {
     pub frame: Rect,
     /// The top of the video's part (the frame's top unless the queue is open).
     top: f32,
+    /// Where the design's card would start if it ended at the bottom: the strip under the
+    /// video (progress, name, folder) keeps the design's size and sits from here, and a bigger
+    /// mini player window gives the extra room to the video.
+    foot: f32,
     pub video: Rect,
     pub progress: Rect,
     pub queue: bool,
@@ -35,7 +39,13 @@ impl Card {
     /// A card with its bottom-left corner at (l, b) and `queue` DIPs of queue above it (0 for
     /// none, up to `QUEUE_H`).
     pub fn new(l: f32, b: f32, queue: f32, window: bool) -> Card {
-        let top = b - H;
+        Card::sized(l, b, W, H, queue, window)
+    }
+
+    /// Like `new`, the card `w` by `h` DIPs (at least the design's size) without its queue.
+    pub fn sized(l: f32, b: f32, w: f32, h: f32, queue: f32, window: bool) -> Card {
+        let (w, h) = (w.max(W), h.max(H));
+        let (top, foot) = (b - h, b - H);
         let queue = if queue >= QUEUE_MIN {
             queue.min(QUEUE_H)
         } else {
@@ -43,10 +53,11 @@ impl Card {
         };
         let t = top - queue;
         Card {
-            frame: Rect::new(l, t, l + W, b),
+            frame: Rect::new(l, t, l + w, b),
             top,
-            video: Rect::new(l + 8.0, top + 8.0, l + W - 8.0, top + 217.0),
-            progress: Rect::new(l + 8.0, top + 223.0, l + W - 8.0, top + 237.0),
+            foot,
+            video: Rect::new(l + 8.0, top + 8.0, l + w - 8.0, foot + 217.0),
+            progress: Rect::new(l + 8.0, foot + 223.0, l + w - 8.0, foot + 237.0),
             queue: queue > 0.0,
             window,
         }
@@ -69,7 +80,7 @@ impl Card {
             (Hit::Next, Rect::around(cx + 76.0, cy, 36.0)),
             (
                 Hit::Playlist,
-                Rect::around(self.frame.r - 31.0, self.top + 310.0, 32.0),
+                Rect::around(self.frame.r - 31.0, self.foot + 310.0, 32.0),
             ),
         ]
     }
@@ -109,10 +120,11 @@ impl Card {
 }
 
 impl Layout {
-    /// The mini player window: the card fills it, its queue whatever height the window has
-    /// grown to so far.
-    pub fn mini(width: f32, height: f32, queue: bool) -> Layout {
-        let card = Card::new(0.0, height, if queue { height - H } else { 0.0 }, true);
+    /// The mini player window: the card fills its width and `card` DIPs of its height (the size
+    /// the user gave it), the queue whatever height is left above that.
+    pub fn mini(width: f32, height: f32, card: f32, queue: bool) -> Layout {
+        let queue = if queue { height - card } else { 0.0 };
+        let card = Card::sized(0.0, height, width, card.min(height), queue, true);
         Layout {
             page: Page::Mini,
             bars: true,
@@ -242,7 +254,7 @@ impl Painter {
             }
             rt.FillRoundedRectangle(&rounded(c.video.inset(-1.0), 5.0), &self.track);
             rt.FillRoundedRectangle(&rounded(c.progress, 4.0), &self.track);
-            let t = c.top;
+            let t = c.foot;
             let name = Rect::new(f.l + 15.0, t + 258.0, f.r - 15.0, t + 284.0);
             self.put(rt, s.file, &r.name, name, &r.label);
             self.icon(ctx, &self.icons.folder, f.l + 13.0, t + 298.0, false);
@@ -344,6 +356,23 @@ mod tests {
         // Short of room, the queue gets shorter, then stays shut.
         assert_eq!(Card::new(0.0, 700.0, 200.0, false).frame.h(), H + 200.0);
         assert!(!Card::new(0.0, 700.0, 100.0, false).queue);
+    }
+
+    #[test]
+    fn a_bigger_window_gives_the_room_to_the_video() {
+        let small = Layout::mini(W, H, H, false).card.unwrap();
+        let big = Layout::mini(800.0, 600.0, 600.0, false).card.unwrap();
+        assert_eq!(big.frame, Rect::new(0.0, 0.0, 800.0, 600.0));
+        assert_eq!(big.video, Rect::new(8.0, 8.0, 792.0, 600.0 - H + 217.0));
+        // The strip under the video keeps its size, at the bottom.
+        assert_eq!(big.progress.h(), small.progress.h());
+        assert_eq!(600.0 - big.progress.t, H - small.progress.t);
+        assert_eq!(
+            big.hit(800.0 - 31.0, 600.0 - H + 310.0),
+            Some(Hit::Playlist)
+        );
+        // Never smaller than the design.
+        assert_eq!(Card::sized(0.0, H, 100.0, 100.0, 0.0, true).frame.w(), W);
     }
 
     #[test]

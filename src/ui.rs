@@ -154,6 +154,8 @@ pub enum Hit {
     Playlist,
     Seek,
     Volume,
+    /// The duration after the seek bar: switches it to the time left and back.
+    Duration,
     /// Empty title bar: drags the window.
     Caption,
     Video,
@@ -223,6 +225,9 @@ pub struct Layout {
     pub width: f32,
     pub height: f32,
     pub video: Rect,
+    /// The part of the video area the bars leave clear. In fullscreen the bars float over the
+    /// video, so it doesn't jump when they show; elsewhere this is the video area itself.
+    pub content: Rect,
     buttons: Vec<(Hit, Rect)>,
     track: Rect,
     current: Rect,
@@ -260,6 +265,7 @@ impl Layout {
                 width,
                 height,
                 video,
+                content: video,
                 ..Default::default()
             };
         }
@@ -292,12 +298,20 @@ impl Layout {
                 }
             }
         }
+        let content = Rect::new(FRAME, TITLE_BAR + 1.0, w - FRAME, height - tools.bar);
+        let video = if fullscreen {
+            Rect::new(0.0, 0.0, w, height)
+        } else {
+            content
+        };
+        buttons.push((Hit::Duration, tools.duration));
         Layout {
             page: Page::Player,
             bars,
             width,
             height,
-            video: Rect::new(FRAME, TITLE_BAR + 1.0, w - FRAME, height - tools.bar),
+            video,
+            content,
             buttons,
             current: tools.current,
             track: tools.track,
@@ -365,7 +379,7 @@ impl Layout {
             Some(Hit::Seek)
         } else if self.bars && self.volume.contains(x, y) {
             Some(Hit::Volume)
-        } else if self.video.contains(x, y) {
+        } else if self.content.contains(x, y) {
             Some(Hit::Video)
         } else if self.bars && y < TITLE_BAR {
             Some(Hit::Caption)
@@ -970,6 +984,8 @@ pub struct Scene<'a> {
     pub duration: f64,
     /// A stream with no end, like radio: its length reads "Live".
     pub live: bool,
+    /// Show the time left instead of the duration.
+    pub time_left: bool,
     pub paused: bool,
     pub volume: f32,
     pub muted: bool,
@@ -1269,6 +1285,8 @@ pub struct Painter {
     factory: ID2D1Factory1,
     icons: Icons,
     bg: ID2D1SolidColorBrush,
+    /// Behind the bars where they float over fullscreen video.
+    scrim: ID2D1SolidColorBrush,
     fg: ID2D1SolidColorBrush,
     accent: ID2D1SolidColorBrush,
     track: ID2D1SolidColorBrush,
@@ -1325,6 +1343,7 @@ impl Painter {
         Ok(Painter {
             icons: Icons::load(ctx)?,
             bg: brush(BG_A3, 1.0)?,
+            scrim: brush(BG_A3, 0.8)?,
             fg: brush(FG_A2, 1.0)?,
             accent: brush(ACCENT, 1.0)?,
             track: brush(BG_B2, 1.0)?,
@@ -1543,13 +1562,16 @@ impl Painter {
             if !s.has_frame {
                 rt.FillRectangle(&l.video.d2d(), &self.black);
                 match s.visual {
-                    Some(visual) => self.visualizer(rt, visual, l.video)?,
-                    None => self.art(rt, ctx, s, l.video)?,
+                    Some(visual) => self.visualizer(rt, visual, l.content)?,
+                    None => self.art(rt, ctx, s, l.content)?,
                 }
             }
             rt.FillGeometry(&self.frame_geometry(l)?, &self.bg, None);
-            // Subtitles sit on the picture itself, or on the video area for audio files.
-            let picture = self.picture.unwrap_or(l.video);
+            // Subtitles sit on the picture itself, or on the video area for audio files, kept
+            // above bars that float over the video.
+            let p = self.picture.unwrap_or(l.video);
+            let c = l.content;
+            let picture = Rect::new(p.l.max(c.l), p.t.max(c.t), p.r.min(c.r), p.b.min(c.b));
             if !s.cues.is_empty() {
                 rt.PushAxisAlignedClip(&l.video.d2d(), D2D1_ANTIALIAS_MODE_ALIASED);
                 let drawn = self.captions.draw(
@@ -1559,16 +1581,20 @@ impl Painter {
                     s.caption_style,
                 );
                 rt.PopAxisAlignedClip();
-                drawn?;
+                // A cue that won't draw costs only itself, never the window.
+                if let Err(e) = drawn {
+                    static TOLD: std::sync::Once = std::sync::Once::new();
+                    TOLD.call_once(|| eprintln!("subtitles: {e}"));
+                }
             }
             if let Some(stats) = s.stats {
                 // Four lines of 13 px text in a box sized to them.
                 let lines = stats.lines().count() as f32;
                 let r = Rect::new(
-                    l.video.l + 12.0,
-                    l.video.t + 12.0,
-                    l.video.l + 332.0,
-                    l.video.t + 32.0 + 17.0 * lines,
+                    c.l + 12.0,
+                    c.t + 12.0,
+                    c.l + 332.0,
+                    c.t + 32.0 + 17.0 * lines,
                 );
                 rt.FillRoundedRectangle(&rounded(r, 6.0), &self.stats_bg);
                 let utf16: Vec<u16> = stats.encode_utf16().collect();
@@ -1581,9 +1607,13 @@ impl Painter {
                     DWRITE_MEASURING_MODE_NATURAL,
                 );
             }
-            self.notice(rt, s, l.video);
+            self.notice(rt, s, c);
             if !l.bars {
                 return Ok(());
+            }
+            if l.video != c {
+                rt.FillRectangle(&Rect::new(0.0, 0.0, l.width, c.t).d2d(), &self.scrim);
+                rt.FillRectangle(&Rect::new(0.0, c.b, l.width, l.height).d2d(), &self.scrim);
             }
             self.title_bar(rt, ctx, s);
             self.control_bar(rt, ctx, s);
@@ -1800,6 +1830,9 @@ impl Painter {
             self.text(rt, &clock_text(s.position), &self.times, l.current);
             let total = if s.live {
                 "Live".to_owned()
+            } else if s.time_left {
+                // Rounded up, so it and the elapsed time always add up to the duration.
+                format!("-{}", clock_text((s.duration - s.position).ceil()))
             } else {
                 clock_text(s.duration)
             };
@@ -2173,7 +2206,32 @@ mod tests {
             Rect::new(1870.0, 1037.0, 1900.0, 1069.0)
         );
         assert_eq!(l.hit(80.0, 1050.0), Some(Hit::Play));
+        assert_eq!(l.hit(1538.0, 1053.0), Some(Hit::Duration));
         assert_eq!(l.hit(960.0, 20.0), Some(Hit::Caption));
+    }
+
+    #[test]
+    fn a_click_on_the_duration_switches_it() {
+        let mut ui = Ui::new();
+        ui.page = Page::Player;
+        ui.layout = Layout::new(1920.0, 1080.0, true, false);
+        assert!(ui.on_down(1538.0, 1053.0).is_none());
+        let up = ui.on_up(1538.0, 1053.0);
+        assert!(matches!(up, Some(Action::Click(Hit::Duration))));
+    }
+
+    #[test]
+    fn fullscreen_bars_float_over_the_video() {
+        let hidden = Layout::new(1920.0, 1080.0, false, true);
+        let shown = Layout::new(1920.0, 1080.0, true, true);
+        assert_eq!(
+            shown.video, hidden.video,
+            "the video doesn't move when the bars show"
+        );
+        assert_eq!(shown.content, Rect::new(10.0, 41.0, 1910.0, 1026.0));
+        // Empty space on the control bar is the bar, not a click on the video.
+        assert_eq!(shown.hit(1600.0, 1075.0), None);
+        assert_eq!(shown.hit(960.0, 500.0), Some(Hit::Video));
     }
 
     #[test]

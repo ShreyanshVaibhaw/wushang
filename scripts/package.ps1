@@ -12,11 +12,11 @@ $zip = Join-Path $meta.target_directory "wushang-$version-windows-x64.zip"
 
 # Build here, with the user folder cut out of the source paths Rust embeds for panics (the
 # registry crates and the standard library live under it), so the zip doesn't carry it.
-$env:RUSTFLAGS = "--remap-path-prefix=$env:USERPROFILE=~"
-cargo build --release --manifest-path "$repo\Cargo.toml"
-$built = $LASTEXITCODE
-Remove-Item Env:RUSTFLAGS
-if ($built -ne 0) { throw 'cargo build failed' }
+# Passed with --config, which Cargo adds to the rustflags in .cargo/config.toml; RUSTFLAGS
+# would replace them.
+$remap = "target.x86_64-pc-windows-msvc.rustflags=['--remap-path-prefix=$env:USERPROFILE=~']"
+cargo build --release --manifest-path "$repo\Cargo.toml" --config $remap
+if ($LASTEXITCODE -ne 0) { throw 'cargo build failed' }
 
 if (Test-Path $stage) { Remove-Item $stage -Recurse -Force }
 New-Item -ItemType Directory -Force (Join-Path $stage 'licenses') | Out-Null

@@ -17,7 +17,9 @@ use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance};
 use windows::Win32::System::DataExchange::{
     CloseClipboard, EmptyClipboard, GetClipboardData, OpenClipboard, SetClipboardData,
 };
-use windows::Win32::System::Memory::{GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalUnlock};
+use windows::Win32::System::Memory::{
+    GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock,
+};
 use windows::Win32::UI::Input::KeyboardAndMouse::*;
 use windows::Win32::UI::WindowsAndMessaging::{IDC_HAND, IDC_IBEAM};
 use windows::core::{HSTRING, Interface, PCWSTR};
@@ -638,11 +640,12 @@ fn clipboard_text() -> Option<String> {
             if p.is_null() {
                 return None;
             }
-            let mut len = 0;
-            while *p.add(len) != 0 {
-                len += 1;
-            }
-            let s = String::from_utf16_lossy(std::slice::from_raw_parts(p, len));
+            // Any program can put text there without the closing zero, so the scan stops at the
+            // end of the block either way.
+            let size = GlobalSize(h) / 2;
+            let all = std::slice::from_raw_parts(p, size);
+            let len = all.iter().position(|&c| c == 0).unwrap_or(size);
+            let s = String::from_utf16_lossy(&all[..len]);
             _ = GlobalUnlock(h);
             Some(s)
         })();

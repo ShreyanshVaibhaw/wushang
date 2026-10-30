@@ -22,7 +22,7 @@ pub struct Details {
 
 /// Opens `path` and describes it; None when FFmpeg can't open it.
 pub fn details(path: &Path) -> Option<Details> {
-    let input = ff::format::input(path.to_str()?).ok()?;
+    let input = crate::session::open_file(path).ok()?;
     Some(Details {
         container: input.format().description().to_owned(),
         // AV_NOPTS_VALUE is i64::MIN, so an unknown duration lands on 0.
