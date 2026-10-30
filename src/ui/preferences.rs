@@ -3,8 +3,8 @@
 //! copy of `Prefs`; each change goes out whole as [`PrefsAction::Changed`], and main.rs applies
 //! and saves it.
 //!
-//! Only settings myvlc acts on are listed. Extensions are myvlc's optional add-ons (libass), not
-//! VLC's Lua extensions, which myvlc doesn't run. General has the design's theme and accent rows
+//! Only settings wushang acts on are listed. Extensions are wushang's optional add-ons (libass), not
+//! VLC's Lua extensions, which wushang doesn't run. General has the design's theme and accent rows
 //! but not its interface language, as there is only English. The design's (i) marks are left
 //! out, as there is nothing behind them. Sizes are DIPs from the 1046x864 frames. On a short window the
 //! frame gets shorter first (the options scroll, the sidebar tightens), then scales down.

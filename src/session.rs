@@ -113,7 +113,7 @@ pub fn open_input(
     // as their connect and socket timeout.
     dict.set("rw_timeout", &micros);
     dict.set("timeout", &micros);
-    dict.set("user_agent", concat!("myvlc/", env!("CARGO_PKG_VERSION")));
+    dict.set("user_agent", concat!("wushang/", env!("CARGO_PKG_VERSION")));
     if options.reconnect {
         // http: reconnect on drops and errors, backing off up to the timeout; HLS retries a
         // segment instead of skipping it.

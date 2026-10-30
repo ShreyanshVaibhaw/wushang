@@ -249,7 +249,7 @@ impl Item {
         }
     }
 
-    /// A row drawn dimmed that does nothing: something myvlc can't do yet.
+    /// A row drawn dimmed that does nothing: something wushang can't do yet.
     pub fn off(label: impl Into<String>) -> Self {
         Item {
             action: None,
@@ -807,7 +807,7 @@ pub fn main_menu(
         )
         .icon(Icon::Settings)
         .key("Ctrl + P"),
-        Item::new("About myvlc", MenuAction::ShowAbout)
+        Item::new("About wushang", MenuAction::ShowAbout)
             .icon(Icon::Info)
             .key("Shift + F1"),
     ]
@@ -1020,7 +1020,7 @@ pub fn player_menu(d: &PanelData, paused: bool) -> Vec<Item> {
         Item::submenu("Playlist", playlist).icon(Icon::Playlist),
         Item::submenu("Open Media", open).icon(Icon::OpenFile),
         Item::divider(),
-        Item::new("Quit myvlc", MenuAction::Quit)
+        Item::new("Quit wushang", MenuAction::Quit)
             .icon(Icon::Quit)
             .key("Ctrl + Q"),
     ]

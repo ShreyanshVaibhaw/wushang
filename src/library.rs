@@ -38,7 +38,7 @@ const FINISHED_AT: f64 = 0.95;
 /// Items in each of Home's "Continue Watching" and "Listen Again".
 const HOME_RECENT: usize = 8;
 const STATE_FILE: &str = "state.txt";
-const STATE_HEADER: &str = "# myvlc library state v1";
+const STATE_HEADER: &str = "# wushang library state v1";
 const M3U_HEADER: &str = "#EXTM3U";
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -273,18 +273,18 @@ pub struct Library {
 }
 
 impl Library {
-    /// %APPDATA%\myvlc, or the MYVLC_HOME environment variable when set (tests and dev runs use it).
+    /// %APPDATA%\wushang, or the WUSHANG_HOME environment variable when set (tests and dev runs use it).
     pub fn default_dir() -> PathBuf {
-        match env::var_os("MYVLC_HOME") {
+        match env::var_os("WUSHANG_HOME") {
             Some(home) if !home.is_empty() => PathBuf::from(home),
-            _ => PathBuf::from(env::var_os("APPDATA").unwrap_or_default()).join("myvlc"),
+            _ => PathBuf::from(env::var_os("APPDATA").unwrap_or_default()).join("wushang"),
         }
     }
 
     /// Loads state from `dir` (missing files mean empty state). On first run (no state file),
-    /// seeds Videos and Music with the user's Videos and Music folders, unless MYVLC_HOME is set.
+    /// seeds Videos and Music with the user's Videos and Music folders, unless WUSHANG_HOME is set.
     pub fn load(dir: &Path) -> Library {
-        Self::open(dir, env::var_os("MYVLC_HOME").is_none())
+        Self::open(dir, env::var_os("WUSHANG_HOME").is_none())
     }
 
     fn open(dir: &Path, seed: bool) -> Library {
@@ -1589,7 +1589,7 @@ mod tests {
         fn new() -> TempDir {
             static NEXT: AtomicUsize = AtomicUsize::new(0);
             let n = NEXT.fetch_add(1, Relaxed);
-            let dir = env::temp_dir().join(format!("myvlc-lib-test-{}-{n}", std::process::id()));
+            let dir = env::temp_dir().join(format!("wushang-lib-test-{}-{n}", std::process::id()));
             let _ = fs::remove_dir_all(&dir);
             fs::create_dir_all(&dir).unwrap();
             TempDir(dir)

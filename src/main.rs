@@ -1,4 +1,4 @@
-//! myvlc: a small video player built in the shape of VLC's pipeline, with the interface from
+//! wushang: a small video player built in the shape of VLC's pipeline, with the interface from
 //! Juxtopposed's VLC redesign.
 //!
 //! demux thread -> video and audio decoder threads -> D3D11 renderer + Direct2D UI (this thread)
@@ -166,7 +166,7 @@ const SLEEP_END_OF_FILE: usize = 5;
 fn main() {
     use_parent_console();
     if let Err(e) = run() {
-        eprintln!("myvlc: {e}");
+        eprintln!("wushang: {e}");
         std::process::exit(1);
     }
 }
@@ -442,7 +442,7 @@ impl App {
                 true
             }
             Err(e) => {
-                eprintln!("myvlc: {e}");
+                eprintln!("wushang: {e}");
                 if net::is_address(path) {
                     let host = net::is_url_path(path)
                         .then(|| net::host_of(&path.to_string_lossy()))
@@ -483,7 +483,7 @@ impl App {
         self.play(path, queue)
     }
 
-    /// Starts recording the open file (into Videos\myvlc unless Settings says otherwise), or
+    /// Starts recording the open file (into Videos\wushang unless Settings says otherwise), or
     /// stops; the notice says where it went.
     fn toggle_record(&mut self) {
         // A notice about the last recording would otherwise be lost under the new one's.
@@ -523,7 +523,7 @@ impl App {
         self.notice = Some((format!("Recording to {name}"), Instant::now()));
     }
 
-    /// Converts `path` into Videos\myvlc (MP4) or Music\myvlc (MP3) in the background.
+    /// Converts `path` into Videos\wushang (MP4) or Music\wushang (MP3) in the background.
     fn convert(&mut self, path: &Path, target: convert::Target) {
         if let Some(job) = &self.converting {
             let name = job.output.file_name().unwrap_or_default().to_string_lossy();
@@ -535,7 +535,7 @@ impl App {
             convert::Target::Mp3 => &windows::Win32::UI::Shell::FOLDERID_Music,
         };
         let dir = snapshot::known_folder(folder)
-            .map(|d| d.join("myvlc"))
+            .map(|d| d.join("wushang"))
             .map_err(|e| e.message())
             .and_then(|dir| {
                 std::fs::create_dir_all(&dir)
@@ -1474,7 +1474,7 @@ fn section_of(path: &Path) -> Section {
 
 fn run() -> Result<(), Box<dyn Error>> {
     let started = Instant::now();
-    const USAGE: &str = "usage: myvlc [--sw] [--play-and-exit] [file or stream address]";
+    const USAGE: &str = "usage: wushang [--sw] [--play-and-exit] [file or stream address]";
     let mut software = false;
     let mut play_and_exit = false;
     let mut path = None;
@@ -1503,7 +1503,7 @@ fn run() -> Result<(), Box<dyn Error>> {
     _ = SHARED.set(shared.clone());
     // WASAPI takes seconds to open on some machines, so start now, while the window comes up.
     let audio = audio::Device::open(shared.clone());
-    // No settings yet means myvlc hasn't run here before: the welcome shows.
+    // No settings yet means wushang hasn't run here before: the welcome shows.
     let first_run = !Library::default_dir().join("settings.txt").exists();
     let settings = Prefs::load(&Library::default_dir());
     if !settings.device.is_empty() {
@@ -2246,7 +2246,7 @@ thread_local! {
 
 /// The timer that runs passes while Windows' own move and size loop has the thread.
 const MODAL_TIMER: usize = 1;
-/// Passes in a row that may fail, about two seconds' worth, before myvlc gives up. One failed
+/// Passes in a row that may fail, about two seconds' worth, before wushang gives up. One failed
 /// pass only costs a frame.
 const MAX_FAILED_PASSES: u32 = 120;
 
@@ -3226,8 +3226,8 @@ fn pick_folder(hwnd: HWND) -> Option<PathBuf> {
 /// The window's own title, for the taskbar and Alt+Tab: the file playing, then the app.
 fn window_title(session: Option<&Session>) -> String {
     match session.and_then(|s| s.path.file_name()) {
-        Some(name) => format!("{} - myvlc", name.to_string_lossy()),
-        None => "myvlc".to_owned(),
+        Some(name) => format!("{} - wushang", name.to_string_lossy()),
+        None => "wushang".to_owned(),
     }
 }
 
@@ -3243,7 +3243,7 @@ fn create_window(title: &str, (video_w, video_h): (u32, u32)) -> windows::core::
             hInstance: instance.into(),
             hCursor: LoadCursorW(None, IDC_ARROW)?,
             hbrBackground: HBRUSH(GetStockObject(BLACK_BRUSH).0),
-            lpszClassName: w!("myvlc"),
+            lpszClassName: w!("wushang"),
             ..Default::default()
         };
         RegisterClassExW(&class);
@@ -3262,7 +3262,7 @@ fn create_window(title: &str, (video_w, video_h): (u32, u32)) -> windows::core::
             ((f64::from(video_h) * fit + chrome_h) as i32).max((MIN_SIZE.1 * scale as f32) as i32);
         let hwnd = CreateWindowExW(
             WINDOW_EX_STYLE::default(),
-            w!("myvlc"),
+            w!("wushang"),
             &HSTRING::from(title),
             WS_OVERLAPPEDWINDOW,
             CW_USEDEFAULT,
@@ -3303,7 +3303,7 @@ fn create_window(title: &str, (video_w, video_h): (u32, u32)) -> windows::core::
     }
 }
 
-/// Puts the window where it was when myvlc last closed, if Settings remember it and that spot
+/// Puts the window where it was when wushang last closed, if Settings remember it and that spot
 /// is still on a screen. Returns whether it was maximized.
 fn restore_placement(hwnd: HWND, p: &Prefs) -> bool {
     let Some(([x, y, w, h], maximized)) = p.window.filter(|_| p.remember_window) else {

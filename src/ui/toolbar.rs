@@ -193,7 +193,7 @@ impl Item {
             Item::Hdr => "HDR",
             Item::Zoom => "Zoom",
             Item::RightSidebar => "Right Sidebar",
-            Item::Quit => "Quit myvlc",
+            Item::Quit => "Quit wushang",
             Item::Preferences => "Settings",
             Item::Home => "Go Home",
             Item::Thumbnail => "Thumbnail",
@@ -216,7 +216,7 @@ impl Item {
     }
 
     /// Width in a bar, and the gap it wants on each side; between two items the larger wins.
-    /// These reproduce the design's player frame for the bars myvlc starts with.
+    /// These reproduce the design's player frame for the bars wushang starts with.
     fn size(self) -> (f32, f32) {
         match self {
             Item::More => (28.0, 10.0),
@@ -380,7 +380,7 @@ impl Toolbar {
             format!("{name} = {}\n", keys.join(" "))
         };
         let text = [
-            "# myvlc toolbar v1\n".to_owned(),
+            "# wushang toolbar v1\n".to_owned(),
             line("title", &self.title),
             line("left", &self.left),
             line("center", &self.center),
@@ -579,7 +579,7 @@ mod tests {
         let mut t = Toolbar::default();
         t.place(Item::Shuffle, None, Zone::Center, 0);
         t.place(Item::Divider, None, Zone::Right, 1);
-        let dir = std::env::temp_dir().join(format!("myvlc-toolbar-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("wushang-toolbar-{}", std::process::id()));
         t.save(&dir).unwrap();
         assert_eq!(Toolbar::load(&dir), t);
         fs::remove_dir_all(dir).unwrap();

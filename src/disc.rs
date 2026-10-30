@@ -3,7 +3,7 @@
 //! `dvd://<folder>` or `bluray://<folder or .iso>`.
 //!
 //! Blu-ray goes through libbluray (FFmpeg's `bluray:` protocol), which picks the main title. For
-//! DVD, libdvdnav would make the FFmpeg build GPL, so myvlc reads the disc's own index files
+//! DVD, libdvdnav would make the FFmpeg build GPL, so wushang reads the disc's own index files
 //! instead: each title set's IFO says how long its main program chain runs and where its
 //! chapters start, and the longest one's VOB files play back to back through FFmpeg's `concat`.
 //! No menus either way, and encrypted discs (CSS, AACS) don't play.
@@ -237,7 +237,7 @@ mod tests {
 
     #[test]
     fn reads_the_main_title_and_its_chapters() {
-        let root = std::env::temp_dir().join(format!("myvlc-dvd-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("wushang-dvd-{}", std::process::id()));
         let dir = root.join("VIDEO_TS");
         std::fs::create_dir_all(&dir).unwrap();
         // An extra in title set 1, the film (two VOBs) in title set 2.
@@ -266,7 +266,7 @@ mod tests {
         );
         assert_eq!(
             super::title(&address),
-            format!("myvlc-dvd-{}", std::process::id())
+            format!("wushang-dvd-{}", std::process::id())
         );
         assert!(super::address(&std::env::temp_dir()).is_none());
 

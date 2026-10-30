@@ -1,4 +1,4 @@
-# myvlc
+# wushang
 
 A small Windows video player in Rust, built with the same pipeline as VLC but without its plugin system.
 FFmpeg demuxes and decodes, the GPU decodes and presents through Direct3D 11, and WASAPI plays the audio.
@@ -12,10 +12,10 @@ cargo run --release -- path\to\video.mp4
 ```
 
 To install it for your account (no admin rights), build it, then run [scripts/install.ps1](scripts/install.ps1).
-It copies `myvlc.exe` and the DLLs it loads to `%LOCALAPPDATA%\Programs\myvlc` and adds a Start menu shortcut.
+It copies `wushang.exe` and the DLLs it loads to `%LOCALAPPDATA%\Programs\wushang` and adds a Start menu shortcut.
 Run it again after a new build to update the installed copy.
 
-Without a file, myvlc opens on the library.
+Without a file, wushang opens on the library.
 The first time it does (no `settings.txt` yet), the design's welcome shows over it in three steps.
 The first shows the media folder the library starts from, and Browse adds another to Videos.
 The second picks the theme and accent colour, which apply as you click, over a small picture of the player.
@@ -56,7 +56,7 @@ A folder's or playlist's track languages go over Settings' for its files: "Japan
 A folder's choice covers the folders inside it, the nearest choice wins, and a playlist's applies to files no chosen folder holds.
 Favourites appear first on Home.
 
-Library state (folders, recent files and positions, visit and play counts) lives in `%APPDATA%\myvlc`, or in the folder named by the `MYVLC_HOME` environment variable, which never seeds your own folders and suits tests.
+Library state (folders, recent files and positions, visit and play counts) lives in `%APPDATA%\wushang`, or in the folder named by the `WUSHANG_HOME` environment variable, which never seeds your own folders and suits tests.
 
 ### Player
 
@@ -88,8 +88,8 @@ A subtitle file with the same name as the video, next to it or in a "Subs" folde
 ASS and SSA subtitles, in the file or beside it, are drawn by libass as VLC and mpv draw them: their positions, fonts, colours, borders, shadows, rotation, karaoke and animation, with the fonts a Matroska file carries for them.
 After a seek, a resume or a switch of subtitle track, a second reader goes over the 10 seconds before the new position, so an embedded line that began there shows at once instead of the screen staying empty until the next one.
 On anamorphic video (DVDs and broadcasts store 16:9 in 720x576) libass draws at the shown size, and letters keep the shape they had where the script was laid out, as VSFilter and mpv show them.
-Without `libass-9.dll` next to myvlc.exe they fall back to plain text like every other format.
-Old subtitle files in a Windows code page instead of UTF-8 are read in the right one: a language tag such as `film.ru.srt` names it, and otherwise myvlc tries the Western, Central European, Cyrillic, Greek, Turkish, Hebrew, Arabic, Baltic, Japanese, Chinese and Korean code pages and keeps the one whose text reads like real words.
+Without `libass-9.dll` next to wushang.exe they fall back to plain text like every other format.
+Old subtitle files in a Windows code page instead of UTF-8 are read in the right one: a language tag such as `film.ru.srt` names it, and otherwise wushang tries the Western, Central European, Cyrillic, Greek, Turkish, Hebrew, Arabic, Baltic, Japanese, Chinese and Korean code pages and keeps the one whose text reads like real words.
 The gear opens the settings panel, with four tabs:
 
 - Playback: marks on the seek bar where the subtitles have lines, playback statistics over the video, reverse playback, a sleep timer, an audio visualizer, and speed from 0.25x to 2x without changing pitch.
@@ -128,9 +128,9 @@ The window opens the way it was launched, so a shortcut set to "Run: Minimized",
 
 ### Snapshots
 
-Shift+S, "Take Snapshot" in the player menu's Video submenu, or the snapshot button from Customize Player saves the frame on screen as a PNG in `Pictures\myvlc`; Settings' Recording page can make it a JPEG, or save it on the desktop or next to the file.
-R, "Record" in the player menu, or the record button from Customize Player records what plays into a Matroska file in `Videos\myvlc`, copied packet for packet without re-encoding, until R is pressed again or the media ends.
-The Recording page can switch it to MPEG-TS, which keeps what was written if myvlc stops mid-recording but holds fewer codecs, and save it on the desktop or next to the file.
+Shift+S, "Take Snapshot" in the player menu's Video submenu, or the snapshot button from Customize Player saves the frame on screen as a PNG in `Pictures\wushang`; Settings' Recording page can make it a JPEG, or save it on the desktop or next to the file.
+R, "Record" in the player menu, or the record button from Customize Player records what plays into a Matroska file in `Videos\wushang`, copied packet for packet without re-encoding, until R is pressed again or the media ends.
+The Recording page can switch it to MPEG-TS, which keeps what was written if wushang stops mid-recording but holds fewer codecs, and save it on the desktop or next to the file.
 The file holds what was on screen: it starts at the keyframe before the picture (copied video can only start on one), packets go in as playback reaches them rather than as the demuxer reads ahead, and a seek while recording carries on in the same file instead of jumping in it.
 Network streams record too; the recording button lights while it runs.
 It is the full-resolution frame with flips, rotation, crop, aspect ratio and colour adjustments as shown, but not zoom or the interface.
@@ -163,7 +163,7 @@ Esc or Ctrl+M also leaves the mini player window.
 ### Network
 
 Ctrl+N, "Open Network Stream" in the "..." menu, or "Add Network Stream" on the Network page asks for an address and plays it: http, https, HLS (`.m3u8`), RTSP, UDP or RTP.
-A bare host like `example.com/live.m3u8` gets `http://` in front, as in VLC, and `myvlc <address>` plays one from the command line.
+A bare host like `example.com/live.m3u8` gets `http://` in front, as in VLC, and `wushang <address>` plays one from the command line.
 The address stays on the Network page; right-clicking it offers Remove.
 A stream connects in the background while the player says "Connecting to ...", and if it can't play, the corner says so before the library comes back.
 A live stream, which has no end, shows "Live" in place of its length.
@@ -184,7 +184,7 @@ The list is gathered in the background and again each time the menu opens, so a 
 "Open Disc" in the "..." menu plays a DVD or Blu-ray: the disc in an optical drive, a disc's files copied to a folder (Ctrl+D), or a Blu-ray image (.iso).
 A disc folder or image also opens from the command line or when dropped on the window.
 Blu-ray goes through libbluray, which picks the main title.
-DVD needs no library: myvlc reads the disc's IFO files, picks the title set whose main program chain runs longest, and plays its VOB files back to back, with the length and chapters the IFO gives.
+DVD needs no library: wushang reads the disc's IFO files, picks the title set whose main program chain runs longest, and plays its VOB files back to back, with the length and chapters the IFO gives.
 libdvdnav and libdvdread would add menus and every title, but would make the FFmpeg build GPL.
 Neither plays encrypted discs (CSS on DVDs, AACS on Blu-rays), so commercial discs don't play; discs you made yourself do.
 
@@ -196,11 +196,11 @@ While it runs, the player menu's "Streaming" submenu shows that address, how man
 Like a recording it follows playback, so pausing or seeking here pauses or moves the stream.
 H.264 and HEVC get their parameter sets repeated before every keyframe, so a player that connects midway starts playing at the next one.
 MPEG-TS can't carry VP9, AV1 or the lossless audio formats; such media says so, and converting it to MP4 first works.
-Windows may ask once whether to let myvlc through its firewall, since other devices connect to it.
+Windows may ask once whether to let wushang through its firewall, since other devices connect to it.
 
 ### Converting
 
-"Convert" in a file's right-click menu, or in the "..." menu for the open file, re-encodes it into an MP4 (H.264 and AAC, saved in `Videos\myvlc`) or an MP3 (the sound alone, saved in `Music\myvlc`); Ctrl+R makes an MP4 of the open file.
+"Convert" in a file's right-click menu, or in the "..." menu for the open file, re-encodes it into an MP4 (H.264 and AAC, saved in `Videos\wushang`) or an MP3 (the sound alone, saved in `Music\wushang`); Ctrl+R makes an MP4 of the open file.
 It encodes with Windows' own Media Foundation encoders, so the FFmpeg build carries no encoder library and stays LGPL.
 The conversion runs in the background with its progress in the corner, on the player or the library, and "Stop Converting" in the "..." menu ends it and deletes the unfinished file.
 Video gets about 0.08 bits per pixel per frame (5 Mb/s for 1080p at 30 frames a second), sound 192 kb/s.
@@ -209,12 +209,12 @@ Video gets about 0.08 bits per pixel per frame (5 Mb/s for 1080p at 30 frames a 
 
 Ctrl+P or Settings in the "..." menu opens the Settings window from the design's "Settings" frames: categories on the left, their options on the right, and a search box that finds an option in any category.
 Every option it lists does something.
-Extensions holds myvlc's optional add-on, libass: whether ASS and SSA keep their own styling, and whether it uses the fonts a Matroska file carries.
-VLC's Lua extensions don't run in myvlc.
+Extensions holds wushang's optional add-on, libass: whether ASS and SSA keep their own styling, and whether it uses the fonts a Matroska file carries.
+VLC's Lua extensions don't run in wushang.
 Changes apply at once and are kept in `settings.txt` next to the library state.
 
 - General: dark, light or system theme, and the accent colour.
-  The design has one light frame, and myvlc turns every screen light from it, so menus, panels and dialogs follow the same greys.
+  The design has one light frame, and wushang turns every screen light from it, so menus, panels and dialogs follow the same greys.
   System follows the Windows "app mode" setting and switches when it changes.
   The accent replaces the design's orange everywhere except the VLC cone and the volume meter.
   Its nine colours are the onboarding frames' bright ones; Settings dims all but the one picked, as the design does.
@@ -238,7 +238,7 @@ Speed, aspect ratio, tracks and decoding are per-file defaults, so a change ther
 
 A profile is a whole set of settings under a name.
 The "…" menu's Profile row names the one in force, and its submenu, from the design's "Profiles" frame, lists Movies, Shows, Music and Work, then any you added, with "New" at the bottom.
-Picking a profile applies its settings at once, theme and accent included, and myvlc starts in it next time.
+Picking a profile applies its settings at once, theme and accent included, and wushang starts in it next time.
 A profile starts as a copy of the settings in force when it is first picked or made, and changes from then on stay with it.
 The window's place and the volume are left alone, since they belong to the machine rather than the profile.
 "New" asks for a name, then adds the profile and switches to it.
@@ -265,7 +265,7 @@ It needs these Ubuntu packages: `gcc-mingw-w64-x86-64-win32 nasm make pkg-config
 ```bash
 SRC=/mnt/d/tools/src/ffmpeg-9.0.2 DAV1D_SRC=/mnt/d/tools/src/dav1d-1.5.4 \
   ZLIB_SRC=/mnt/d/tools/src/zlib-1.3.1 BLURAY_SRC=/mnt/d/tools/src/bluray/libbluray-1.3.4 \
-  PREFIX=/mnt/d/tools/ffmpeg-9.0.2-myvlc bash scripts/build-ffmpeg.sh
+  PREFIX=/mnt/d/tools/ffmpeg-9.0.2-wushang bash scripts/build-ffmpeg.sh
 ```
 
 It builds the file protocol and the network ones a player opens (http, https, tcp, udp, rtp, with TLS from Windows' Schannel), `concat` for a DVD's VOB files, `bluray` for Blu-rays through libbluray (LGPL, linked into `avformat-63.dll`, 282 KB), 36 demuxers (HLS and RTSP among them), 20 parsers, 51 decoders (raw video among them, for capture devices) and the D3D11VA hwaccels, plus libswresample and libswscale.
@@ -291,7 +291,7 @@ The release tarballs go unpacked in `SRC`; libass's and FreeType's are GPG-signe
 SRC=/mnt/d/tools/src/ass PREFIX=/mnt/d/tools/libass-0.17.3 bash scripts/build-libass.sh
 ```
 
-[.cargo/config.toml](.cargo/config.toml) names the folder as `LIBASS_DIR`, and [build.rs](build.rs) copies the DLL next to the exe; myvlc loads it at run time, so a build without it still runs.
+[.cargo/config.toml](.cargo/config.toml) names the folder as `LIBASS_DIR`, and [build.rs](build.rs) copies the DLL next to the exe; wushang loads it at run time, so a build without it still runs.
 
 ## How it works
 
@@ -327,7 +327,7 @@ The library page ([src/ui/browse.rs](src/ui/browse.rs)) is painted inside a Dire
 | Qt interface | Direct2D + DirectWrite interface in a borderless Win32 window | [src/ui.rs](src/ui.rs), [src/ui/browse.rs](src/ui/browse.rs), [src/main.rs](src/main.rs) |
 | media library (medialibrary) | folders, recent files, M3U playlists, thumbnails, tags | [src/library.rs](src/library.rs), [src/thumbs.rs](src/thumbs.rs) |
 
-The decoder, the video processor and Direct2D share one `ID3D11Device`, which myvlc creates with BGRA support and hands to FFmpeg.
+The decoder, the video processor and Direct2D share one `ID3D11Device`, which wushang creates with BGRA support and hands to FFmpeg.
 Each present draws the video into the rounded video area, then Direct2D paints the bars, icons and text into the same back buffer.
 The icons are the design's SVGs, rendered by Direct2D's SVG support, and the text uses Inter, embedded in the exe.
 Layout numbers come from the design's 1920x1080 frame in DIPs, so the interface scales with the screen's DPI.
@@ -336,7 +336,7 @@ Decoded frames stay in the decoder's texture array, and the GPU's video processo
 Nothing is copied back to system memory.
 
 AV1 needs one extra decision, because libavcodec always prefers libdav1d, which never uses the GPU.
-myvlc asks the GPU for an AV1 decoder profile first.
+wushang asks the GPU for an AV1 decoder profile first.
 If it has one, FFmpeg's own AV1 decoder runs on D3D11VA like every other codec; if not, libdav1d decodes on every CPU core.
 
 A stream the GPU turns down after all, such as 10-bit H.264, which no GPU decodes, or a 4:4:4 AV1, is reopened in software on every core (libdav1d for AV1) and decoded again from the last keyframe.
@@ -371,30 +371,30 @@ At normal priority, libdav1d's bursts across all cores made it wake up about 40 
 Same laptop (Intel UHD + GTX 1650 Ti, Windows 11), same 6-second 1080p30 clips, release build.
 Each figure is the median of three runs.
 VLC ran with `--intf=dummy`, so its Qt GUI was not loaded either.
-myvlc used the slim FFmpeg build.
+wushang used the slim FFmpeg build.
 CPU time swings by about 100 ms between runs of the same setup, so treat smaller gaps as noise.
 These figures predate the interface; drawing it adds about 19 MB of working set and 9 MB of private memory (H.264 measured minimized: 103 MB working set, 88 MB private).
 
 | Clip | Player | Working set | GPU memory | Threads | CPU time |
 |---|---|---|---|---|---|
 | H.264 + AAC, MP4 | VLC | 282 MB | 215 MB | 27 | 734 ms |
-| H.264 + AAC, MP4 | myvlc | 82 MB | 84 MB | 13 | 516 ms |
+| H.264 + AAC, MP4 | wushang | 82 MB | 84 MB | 13 | 516 ms |
 | HEVC + Opus, MKV | VLC | 298 MB | 222 MB | 30 | 734 ms |
-| HEVC + Opus, MKV | myvlc | 89 MB | 101 MB | 13 | 438 ms |
+| HEVC + Opus, MKV | wushang | 89 MB | 101 MB | 13 | 438 ms |
 
 GPU memory is the "GPU Process Memory" shared usage counter.
 Dedicated usage was 0 MB for both, so both decoded on the Intel GPU, which keeps video surfaces in system RAM.
 
 The first frame appears 180 to 200 ms after launch.
 On this laptop, opening the WASAPI stream takes 1.7 s inside `IAudioClient::Initialize`, and VLC waits for it, which is the "Decoder wait done in 2514 ms" in its log.
-myvlc opens audio on the audio thread while the window and first frame come up, and starts the clock once sound plays.
+wushang opens audio on the audio thread while the window and first frame come up, and starts the clock once sound plays.
 
 H.264 and HEVC played with no dropped frames in every run; VP9 dropped one frame in one of four runs.
 A 60-second clip takes 62.3 s of wall time: 60 s of playback plus the 1.7 s audio device startup.
 
 ## Slim FFmpeg against the full build
 
-The same `myvlc.exe` ran next to each set of DLLs; both are FFmpeg 9 with the same ABI.
+The same `wushang.exe` ran next to each set of DLLs; both are FFmpeg 9 with the same ABI.
 Medians of three runs per clip.
 The memory, CPU and startup rows were measured before libdav1d was added to the slim build.
 
@@ -416,7 +416,7 @@ CPU time and startup are the same within run-to-run noise.
 ## AV1 in software
 
 Neither GPU in this laptop decodes AV1, so AV1 goes to libdav1d.
-These runs started myvlc minimized without activation, so they never took focus.
+These runs started wushang minimized without activation, so they never took focus.
 A minimized window skips display composition, so the CPU figures are a little lower than for a visible window and are not comparable with the tables above.
 Peak memory comes from Windows' own per-process counters.
 
@@ -444,7 +444,7 @@ Each of these is marked with a `ponytail:` comment in the code, along with the u
 - 4K60 10-bit H.264 decodes in software, which drops frames on a laptop CPU.
 - Audio devices must mix in f32, which every WASAPI shared-mode device seen so far does.
 - The audio callback takes a mutex.
-- The stereo Test sound plays through Windows' default device at the system volume, not the chosen device or myvlc's volume.
+- The stereo Test sound plays through Windows' default device at the system volume, not the chosen device or wushang's volume.
 - The subtitle timeline shows nothing for ASS and SSA tracks libass draws, and an embedded track's lines only as the demuxer reads them.
 - A recording or network stream of an RTSP or UDP stream ends where that stream drops and reconnects.
 - A reconnected stream must keep its track order; one that comes back with different tracks plays them wrongly.

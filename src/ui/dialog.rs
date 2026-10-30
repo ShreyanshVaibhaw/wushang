@@ -147,14 +147,14 @@ const SHORTCUTS: [(&str, &str); 24] = [
     ),
     ("Backspace", "Back, in the library"),
     ("S / P / N", "Stop, previous file, next file"),
-    ("Shift + S", "Snapshot, saved in Pictures\\myvlc"),
-    ("R", "Record, saved in Videos\\myvlc; R again stops"),
+    ("Shift + S", "Snapshot, saved in Pictures\\wushang"),
+    ("R", "Record, saved in Videos\\wushang; R again stops"),
     ("Ctrl + O", "Open files"),
     ("Ctrl + F", "Open a folder"),
     ("Ctrl + N", "Open a network stream"),
     (
         "Ctrl + R",
-        "Convert the open file to MP4, saved in Videos\\myvlc",
+        "Convert the open file to MP4, saved in Videos\\wushang",
     ),
     ("Ctrl + P", "Settings"),
     ("Ctrl + M", "Mini player, and back"),
@@ -162,7 +162,7 @@ const SHORTCUTS: [(&str, &str); 24] = [
     ("Ctrl + \\", "Hide the controls until the mouse moves"),
     ("Right-click", "Player and library menus"),
     ("F1", "Keyboard shortcuts"),
-    ("Shift + F1", "About myvlc"),
+    ("Shift + F1", "About wushang"),
     ("Q, Ctrl + Q", "Quit"),
 ];
 
@@ -1083,7 +1083,7 @@ fn about_parts(b: &mut Builder) -> f32 {
     let w = b.w;
     b.parts
         .push(Part::Logo(Rect::new(PAD, 70.0, PAD + 48.0, 118.0)));
-    b.text("myvlc", Style::Name, 84.0, 84.0, w - PAD);
+    b.text("wushang", Style::Name, 84.0, 84.0, w - PAD);
     b.text(
         concat!("Version ", env!("CARGO_PKG_VERSION")),
         Style::Help,

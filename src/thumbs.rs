@@ -522,7 +522,7 @@ mod tests {
 
     fn temp(name: &str, bytes: &[u8]) -> PathBuf {
         // Fixed names, so reruns overwrite instead of piling up files.
-        let path = std::env::temp_dir().join(format!("myvlc-thumbs-{name}"));
+        let path = std::env::temp_dir().join(format!("wushang-thumbs-{name}"));
         std::fs::write(&path, bytes).unwrap();
         path
     }

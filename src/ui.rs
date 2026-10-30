@@ -243,7 +243,7 @@ pub struct Layout {
 }
 
 impl Layout {
-    /// The player page with the bars myvlc starts with.
+    /// The player page with the bars wushang starts with.
     #[cfg(test)]
     pub fn new(width: f32, height: f32, bars: bool, fullscreen: bool) -> Self {
         Self::player(width, height, bars, fullscreen, &Toolbar::default())
@@ -1765,7 +1765,11 @@ impl Painter {
                 self.hover_box(rt, s, Hit::More);
                 self.icon(ctx, &i.more, 56.0, 11.0, true);
             }
-            let title = if s.title.is_empty() { "myvlc" } else { s.title };
+            let title = if s.title.is_empty() {
+                "wushang"
+            } else {
+                s.title
+            };
             self.text(
                 rt,
                 title,

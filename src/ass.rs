@@ -1,5 +1,5 @@
 //! ASS and SSA subtitles drawn by libass, as VLC and mpv draw them: positions, styles, fonts,
-//! colours, borders, rotation, karaoke and animation. libass ships as one DLL beside myvlc.exe
+//! colours, borders, rotation, karaoke and animation. libass ships as one DLL beside wushang.exe
 //! (`scripts/build-libass.sh`), loaded at run time; without it, ASS falls back to the plain text
 //! `subs.rs` makes of every format.
 //!
@@ -31,7 +31,7 @@ struct Image {
 
 type MessageCb = unsafe extern "C" fn(c_int, *const c_char, *mut c_void, *mut c_void);
 
-/// The libass functions myvlc calls, from the DLL.
+/// The libass functions wushang calls, from the DLL.
 struct Api {
     library_init: unsafe extern "C" fn() -> *mut c_void,
     library_done: unsafe extern "C" fn(*mut c_void),
@@ -76,7 +76,7 @@ impl Library {
         if library.is_null() {
             return None;
         }
-        // libass narrates font matching and every odd tag; myvlc's log has no use for it.
+        // libass narrates font matching and every odd tag; wushang's log has no use for it.
         unsafe extern "C" fn quiet(_: c_int, _: *const c_char, _: *mut c_void, _: *mut c_void) {}
         unsafe { (api.set_message_cb)(library, Some(quiet), std::ptr::null_mut()) };
         Some(Arc::new(Library(library)))
@@ -465,7 +465,7 @@ mod tests {
     }
 
     /// A file's fonts serve its tracks, and are gone for the tracks of the file after it. Inter,
-    /// which myvlc bundles and Windows doesn't have, stands in for an attached font.
+    /// which wushang bundles and Windows doesn't have, stands in for an attached font.
     #[test]
     fn a_files_fonts_go_with_it() {
         let header = b"[Script Info]\nPlayResX: 640\nPlayResY: 360\n\n[V4+ Styles]\n\

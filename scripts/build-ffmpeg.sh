@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Cross-compiles a slim LGPL FFmpeg for myvlc on Linux/WSL with MinGW-w64.
+# Cross-compiles a slim LGPL FFmpeg for wushang on Linux/WSL with MinGW-w64.
 # Only the demuxers, parsers and decoders a desktop player needs are built, plus D3D11VA, dav1d
 # for software AV1, and zlib for Matroska tracks stored compressed. Subtitles cover embedded text
 # and picture tracks and the common external files (.srt .ass .ssa .vtt .sub .idx .smi .sup).
@@ -10,7 +10,7 @@
 # with Windows' own Media Foundation encoders (H.264, HEVC, AAC, MP3), which keeps the build LGPL
 # with no codec library of its own. Capture devices come from DirectShow, the screen from GDI.
 # Blu-ray folders and images open through libbluray (LGPL), linked in statically; DVDs need no
-# library, as myvlc reads their files itself (src/disc.rs) and plays them through `concat`.
+# library, as wushang reads their files itself (src/disc.rs) and plays them through `concat`.
 # libdvdnav and libdvdread would make the build GPL.
 #
 # Needs: gcc-mingw-w64-x86-64-win32 nasm make pkg-config meson ninja-build, plus gcc and
@@ -23,7 +23,7 @@ SRC=${SRC:-/mnt/d/tools/src/ffmpeg-9.0.2}
 DAV1D_SRC=${DAV1D_SRC:-/mnt/d/tools/src/dav1d-1.5.4}
 ZLIB_SRC=${ZLIB_SRC:-/mnt/d/tools/src/zlib-1.3.1}
 BLURAY_SRC=${BLURAY_SRC:-/mnt/d/tools/src/bluray/libbluray-1.3.4}
-PREFIX=${PREFIX:-/mnt/d/tools/ffmpeg-9.0.2-myvlc}
+PREFIX=${PREFIX:-/mnt/d/tools/ffmpeg-9.0.2-wushang}
 # Static libraries linked into the FFmpeg DLLs: none of them ships as a DLL of its own.
 DAV1D_PREFIX="$PREFIX-deps"
 
@@ -50,7 +50,7 @@ export PKG_CONFIG_LIBDIR="$DAV1D_PREFIX/lib/pkgconfig"
 
 # libbluray (LGPL) reads Blu-ray folders and ISO images. No BD-J (Java menus), no libxml2 (disc
 # metadata) and no fonts: what plays is the main title. AACS decryption is a separate library
-# libbluray would load at run time, which myvlc doesn't ship, so encrypted discs don't play.
+# libbluray would load at run time, which wushang doesn't ship, so encrypted discs don't play.
 (cd "$BLURAY_SRC" && ./configure --host=x86_64-w64-mingw32 --prefix="$DAV1D_PREFIX" \
   --enable-static --disable-shared --disable-bdjava-jar --without-libxml2 --without-freetype \
   --without-fontconfig --disable-examples --disable-doxygen-doc && make clean && \
@@ -74,7 +74,7 @@ decoders=(h264 hevc av1 libdav1d vp8 vp9 mpeg4 mpeg2video mpeg1video vc1 wmv3 ms
           aac aac_latm mp3float mp2float ac3 eac3 opus vorbis flac alac dca truehd wmav2
           pcm_s16le pcm_s16be pcm_s24le pcm_s32le pcm_f32le pcm_u8 pcm_alaw pcm_mulaw pcm_bluray pcm_dvd
           subrip srt ass ssa webvtt movtext text microdvd subviewer sami dvdsub dvbsub pgssub)
-# myvlc uses the *_d3d11va2 hwaccels, which decode into AV_PIX_FMT_D3D11 textures it presents
+# wushang uses the *_d3d11va2 hwaccels, which decode into AV_PIX_FMT_D3D11 textures it presents
 # without copying. Their code sits in the same objects as the older *_d3d11va ones, and the
 # Makefile only builds those objects when *_d3d11va is enabled, so both families are listed.
 hwaccels=()

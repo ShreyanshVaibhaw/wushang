@@ -732,7 +732,7 @@ mod tests {
 
     /// A fresh folder under the temp dir, emptied on every run.
     fn temp_dir(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("myvlc-subs-{name}"));
+        let dir = std::env::temp_dir().join(format!("wushang-subs-{name}"));
         _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir

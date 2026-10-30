@@ -528,7 +528,7 @@ mod tests {
     fn convert(target: Target) -> PathBuf {
         let clip = Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/test_h264.mp4");
         let out = std::env::temp_dir().join(format!(
-            "myvlc-convert-{}.{}",
+            "wushang-convert-{}.{}",
             std::process::id(),
             target.extension()
         ));

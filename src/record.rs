@@ -1,6 +1,6 @@
 //! Recording, VLC's "Record": the open file or stream copied packet for packet, without
-//! re-encoding, into a Matroska file in Videos\myvlc, from the moment Record is pressed until it is
-//! pressed again or the media ends. Matroska holds every codec myvlc plays.
+//! re-encoding, into a Matroska file in Videos\wushang, from the moment Record is pressed until it is
+//! pressed again or the media ends. Matroska holds every codec wushang plays.
 //!
 //! The demux thread does the writing, since it holds the packets anyway; the interface asks for
 //! a recording through a [`Control`] and hears back when a file is done. The demuxer reads seconds
@@ -431,7 +431,7 @@ mod tests {
         let mut received = Vec::new();
         player.read_to_end(&mut received).unwrap();
         let body = received.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
-        let ts = std::env::temp_dir().join(format!("myvlc-stream-{}.ts", std::process::id()));
+        let ts = std::env::temp_dir().join(format!("wushang-stream-{}.ts", std::process::id()));
         std::fs::write(&ts, &received[body..]).unwrap();
         let check = ff::format::input(&ts).unwrap();
         assert_eq!(check.format().name(), "mpegts");
@@ -467,7 +467,7 @@ mod tests {
     #[test]
     fn records_mpeg_ts_for_a_ts_path() {
         let clip = Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/test_60s.mp4");
-        let out = std::env::temp_dir().join(format!("myvlc-record-{}.ts", std::process::id()));
+        let out = std::env::temp_dir().join(format!("wushang-record-{}.ts", std::process::id()));
         let mut input = ff::format::input(&clip).unwrap();
         let mut recorder = Recorder::start(&input, &Sink::File(out.clone())).unwrap();
         for (_, packet) in input.packets().take(120) {
@@ -488,7 +488,7 @@ mod tests {
     #[test]
     fn copies_from_a_keyframe_and_continues_after_a_seek() {
         let clip = Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/test_tracks.mkv");
-        let out = std::env::temp_dir().join(format!("myvlc-record-{}.mkv", std::process::id()));
+        let out = std::env::temp_dir().join(format!("wushang-record-{}.mkv", std::process::id()));
         let mut input = ff::format::input(&clip).unwrap();
         let mut recorder = Recorder::start(&input, &Sink::File(out.clone())).unwrap();
         // Start mid-file, as pressing Record would, then seek back once.

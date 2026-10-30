@@ -12,7 +12,7 @@ fn main() {
         let bin = PathBuf::from(dir).join("bin");
         // Copy again whenever a library is rebuilt in place, not only when the variable changes.
         println!("cargo:rerun-if-changed={}", bin.display());
-        // libass is optional: myvlc draws plain subtitles without it.
+        // libass is optional: wushang draws plain subtitles without it.
         let Ok(entries) = fs::read_dir(&bin) else {
             continue;
         };

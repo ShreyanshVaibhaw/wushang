@@ -13,7 +13,7 @@ use std::path::Path;
 use crate::captions::CaptionStyle;
 
 const FILE: &str = "settings.txt";
-const HEADER: &str = "# myvlc settings v1";
+const HEADER: &str = "# wushang settings v1";
 
 /// A list of choices: (stored key, label).
 pub type Choices = &'static [(&'static str, &'static str)];
@@ -33,7 +33,7 @@ pub const WHEEL: Choices = &[
 ];
 pub const RESUME: Choices = &[("always", "Always"), ("never", "Never")];
 pub const REPEAT: Choices = &[("off", "Off"), ("all", "All"), ("one", "One")];
-pub const AT_END: Choices = &[("library", "Go to the library"), ("quit", "Quit myvlc")];
+pub const AT_END: Choices = &[("library", "Go to the library"), ("quit", "Quit wushang")];
 pub const STARTUP_VOLUME: Choices = &[
     ("remember", "Remember last volume"),
     ("25", "25%"),
@@ -63,20 +63,20 @@ pub const NET_TIMEOUT: Choices = &[
     ("30", "30 seconds"),
     ("60", "1 minute"),
 ];
-/// Where snapshots go: Pictures\myvlc, the desktop, or the folder of the file they come from.
+/// Where snapshots go: Pictures\wushang, the desktop, or the folder of the file they come from.
 pub const SNAP_DIR: Choices = &[
-    ("pictures", "Pictures\\myvlc"),
+    ("pictures", "Pictures\\wushang"),
     ("desktop", "Desktop"),
     ("beside", "Next to the file"),
 ];
 /// Where recordings go, the same way.
 pub const RECORD_DIR: Choices = &[
-    ("videos", "Videos\\myvlc"),
+    ("videos", "Videos\\wushang"),
     ("desktop", "Desktop"),
     ("beside", "Next to the file"),
 ];
 pub const SNAP_FORMAT: Choices = &[("png", "PNG"), ("jpg", "JPEG")];
-/// MPEG-TS keeps what was written if myvlc stops mid-recording, but holds fewer codecs.
+/// MPEG-TS keeps what was written if wushang stops mid-recording, but holds fewer codecs.
 pub const RECORD_FORMAT: Choices = &[("mkv", "Matroska (.mkv)"), ("ts", "MPEG-TS (.ts)")];
 /// The first port streaming tries; it takes the next free one when that is busy.
 pub const STREAM_PORT: Choices = &[
@@ -85,7 +85,7 @@ pub const STREAM_PORT: Choices = &[
     ("8554", "8554"),
     ("9000", "9000"),
 ];
-/// Subtitle fonts to pick from; Inter comes with myvlc, the rest with Windows.
+/// Subtitle fonts to pick from; Inter comes with wushang, the rest with Windows.
 pub const FONTS: [&str; 8] = [
     "Inter",
     "Segoe UI",
@@ -154,7 +154,7 @@ pub struct Prefs {
     /// An output device name; empty follows the system default.
     pub device: String,
     pub startup_volume: usize,
-    /// The volume when myvlc last closed, 0..2.
+    /// The volume when wushang last closed, 0..2.
     pub volume: f32,
     /// Percent per Up/Down press.
     pub volume_step: u32,
@@ -603,7 +603,7 @@ mod tests {
             net_timeout: 30,
             ..Prefs::default()
         };
-        let dir = std::env::temp_dir().join(format!("myvlc-prefs-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("wushang-prefs-{}", std::process::id()));
         p.save(&dir).unwrap();
         assert_eq!(Prefs::load(&dir), p);
         fs::remove_dir_all(dir).unwrap();

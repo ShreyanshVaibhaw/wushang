@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use crate::library::Track;
 
 const FILE: &str = "tags.txt";
-const HEADER: &str = "# myvlc tags v1";
+const HEADER: &str = "# wushang tags v1";
 
 /// A file's size and modification time (in FILETIME units): when either changes, its tags may
 /// have too.
@@ -78,7 +78,7 @@ mod tests {
 
     #[test]
     fn saves_and_loads_tags() {
-        let dir = std::env::temp_dir().join(format!("myvlc-tags-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("wushang-tags-{}", std::process::id()));
         let song = PathBuf::from(r"E:\Music\Album\01 Song.mp3");
         let track = Track {
             path: song.clone(),

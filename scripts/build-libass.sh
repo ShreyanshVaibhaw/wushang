@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Cross-compiles libass for myvlc on Linux/WSL with MinGW-w64, as one DLL with FreeType, FriBidi
-# and HarfBuzz linked in statically; myvlc loads it at run time to draw ASS and SSA subtitles with
+# Cross-compiles libass for wushang on Linux/WSL with MinGW-w64, as one DLL with FreeType, FriBidi
+# and HarfBuzz linked in statically; wushang loads it at run time to draw ASS and SSA subtitles with
 # their positions, styles, fonts and karaoke. Fonts come from Windows through DirectWrite, so
 # there is no fontconfig.
 #
@@ -55,7 +55,7 @@ static harfbuzz "$SRC/harfbuzz-10.0.1" \
   -Dicu=disabled -Dtests=disabled -Ddocs=disabled -Dutilities=disabled -Dintrospection=disabled
 
 # libass as a DLL with everything inside, the C++ runtime HarfBuzz needs included, so it ships
-# alone next to myvlc.exe.
+# alone next to wushang.exe.
 rm -rf "$SRC/libass-0.17.3/build-mingw"
 meson setup "$SRC/libass-0.17.3/build-mingw" "$SRC/libass-0.17.3" --cross-file="$CROSS" \
   --prefix="$PREFIX" --libdir=lib --buildtype=release --default-library=shared \

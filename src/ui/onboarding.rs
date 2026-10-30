@@ -1,10 +1,10 @@
 //! The first-run welcome, from the design's eleven "Onboarding" frames: a welcome with the media
 //! folder to start from, the theme and accent colour over a small picture of the player, and the
-//! basic keyboard shortcuts. It shows over the library the first time myvlc starts (no
+//! basic keyboard shortcuts. It shows over the library the first time wushang starts (no
 //! settings.txt yet). Theme and colour apply as they're picked, like Settings > General.
 //!
 //! Sizes are DIPs from the 1088x756 frames; on a small window it scales down. The design's text
-//! says VLC and lists VLC's keys; this says myvlc and lists myvlc's.
+//! says VLC and lists VLC's keys; this says wushang and lists wushang's.
 
 use windows::Win32::UI::Input::KeyboardAndMouse::*;
 use windows::core::Interface;
@@ -369,8 +369,8 @@ impl Painter {
         unsafe {
             self.prefs_glyph(ctx, base, &self.icons.logo, W / 2.0, 186.0, 124.0);
             let title = Rect::new(0.0, 285.0, W, 325.0);
-            self.put(rt, "Welcome to myvlc!", &r.welcome, title, &r.title_fg);
-            let text = "myvlc is a free video and music player built on FFmpeg. It plays most \
+            self.put(rt, "Welcome to wushang!", &r.welcome, title, &r.title_fg);
+            let text = "wushang is a free video and music player built on FFmpeg. It plays most \
                         video and audio files, with their subtitles and tracks, and keeps a \
                         library of your media folders.";
             let utf16: Vec<u16> = text.encode_utf16().collect();

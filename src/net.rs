@@ -49,7 +49,7 @@ impl NetKind {
     }
 }
 
-/// Whether `s` is a stream address myvlc can open, like `https://example.com/live.m3u8`.
+/// Whether `s` is a stream address wushang can open, like `https://example.com/live.m3u8`.
 pub fn is_url(s: &str) -> bool {
     let Some((scheme, rest)) = s.split_once("://") else {
         return false;
@@ -85,7 +85,7 @@ pub fn normalize_url(raw: &str) -> Result<String, String> {
         };
     }
     if let Some((scheme, _)) = url.split_once("://") {
-        return Err(format!("myvlc can't open {scheme} addresses."));
+        return Err(format!("wushang can't open {scheme} addresses."));
     }
     // No scheme: a dotted host, optionally with a port and a path.
     let host = url.split(['/', '?', '#']).next().unwrap_or("");
@@ -460,7 +460,7 @@ pub fn fetch_text(url: &str, timeout: Duration) -> Result<String, String> {
     let ms = (timeout.as_millis()).clamp(1_000, 60_000) as i32;
 
     let wide = |s: &str| s.encode_utf16().chain([0]).collect::<Vec<u16>>();
-    let agent = HSTRING::from(concat!("myvlc/", env!("CARGO_PKG_VERSION")));
+    let agent = HSTRING::from(concat!("wushang/", env!("CARGO_PKG_VERSION")));
     unsafe {
         struct Handle(*mut std::ffi::c_void);
         impl Drop for Handle {

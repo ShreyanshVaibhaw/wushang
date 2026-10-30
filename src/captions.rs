@@ -574,7 +574,7 @@ mod tests {
             text(1.5, vec![vec![span("A later cue stacks above", false)]]),
         ];
         let pixels = render(&cues);
-        png(&std::env::temp_dir().join("myvlc-captions.png"), &pixels);
+        png(&std::env::temp_dir().join("wushang-captions.png"), &pixels);
 
         // Text fill and its outline in the bottom 30%, centred.
         let bottom = (W / 8, H * 7 / 10, W * 7 / 8, H);

@@ -7,7 +7,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 const FILE: &str = "bookmarks.txt";
-const HEADER: &str = "# myvlc bookmarks v1";
+const HEADER: &str = "# wushang bookmarks v1";
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Bookmark {
@@ -134,14 +134,14 @@ mod tests {
 
     fn temp_dir(name: &str) -> PathBuf {
         let dir =
-            std::env::temp_dir().join(format!("myvlc-bookmarks-{name}-{}", std::process::id()));
+            std::env::temp_dir().join(format!("wushang-bookmarks-{name}-{}", std::process::id()));
         _ = fs::remove_dir_all(&dir);
         dir
     }
 
     #[test]
     fn parse_skips_bad_lines() {
-        let text = "# myvlc bookmarks v1\n\
+        let text = "# wushang bookmarks v1\n\
                     C:\\v\\a.mp4\t75.5\tIntro\n\
                     not a bookmark\n\
                     C:\\v\\a.mp4\tsoon\tBad time\n\

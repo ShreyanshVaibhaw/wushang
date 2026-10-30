@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Generates the test clips in testdata/ that are too big to keep in git: 1080p30 test patterns in
-# each codec myvlc decodes. The small fixtures with exact subtitle timings (test_tracks.mkv,
+# each codec wushang decodes. The small fixtures with exact subtitle timings (test_tracks.mkv,
 # test_subs.mkv, tracks.srt) are committed instead.
 #
 # Needs an ffmpeg with libx264, libx265, libvpx-vp9, libsvtav1 and libopus (a GPL build, e.g.

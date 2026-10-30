@@ -1,4 +1,4 @@
-//! Snapshots: the frame on screen saved as a PNG or JPEG (in Pictures\myvlc unless Settings
+//! Snapshots: the frame on screen saved as a PNG or JPEG (in Pictures\wushang unless Settings
 //! says otherwise), named after the file and the moment in it, like "Holiday 1m05s.png".
 
 use std::path::{Path, PathBuf};
@@ -75,7 +75,7 @@ pub fn free_path(dir: &Path, name: &str, ext: &str) -> PathBuf {
         .unwrap()
 }
 
-/// The folder to save in for a `prefs::SNAP_DIR` or `RECORD_DIR` key, made if missing: a myvlc
+/// The folder to save in for a `prefs::SNAP_DIR` or `RECORD_DIR` key, made if missing: a wushang
 /// folder in `own` (Pictures or Videos), the desktop, or the folder `media` is in. A stream has
 /// no folder, so "beside" sends it to `own` too.
 pub fn output_dir(key: &str, own: &GUID, media: &Path) -> windows::core::Result<PathBuf> {
@@ -86,7 +86,7 @@ pub fn output_dir(key: &str, own: &GUID, media: &Path) -> windows::core::Result<
     let dir = match (key, beside) {
         ("desktop", _) => known_folder(&FOLDERID_Desktop)?,
         ("beside", Some(dir)) => dir.to_owned(),
-        _ => known_folder(own)?.join("myvlc"),
+        _ => known_folder(own)?.join("wushang"),
     };
     std::fs::create_dir_all(&dir)?;
     Ok(dir)
@@ -148,7 +148,7 @@ mod tests {
             "Rock_ 24_7"
         );
 
-        let dir = std::env::temp_dir().join(format!("myvlc-snap-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("wushang-snap-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         assert_eq!(free_path(&dir, "a", "png"), dir.join("a.png"));
         unsafe { CoInitializeEx(None, COINIT_MULTITHREADED).ok().unwrap() };

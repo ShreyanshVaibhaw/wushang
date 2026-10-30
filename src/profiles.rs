@@ -1,7 +1,7 @@
 //! Profiles: named sets of settings, picked from the "..." menu's Profile submenu (the design's
 //! "Profiles" frame). settings.txt always holds the settings in force and `profile.txt` names the
 //! profile they belong to. Each profile keeps its own copy in `profiles\<name>\settings.txt`,
-//! written when myvlc switches to it or away from it.
+//! written when wushang switches to it or away from it.
 
 use std::fs;
 use std::io::{self, ErrorKind};
@@ -107,7 +107,7 @@ mod tests {
 
     #[test]
     fn each_profile_keeps_its_own_settings() {
-        let dir = std::env::temp_dir().join(format!("myvlc-profiles-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("wushang-profiles-{}", std::process::id()));
         _ = fs::remove_dir_all(&dir);
         let mut p = Profiles::load(&dir);
         assert_eq!(p.names(), DEFAULTS);
