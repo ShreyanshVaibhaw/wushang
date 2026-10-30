@@ -29,7 +29,8 @@ To install it for your account (no admin rights), build it, then run [scripts/in
 It copies `wushang.exe` and the DLLs it loads to `%LOCALAPPDATA%\Programs\wushang` and adds a Start menu shortcut.
 Run it again after a new build to update the installed copy.
 
-To make a release, raise `version` in [Cargo.toml](Cargo.toml), build, and run [scripts/package.ps1](scripts/package.ps1), which writes `wushang-<version>-windows-x64.zip` to the build folder.
+To make a release, raise `version` in [Cargo.toml](Cargo.toml) and run [scripts/package.ps1](scripts/package.ps1), which builds and writes `wushang-<version>-windows-x64.zip` to the build folder.
+It builds with your user folder cut out of the source paths the exe embeds, so the zip doesn't carry your Windows user name.
 Attach that zip to a GitHub release tagged `v<version>`; the updater only installs a zip named that way.
 
 Without a file, wushang opens on the library.
