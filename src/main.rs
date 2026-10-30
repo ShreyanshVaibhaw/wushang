@@ -1895,10 +1895,17 @@ fn run() -> Result<(), Box<dyn Error>> {
         {
             app.installing = None;
             match result {
-                // Quit as usual, saving everything, and start the new version after.
+                // Quit as usual, saving everything, and start the new version after. With the
+                // dialog closed meanwhile, the new version starts next time instead.
                 Ok(exe) => {
-                    update::restart_with(exe);
-                    unsafe { _ = DestroyWindow(hwnd) };
+                    if UI.with_borrow(|ui| {
+                        ui.dialog
+                            .as_ref()
+                            .is_some_and(|d| matches!(d.dialog, Dialog::Update(_)))
+                    }) {
+                        update::restart_with(exe);
+                        unsafe { _ = DestroyWindow(hwnd) };
+                    }
                 }
                 Err(e) => UI.with_borrow_mut(|ui| ui.dialog_error(e)),
             }

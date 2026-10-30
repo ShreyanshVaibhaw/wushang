@@ -919,11 +919,17 @@ impl Painter {
                     )
                 };
                 b.text(help, Style::Help, PAD, 117.0, w - PAD);
+                let mut top = 157.0;
                 if let Some(e) = &d.error {
                     b.text(e.as_str(), Style::Error, PAD, 143.0, w - PAD);
+                    top += 20.0;
                 }
-                let label = if d.busy { "Installing..." } else { "Install" };
-                b.footer(177.0, Some((Target::Cancel, "Later")), label, !d.busy)
+                // No Later while it installs: the files are already being replaced.
+                if d.busy {
+                    b.footer(top, None, "Installing...", false)
+                } else {
+                    b.footer(top, Some((Target::Cancel, "Later")), "Install", true)
+                }
             }
         };
         // Clicks anywhere on the dialog stop at it; the dimmed window around it is Body too.
