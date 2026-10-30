@@ -62,6 +62,9 @@ Library state (folders, recent files and positions, visit and play counts) lives
 
 The player has the redesign's own title bar and control bar.
 Click play/pause, previous (restart, or the previous file within the first 3 seconds), next, the seek bar, the volume wedge (up to 200%, like VLC) and the speaker (mute).
+Hovering over the seek bar shows a preview above it, as on YouTube: the frame at that point (its nearest keyframe, decoded in software on a thread of its own) and the time.
+Dragging the seek bar pauses and shows the video under the pointer as it moves, then plays on from the drop if it was playing.
+While the pointer moves it jumps to keyframes, the next jump waiting for the last one's frame, so the picture keeps up; where the pointer rests, an exact seek shows the frame under it.
 The title bar has minimize, maximize, fullscreen and close, and dragging it moves the window.
 While playing, the bars hide after 3 seconds without mouse movement and the video fills the window inside a 10 px rounded frame; moving the mouse brings them back.
 The "…" button opens the main menu from the design: open files, open a folder, recent files, settings profiles, keyboard shortcuts, Customize Player, Settings and About.

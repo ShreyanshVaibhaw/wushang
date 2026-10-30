@@ -505,6 +505,10 @@ impl Renderer {
         self.painter.add_thumbnail(&self.d2d, path, picture);
     }
 
+    pub fn set_seek_still(&mut self, still: Option<(u32, u32, &[u8])>) {
+        self.painter.set_seek_still(&self.d2d, still);
+    }
+
     pub fn take_wanted(&mut self) -> Vec<PathBuf> {
         self.painter.take_wanted()
     }

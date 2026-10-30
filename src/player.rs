@@ -121,6 +121,9 @@ pub struct Shared {
     /// Where the last seek asked to land, as f64 bits. The demuxer can only seek to a keyframe,
     /// so decoders drop what comes before this, like VLC's exact seek.
     seek_floor: AtomicU64,
+    /// False after a quick seek: video shows the keyframe it lands on instead of decoding on to
+    /// the target, so dragging the seek bar keeps up.
+    exact: AtomicBool,
     volume: AtomicU32,
     pub muted: AtomicBool,
     seek: Mutex<Seek>,
@@ -182,6 +185,8 @@ struct Seek {
     /// Last target requested. The clock is unknown right after a seek, so a second key press
     /// builds on this instead of jumping back to the start.
     last: f64,
+    /// The pending seek is `Shared::seek_quick`'s.
+    quick: bool,
 }
 
 impl Shared {
@@ -193,6 +198,7 @@ impl Shared {
             stopping: AtomicBool::new(false),
             serial: AtomicU64::new(0),
             seek_floor: AtomicU64::new(0),
+            exact: AtomicBool::new(true),
             volume: AtomicU32::new(1.0f32.to_bits()),
             muted: AtomicBool::new(false),
             seek: Mutex::default(),
@@ -217,6 +223,7 @@ impl Shared {
         self.serial.fetch_add(1, Relaxed);
         *self.seek.lock().unwrap() = Seek::default();
         self.seek_floor.store(0, Relaxed);
+        self.exact.store(true, Relaxed);
         for flag in [&self.video_done, &self.audio_master, &self.audio_done] {
             flag.store(false, Relaxed);
         }
@@ -224,6 +231,11 @@ impl Shared {
 
     pub fn seek_floor(&self) -> f64 {
         f64::from_bits(self.seek_floor.load(Relaxed))
+    }
+
+    /// Whether video decodes on to the last seek's target (see `exact`).
+    fn exact(&self) -> bool {
+        self.exact.load(Relaxed)
     }
 
     pub fn volume(&self) -> f32 {
@@ -254,6 +266,16 @@ impl Shared {
         let mut seek = self.seek.lock().unwrap();
         seek.last = target.max(0.0);
         seek.pending = Some(seek.last);
+        seek.quick = false;
+    }
+
+    /// A seek that shows the keyframe at or before `target` rather than the frame at it: fast
+    /// enough to repeat while the seek bar is dragged.
+    pub fn seek_quick(&self, target: f64) {
+        let mut seek = self.seek.lock().unwrap();
+        seek.last = target.max(0.0);
+        seek.pending = Some(seek.last);
+        seek.quick = true;
     }
 
     pub fn toggle_pause(&self) {
@@ -267,10 +289,13 @@ impl Shared {
         let from = self.clock.get().unwrap_or(seek.last);
         seek.last = (from + delta).max(0.0);
         seek.pending = Some(seek.last);
+        seek.quick = false;
     }
 
-    fn take_seek(&self) -> Option<f64> {
-        self.seek.lock().unwrap().pending.take()
+    /// The seek the demuxer should do, and whether it is quick.
+    fn take_seek(&self) -> Option<(f64, bool)> {
+        let mut seek = self.seek.lock().unwrap();
+        seek.pending.take().map(|t| (t, seek.quick))
     }
 }
 
@@ -574,15 +599,17 @@ pub fn spawn_demuxer(
                     r.play_to(playhead);
                 }
             }
-            let target = if follower {
+            let (target, quick) = if follower {
                 let now = shared.serial.load(Relaxed);
-                (now != followed).then(|| {
+                let target = (now != followed).then(|| {
                     followed = now;
                     shared.seek_floor()
-                })
+                });
+                (target, None)
             } else {
-                shared.take_seek()
+                shared.take_seek().unzip()
             };
+            let quick = quick.unwrap_or(false);
             if let Some(target) = target {
                 // Lands on the keyframe at or before the target; the decoders skip up to the target.
                 let ts = (target.max(0.0) * f64::from(ffi::AV_TIME_BASE)) as i64;
@@ -599,6 +626,7 @@ pub fn spawn_demuxer(
                     followed
                 } else {
                     shared.seek_floor.store(target.max(0.0).to_bits(), Relaxed);
+                    shared.exact.store(!quick, Relaxed);
                     shared.serial.fetch_add(1, Relaxed) + 1
                 };
                 for r in routes.lock().unwrap().iter() {
@@ -612,7 +640,11 @@ pub fn spawn_demuxer(
                     r.seeked();
                 }
                 eof = false;
-                prerolled.clear();
+                // Quick seeks come many a second from a dragged seek bar; the exact one that
+                // ends the drag reads the subtitles before it.
+                if !quick {
+                    prerolled.clear();
+                }
             }
             if let Some(reopen) = &reopen {
                 let fresh: Vec<_> = {
@@ -853,7 +885,7 @@ pub fn spawn_video_decoder(
                         let pts = frame.timestamp().map_or(next_pts, |t| t as f64 * time_base);
                         next_pts = pts + frame_duration;
                         // Decoded only to reach the seek target from the keyframe before it.
-                        if pts + frame_duration / 2.0 < shared.seek_floor() {
+                        if shared.exact() && pts + frame_duration / 2.0 < shared.seek_floor() {
                             continue;
                         }
                         // Software frames are repacked for the GPU here, off the render thread.

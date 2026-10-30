@@ -112,6 +112,9 @@ static WINDOWED: Mutex<Option<(isize, WINDOWPLACEMENT)>> = Mutex::new(None);
 static MINI: Mutex<Option<WINDOWPLACEMENT>> = Mutex::new(None);
 /// Thumbnail size in pixels: the grid tile at 125% scaling, 16:9.
 const THUMB_SIZE: (u32, u32) = (400, 225);
+/// Pixels across the seek bar preview's still; it shows 200 DIPs wide, so this stays sharp up to
+/// 200% scaling.
+const SEEK_STILL_WIDTH: u32 = 400;
 /// How often playback positions go into the library while playing.
 const RECORD_EVERY: Duration = Duration::from_secs(5);
 const SAVE_EVERY: Duration = Duration::from_secs(30);
@@ -282,7 +285,27 @@ struct App {
     /// The HTTP server players connect to while streaming out, and where its errors come back.
     stream_server: Option<stream::Server>,
     stream_control: Option<record::Control>,
+    /// The seek bar being dragged; see `App::scrub`.
+    scrub: Option<Scrub>,
 }
+
+/// A drag of the seek bar, which shows the video at the pointer as it moves, as YouTube does.
+struct Scrub {
+    /// Playing when the drag began, so it plays again when it ends.
+    resume: bool,
+    /// The last target sent, when, and the serial the seek before it had.
+    sent: f64,
+    at: Instant,
+    serial: u64,
+    /// Whether that seek was exact.
+    exact: bool,
+}
+
+/// While dragging, a quick seek goes out once the last one's frame is on screen, or after this
+/// long if it never comes.
+const SCRUB_WAIT: Duration = Duration::from_millis(250);
+/// A pointer that rests this long gets an exact seek, for the frame under it.
+const SCRUB_REST: Duration = Duration::from_millis(150);
 
 struct Opening {
     path: PathBuf,
@@ -698,6 +721,57 @@ impl App {
             }
         }
         self.external_selected = i;
+    }
+
+    /// Follows a drag of the seek bar, `fraction` along it (None once it ends): playback pauses,
+    /// and the video shows the keyframe under the pointer as it moves, then the exact frame
+    /// where it rests. The drop's own exact seek comes from the bar; playing resumes after it.
+    fn scrub(&mut self, fraction: Option<f64>) {
+        let shared = &self.shared;
+        let duration = self.session.as_ref().map_or(0.0, |s| s.duration);
+        let Some(fraction) = fraction.filter(|_| duration > 0.0) else {
+            if let Some(scrub) = self.scrub.take()
+                && scrub.resume
+                && shared.paused.load(Relaxed)
+            {
+                shared.toggle_pause();
+            }
+            return;
+        };
+        let target = fraction * duration;
+        let serial = shared.serial.load(Relaxed);
+        let scrub = self.scrub.get_or_insert_with(|| {
+            let resume = !shared.paused.load(Relaxed);
+            if resume {
+                shared.toggle_pause();
+            }
+            Scrub {
+                resume,
+                sent: f64::NAN,
+                at: Instant::now(),
+                serial,
+                exact: false,
+            }
+        });
+        // The last seek is done once the demuxer has made it and its first frame is up.
+        let shown =
+            serial != scrub.serial && self.current.as_ref().is_some_and(|c| c.serial == serial);
+        let ready = shown || scrub.at.elapsed() > SCRUB_WAIT;
+        if target != scrub.sent && ready {
+            shared.seek_quick(target);
+        } else if target == scrub.sent && !scrub.exact && ready && scrub.at.elapsed() > SCRUB_REST {
+            shared.seek_to(target);
+            scrub.exact = true;
+            scrub.at = Instant::now();
+            scrub.serial = serial;
+            return;
+        } else {
+            return;
+        }
+        scrub.sent = target;
+        scrub.exact = false;
+        scrub.at = Instant::now();
+        scrub.serial = serial;
     }
 
     /// The cues to show at media time `t`.
@@ -1500,6 +1574,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         next_playlist: None,
         stream_server: None,
         stream_control: None,
+        scrub: None,
     };
     refresh_devices(&app.capture_devices);
     app.queue.set_repeat(REPEAT[settings.repeat.min(2)]);
@@ -1556,6 +1631,10 @@ fn run() -> Result<(), Box<dyn Error>> {
     }
 
     let thumbnailer = thumbs::Thumbnailer::new(2, THUMB_SIZE.0, THUMB_SIZE.1);
+    // The seek bar's preview: the time last asked for, and the file the still on hand is from.
+    let previewer = thumbs::SeekPreviewer::new(SEEK_STILL_WIDTH);
+    let mut preview_asked: Option<(PathBuf, f64)> = None;
+    let mut still_for: Option<PathBuf> = None;
     // Tags for Songs, Albums, Artists and Genres come from probing every music file once; the
     // index on disk covers the files that haven't changed since.
     let prober = thumbs::Prober::new();
@@ -1725,6 +1804,38 @@ fn run() -> Result<(), Box<dyn Error>> {
             Relaxed,
         );
 
+        // A still for the seek bar's preview at the pointer, for a video file on disk. It moves
+        // in steps of a 400th of the file, at least half a second, so a sweep asks only so often.
+        let hover = UI.with_borrow(Ui::seek_hover);
+        if let (Some(fraction), Some(s)) = (hover, app.session.as_ref())
+            && s.video_size.is_some()
+            && s.duration > 0.0
+            && !net::is_address(&s.path)
+        {
+            let at = fraction * s.duration;
+            let step = (s.duration / 400.0).max(0.5);
+            let ask = preview_asked
+                .as_ref()
+                .is_none_or(|(path, asked)| *path != s.path || (asked - at).abs() >= step);
+            if ask {
+                previewer.request(&s.path, at);
+                preview_asked = Some((s.path.clone(), at));
+            }
+        }
+        if let Some((path, still)) = previewer.take_ready()
+            && app.session.as_ref().is_some_and(|s| s.path == path)
+        {
+            renderer.set_seek_still(still.as_ref().map(|t| (t.width, t.height, &t.bgra[..])));
+            still_for = Some(path);
+            UI.with_borrow_mut(|ui| ui.dirty = true);
+        }
+        // The next file starts without the last one's still.
+        if still_for.is_some()
+            && still_for.as_deref() != app.session.as_ref().map(|s| s.path.as_path())
+        {
+            renderer.set_seek_still(None);
+            still_for = None;
+        }
         for (path, thumb) in thumbnailer.take_ready() {
             renderer.add_thumbnail(
                 path,
@@ -1801,6 +1912,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         renderer.update_display(hwnd, hdr, DISPLAY_CHANGED.swap(false, Relaxed));
 
         app.step_reverse();
+        app.scrub(UI.with_borrow(Ui::scrubbing));
         let serial = shared.serial.load(Relaxed);
         let fresh = app.current.as_ref().is_none_or(|c| c.serial != serial);
         let paused = shared.paused.load(Relaxed);
@@ -2047,6 +2159,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                     caption_style: &app.caption,
                     stats: stats.as_deref(),
                     notice: app.notice.as_ref().map(|(text, _)| text.as_str()),
+                    seek_hover: ui.seek_hover().map(|f| f * duration),
                 };
                 renderer.present(
                     app.current.as_ref().map(|c| &c.frame),

@@ -645,6 +645,22 @@ impl Ui {
             || self.last_activity.elapsed() < self.hide_after
     }
 
+    /// Where along the seek bar (a fraction) the preview above it is for: the pointer over the
+    /// bar, or the drag.
+    pub fn seek_hover(&self) -> Option<f64> {
+        if let Some(fraction) = self.scrubbing() {
+            return Some(fraction);
+        }
+        (self.page == Page::Player && self.hover == Some(Hit::Seek))
+            .then(|| self.layout.seek_fraction(self.pointer.0))
+    }
+
+    /// Where the seek bar is being dragged to, as a fraction, while it is.
+    pub fn scrubbing(&self) -> Option<f64> {
+        let (fraction, _) = self.seek_preview?;
+        (self.drag == Some(Hit::Seek)).then_some(fraction)
+    }
+
     /// The seek position to draw instead of the clock while dragging or right after a drop.
     pub fn seek_preview(&self) -> Option<f64> {
         let (fraction, at) = self.seek_preview?;
@@ -669,7 +685,8 @@ impl Ui {
             self.hidden = false;
         }
         let hover = self.layout.hit(x, y);
-        if hover != self.hover {
+        // Over the seek bar the preview above it follows the pointer.
+        if hover != self.hover || hover == Some(Hit::Seek) {
             self.hover = hover;
             self.dirty = true;
         }
@@ -1001,6 +1018,8 @@ pub struct Scene<'a> {
     pub stats: Option<&'a str>,
     /// A line shown over the video for a moment, such as where a snapshot went.
     pub notice: Option<&'a str>,
+    /// Seconds into the file at the pointer over the seek bar (or its drag), for the preview.
+    pub seek_hover: Option<f64>,
 }
 
 fn fill_width(volume: f32) -> f32 {
@@ -1280,6 +1299,8 @@ pub struct Painter {
     skip_text: IDWriteTextFormat,
     /// Thumbnails by file; None means the file has no picture.
     thumbs: HashMap<PathBuf, Option<ID2D1Bitmap>>,
+    /// The still for the seek bar's preview, from the file playing.
+    seek_still: Option<ID2D1Bitmap>,
     /// Visible files without a thumbnail yet, collected while painting.
     wanted: Vec<PathBuf>,
     /// The bars' thumbnail, wanted while painting the bars, which only borrow the painter.
@@ -1355,6 +1376,7 @@ impl Painter {
             factory,
             dwrite,
             thumbs: HashMap::new(),
+            seek_still: None,
             wanted: Vec::new(),
             bar_wanted: Default::default(),
         })
@@ -1413,6 +1435,28 @@ impl Painter {
             .ok()
         });
         self.thumbs.insert(path, bitmap);
+    }
+
+    /// The still the seek bar's preview shows, or None for just the time.
+    pub fn set_seek_still(&mut self, ctx: &ID2D1DeviceContext5, still: Option<(u32, u32, &[u8])>) {
+        self.seek_still = still.and_then(|(width, height, bgra)| unsafe {
+            let props = D2D1_BITMAP_PROPERTIES {
+                pixelFormat: D2D1_PIXEL_FORMAT {
+                    format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                    alphaMode: D2D1_ALPHA_MODE_IGNORE,
+                },
+                dpiX: 96.0,
+                dpiY: 96.0,
+            };
+            let rt: &ID2D1RenderTarget = ctx;
+            rt.CreateBitmap(
+                D2D_SIZE_U { width, height },
+                Some(bgra.as_ptr().cast()),
+                width * 4,
+                &props,
+            )
+            .ok()
+        });
     }
 
     /// Files the last paint showed without a thumbnail.
@@ -1772,6 +1816,9 @@ impl Painter {
                 &rounded(Rect::new(fill.r - 8.0, fill.t, fill.r, fill.b), 4.0),
                 &self.accent,
             );
+            if let Some(at) = s.seek_hover.filter(|_| s.duration > 0.0) {
+                self.seek_tip(rt, ctx, s, at);
+            }
             for p in l
                 .tools
                 .placed
@@ -1780,6 +1827,45 @@ impl Painter {
             {
                 self.tool(rt, ctx, s, p);
             }
+        }
+    }
+
+    /// The preview over the seek bar at `at` seconds, as on YouTube: the frame there and its
+    /// time, or only the time when there is no frame (audio, streams, discs).
+    unsafe fn seek_tip(
+        &self,
+        rt: &ID2D1RenderTarget,
+        ctx: &ID2D1DeviceContext5,
+        s: &Scene,
+        at: f64,
+    ) {
+        const W: f32 = 200.0;
+        const LABEL: f32 = 26.0;
+        let (l, t) = (s.layout, s.layout.track);
+        let x = t.l + 2.0 + (at / s.duration).clamp(0.0, 1.0) as f32 * (t.w() - 4.0);
+        let image = self.seek_still.as_ref().map(|b| {
+            let size = unsafe { b.GetSize() };
+            let h = (W * size.height / size.width.max(1.0)).min(W);
+            (b, size, h)
+        });
+        let (w, h) = match &image {
+            Some((_, _, h)) => (W + 6.0, h + LABEL + 6.0),
+            None => (76.0, LABEL),
+        };
+        let left = (x - w / 2.0).clamp(l.video.l + 8.0, (l.video.r - 8.0 - w).max(l.video.l + 8.0));
+        let bottom = t.t - 10.0;
+        let tip = Rect::new(left, bottom - h, left + w, bottom);
+        unsafe {
+            rt.FillRoundedRectangle(&rounded(tip, 8.0), &self.bg);
+            if let Some((bitmap, size, ih)) = image {
+                let pic = Rect::new(tip.l + 3.0, tip.t + 3.0, tip.r - 3.0, tip.t + 3.0 + ih);
+                if let Ok(brush) = ctx.CreateBitmapBrush(bitmap, None, None) {
+                    brush.SetTransform(&browse::cover(pic, size.width, size.height));
+                    rt.FillRoundedRectangle(&rounded(pic, 6.0), &brush);
+                }
+            }
+            let label = Rect::new(tip.l, tip.b - LABEL, tip.r, tip.b);
+            self.text(rt, &clock_text(at), &self.times, label);
         }
     }
 

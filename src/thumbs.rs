@@ -105,17 +105,17 @@ pub fn render(path: &Path, width: u32, height: u32) -> Option<Thumbnail> {
 }
 
 /// `skim` trades quality nobody sees at thumbnail size for speed: no deblocking, and no decoding
-/// of frames nothing else refers to (B-frames, mostly). It cut render() by about a third.
-fn open_decoder(stream: &ff::Stream, skim: bool) -> Option<ff::decoder::Video> {
+/// of the frames it names (non-reference ones, B-frames mostly, cut render() by about a third).
+fn open_decoder(stream: &ff::Stream, skim: Option<ffi::AVDiscard>) -> Option<ff::decoder::Video> {
     let mut ctx = ff::codec::Context::from_parameters(stream.parameters()).ok()?;
     // No hw_device_ctx, so this is software. For AV1 libavcodec picks libdav1d, which needs no GPU.
     unsafe {
         let raw = ctx.as_mut_ptr();
         (*raw).pkt_timebase = stream.time_base().into();
         (*raw).thread_count = 2;
-        if skim {
+        if let Some(skip) = skim {
             (*raw).skip_loop_filter = ffi::AVDiscard::AVDISCARD_ALL;
-            (*raw).skip_frame = ffi::AVDiscard::AVDISCARD_NONREF;
+            (*raw).skip_frame = skip;
         }
     }
     ctx.decoder().video().ok()
@@ -150,7 +150,7 @@ fn decode_until(input: &mut ff::format::context::Input, target: f64) -> Option<f
     let stream = input.streams().find(is_video)?;
     let index = stream.index();
     let time_base = f64::from(stream.time_base());
-    let mut decoder = open_decoder(&stream, true)?;
+    let mut decoder = open_decoder(&stream, Some(ffi::AVDiscard::AVDISCARD_NONREF))?;
     let mut last = None;
     let (mut frames, mut packets) = (0, 0);
     let mut eof = false;
@@ -197,7 +197,7 @@ fn cover_frame(input: &ff::format::context::Input) -> Option<ff::frame::Video> {
         }
         std::slice::from_raw_parts(pic.data, pic.size as usize)
     };
-    let mut decoder = open_decoder(&stream, false)?;
+    let mut decoder = open_decoder(&stream, None)?;
     decoder.send_packet(&ff::Packet::copy(data)).ok()?;
     _ = decoder.send_eof();
     let mut frame = ff::frame::Video::empty();
@@ -366,6 +366,100 @@ impl<T> Drop for Workers<T> {
 }
 
 /// Background workers. Requests are served newest first (a stack), so what the user is looking at now wins over items scrolled past. Duplicate requests for a path already queued, running or done are ignored.
+/// A still from `secs` into a video, for the seek bar's preview: the keyframe at or before it,
+/// `width` pixels wide in the shape the video shows at. Only keyframes are decoded, in software,
+/// so it takes a fraction of a second even for 4K.
+pub fn still_at(path: &Path, secs: f64, width: u32) -> Option<Thumbnail> {
+    let mut input = open(path)?;
+    let stream = input.streams().find(is_video)?;
+    let index = stream.index();
+    let mut decoder = open_decoder(&stream, Some(ffi::AVDiscard::AVDISCARD_NONKEY))?;
+    let ts = (secs.max(0.0) * f64::from(ffi::AV_TIME_BASE)) as i64;
+    input.seek(ts, ..ts.saturating_add(1)).ok()?;
+    let mut frame = ff::frame::Video::empty();
+    let mut got = false;
+    for _ in 0..MAX_PACKETS {
+        let mut packet = ff::Packet::empty();
+        match packet.read(&mut input) {
+            Ok(()) if packet.stream() == index => _ = decoder.send_packet(&packet),
+            Ok(()) => continue,
+            Err(_) => _ = decoder.send_eof(),
+        }
+        if decoder.receive_frame(&mut frame).is_ok() {
+            got = true;
+            break;
+        }
+    }
+    if !got {
+        return None;
+    }
+    let (w, h) = (f64::from(frame.width()), f64::from(frame.height()));
+    // Anamorphic video shows wider than it is stored.
+    let aspect = frame.aspect_ratio();
+    let sar = if aspect.numerator() > 0 && aspect.denominator() > 0 {
+        f64::from(aspect)
+    } else {
+        1.0
+    };
+    let height = (f64::from(width) * h / (w * sar)).round().max(1.0) as u32;
+    scale_cover(frame, width, height)
+}
+
+/// Stills for the seek bar's preview, made on a thread of their own. Only the newest request
+/// counts: one that is overtaken before its turn is dropped.
+pub struct SeekPreviewer(Arc<(Mutex<PreviewState>, Condvar)>);
+
+#[derive(Default)]
+struct PreviewState {
+    want: Option<(PathBuf, f64)>,
+    ready: Option<(PathBuf, Option<Thumbnail>)>,
+    quit: bool,
+}
+
+impl SeekPreviewer {
+    /// Stills `width` pixels wide.
+    pub fn new(width: u32) -> Self {
+        let state = Arc::new((Mutex::new(PreviewState::default()), Condvar::new()));
+        let shared = state.clone();
+        thread::spawn(move || {
+            let (lock, wake) = &*shared;
+            loop {
+                let (path, secs) = {
+                    let s = lock.lock().unwrap();
+                    let mut s = wake.wait_while(s, |s| s.want.is_none() && !s.quit).unwrap();
+                    if s.quit {
+                        return;
+                    }
+                    s.want.take().unwrap()
+                };
+                let still = still_at(&path, secs, width);
+                lock.lock().unwrap().ready = Some((path, still));
+            }
+        });
+        SeekPreviewer(state)
+    }
+
+    /// Asks for the still at `secs` into `path`, in place of any not started yet.
+    pub fn request(&self, path: &Path, secs: f64) {
+        let (lock, wake) = &*self.0;
+        lock.lock().unwrap().want = Some((path.to_owned(), secs));
+        wake.notify_one();
+    }
+
+    /// The newest still made, with the file it is from.
+    pub fn take_ready(&self) -> Option<(PathBuf, Option<Thumbnail>)> {
+        self.0.0.lock().unwrap().ready.take()
+    }
+}
+
+impl Drop for SeekPreviewer {
+    fn drop(&mut self) {
+        let (lock, wake) = &*self.0;
+        lock.lock().unwrap().quit = true;
+        wake.notify_one();
+    }
+}
+
 pub struct Thumbnailer(Workers<Thumbnail>);
 
 impl Thumbnailer {
@@ -487,6 +581,18 @@ mod tests {
             200,
             200,
         );
+    }
+
+    #[test]
+    fn seek_bar_stills_keep_the_videos_shape() {
+        let started = Instant::now();
+        let still = still_at(&testdata("test_hevc.mkv"), 3.0, 320).unwrap();
+        println!("still_at(test_hevc.mkv) took {:?}", started.elapsed());
+        // 1920x1080 at 320 wide.
+        assert_picture(&still, 320, 180);
+        // Past the end it still finds the last keyframe; a file that isn't there gives none.
+        assert!(still_at(&testdata("test_h264.mp4"), 600.0, 160).is_some());
+        assert!(still_at(Path::new("C:/nonexistent/clip.mp4"), 1.0, 160).is_none());
     }
 
     #[test]
