@@ -7,7 +7,20 @@ FFmpeg demuxes and decodes, the GPU decodes and presents through Direct3D 11, an
 The interface follows Juxtopposed's VLC redesign (see Credits).
 [VLC_ANALYSIS.md](VLC_ANALYSIS.md) explains the VLC internals this design comes from.
 
-## Run
+## Download
+
+Get `wushang-<version>-windows-x64.zip` from the [latest release](https://github.com/ShreyanshVaibhaw/wushang/releases/latest), unzip it into a folder of your own, such as `%LOCALAPPDATA%\Programs\wushang`, and run `wushang.exe`.
+It needs Windows 10 or 11 on x64, and nothing else installed.
+
+### Updates
+
+When wushang starts, it asks GitHub for the latest release, and when that one is newer it offers it in a window once nothing is playing.
+Install downloads the release's zip, puts its files in place of the old ones, and restarts wushang; the library, settings and history stay as they were.
+Later closes the window, and wushang asks again next time it starts.
+Settings > General > "Check for updates when wushang starts" turns the check off.
+The update replaces files beside `wushang.exe`, so it needs a folder you can write to; a copy under `Program Files` can't update itself.
+
+## Run from source
 
 ```bash
 cargo run --release -- path\to\video.mp4
@@ -16,6 +29,9 @@ cargo run --release -- path\to\video.mp4
 To install it for your account (no admin rights), build it, then run [scripts/install.ps1](scripts/install.ps1).
 It copies `wushang.exe` and the DLLs it loads to `%LOCALAPPDATA%\Programs\wushang` and adds a Start menu shortcut.
 Run it again after a new build to update the installed copy.
+
+To make a release, raise `version` in [Cargo.toml](Cargo.toml), build, and run [scripts/package.ps1](scripts/package.ps1), which writes `wushang-<version>-windows-x64.zip` to the build folder.
+Attach that zip to a GitHub release tagged `v<version>`; the updater only installs a zip named that way.
 
 Without a file, wushang opens on the library.
 The first time it does (no `settings.txt` yet), the design's welcome shows over it in three steps.

@@ -129,6 +129,7 @@ pub enum PrefsAction {
 pub enum Ctl {
     Theme,
     Accent,
+    CheckUpdates,
     OnTop,
     RememberWindow,
     AutoHide,
@@ -223,6 +224,7 @@ impl Ctl {
     fn flag(self, p: &Prefs) -> Option<bool> {
         Some(match self {
             Ctl::OnTop => p.on_top,
+            Ctl::CheckUpdates => p.check_updates,
             Ctl::RememberWindow => p.remember_window,
             Ctl::SaveRecent => p.save_recent,
             Ctl::ReverseWheel => p.reverse_wheel,
@@ -246,6 +248,7 @@ impl Ctl {
     fn set_flag(self, p: &mut Prefs, on: bool) {
         let f = match self {
             Ctl::OnTop => &mut p.on_top,
+            Ctl::CheckUpdates => &mut p.check_updates,
             Ctl::RememberWindow => &mut p.remember_window,
             Ctl::SaveRecent => &mut p.save_recent,
             Ctl::ReverseWheel => &mut p.reverse_wheel,
@@ -926,6 +929,8 @@ impl Builder<'_> {
                 self.section("Appearance");
                 self.segments("Theme", Ctl::Theme, prefs::THEME);
                 self.swatches("Accent color", Ctl::Accent);
+                self.section("Updates");
+                self.toggle("Check for updates when wushang starts", Ctl::CheckUpdates);
             }
             Category::Interface => {
                 self.section("Window");

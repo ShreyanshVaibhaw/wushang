@@ -117,6 +117,8 @@ pub struct Prefs {
     pub theme: usize,
     /// One of `ui::theme::ACCENTS`, or any colour a hand edit put there.
     pub accent: u32,
+    /// Ask GitHub for a newer release at start, and offer it.
+    pub check_updates: bool,
     // Interface.
     pub on_top: bool,
     pub remember_window: bool,
@@ -216,6 +218,7 @@ impl Default for Prefs {
         Prefs {
             theme: 0,
             accent: crate::ui::theme::DEFAULT_ACCENT,
+            check_updates: true,
             on_top: false,
             remember_window: true,
             window: None,
@@ -294,6 +297,7 @@ impl Prefs {
         let mut line = |k: &str, v: String| _ = writeln!(out, "{k} = {v}");
         line("theme", key(THEME, self.theme).into());
         line("accent", format!("#{:06X}", self.accent));
+        line("check_updates", self.check_updates.to_string());
         line("on_top", self.on_top.to_string());
         line("remember_window", self.remember_window.to_string());
         if let Some(([x, y, w, h], max)) = self.window {
@@ -423,6 +427,7 @@ fn parse(text: &str) -> Prefs {
         match k {
             "theme" => choice(&mut p.theme, THEME),
             "accent" => colour(&mut p.accent),
+            "check_updates" => flag(&mut p.check_updates),
             "on_top" => flag(&mut p.on_top),
             "remember_window" => flag(&mut p.remember_window),
             "window" => {

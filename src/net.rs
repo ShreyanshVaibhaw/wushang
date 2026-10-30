@@ -437,13 +437,18 @@ fn resolve(base: &str, href: &str) -> String {
 /// Fetches `url` (http or https) and returns the body as text. Follows redirects,
 /// honours the system proxy, and gives up after `timeout` per stage.
 pub fn fetch_text(url: &str, timeout: Duration) -> Result<String, String> {
+    fetch(url, timeout, MAX_FETCH).map(|body| String::from_utf8_lossy(&body).into_owned())
+}
+
+/// Fetches `url` (http or https) as bytes, up to `max` of them, like [`fetch_text`].
+pub fn fetch(url: &str, timeout: Duration, max: usize) -> Result<Vec<u8>, String> {
     let (scheme, rest) = url
         .split_once("://")
         .ok_or_else(|| format!("{} is not a web address", redact(url)))?;
     let secure = match scheme.to_ascii_lowercase().as_str() {
         "http" => false,
         "https" => true,
-        _ => return Err(format!("feeds load over http or https, not {scheme}")),
+        _ => return Err(format!("only http and https load, not {scheme}")),
     };
     let (authority, path) = match rest.find('/') {
         Some(i) => (&rest[..i], &rest[i..]),
@@ -540,11 +545,11 @@ pub fn fetch_text(url: &str, timeout: Duration) -> Result<String, String> {
                 break;
             }
             body.extend_from_slice(&buf[..read as usize]);
-            if body.len() > MAX_FETCH {
-                return Err("that feed is too large to read".into());
+            if body.len() > max {
+                return Err("that download is too large".into());
             }
         }
-        Ok(String::from_utf8_lossy(&body).into_owned())
+        Ok(body)
     }
 }
 

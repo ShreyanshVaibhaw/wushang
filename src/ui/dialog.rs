@@ -37,6 +37,8 @@ pub enum Dialog {
     Properties(PathBuf),
     /// Asks before deleting the named playlist.
     DeletePlaylist(String),
+    /// Offers a newer release from GitHub.
+    Update(crate::update::Release),
     /// Names a new settings profile.
     NewProfile,
     /// Asks for a stream to play, or a podcast feed to add.
@@ -70,6 +72,9 @@ pub enum DialogAction {
     /// Play the stream or add the feed at the typed address; on success close the dialog, else
     /// report with [`Ui::dialog_error`].
     OpenAddress(NetKind, String),
+    /// Download and install the release; on success wushang restarts, else report with
+    /// [`Ui::dialog_error`].
+    InstallUpdate(crate::update::Release),
 }
 
 /// What a click lands on.
@@ -351,6 +356,8 @@ pub struct State {
     thumbnail_picked: bool,
     /// The last press in the field, to spot a double-click.
     last_press: Option<Instant>,
+    /// Update: downloading and installing, so Install is off.
+    busy: bool,
 }
 
 impl State {
@@ -368,6 +375,7 @@ impl State {
             typing: false,
             thumbnail_picked: false,
             last_press: None,
+            busy: false,
             dialog: dialog.clone(),
         };
         match dialog {
@@ -377,6 +385,7 @@ impl State {
             Dialog::About
             | Dialog::Shortcuts
             | Dialog::DeletePlaylist(_)
+            | Dialog::Update(_)
             | Dialog::NewProfile
             | Dialog::Address(_) => {}
         }
@@ -391,6 +400,7 @@ impl State {
             Dialog::Shortcuts => "Keyboard Shortcuts",
             Dialog::Properties(_) => "Properties",
             Dialog::DeletePlaylist(_) => "Delete Playlist",
+            Dialog::Update(_) => "Update Available",
             Dialog::NewProfile => "New Profile",
             Dialog::Address(NetKind::Podcast) => "Add Podcast",
             Dialog::Address(_) => "Open Network Stream",
@@ -834,7 +844,7 @@ impl Painter {
             Dialog::Properties(_) => 640.0,
             Dialog::About | Dialog::Shortcuts => 600.0,
             Dialog::DeletePlaylist(_) | Dialog::NewProfile => 520.0,
-            Dialog::Address(_) => 600.0,
+            Dialog::Address(_) | Dialog::Update(_) => 600.0,
         };
         let mut b = Builder {
             w,
@@ -891,6 +901,29 @@ impl Painter {
                     w - PAD,
                 );
                 b.footer(157.0, Some((Target::Cancel, "Cancel")), "Delete", true)
+            }
+            Dialog::Update(release) => {
+                b.text(
+                    format!("wushang {} is available", release.version),
+                    Style::Heading,
+                    PAD,
+                    87.0,
+                    w - PAD,
+                );
+                let help = if d.busy {
+                    "Downloading and installing. wushang restarts when it's done.".to_owned()
+                } else {
+                    format!(
+                        "You have {}. Your library and settings stay as they are.",
+                        env!("CARGO_PKG_VERSION")
+                    )
+                };
+                b.text(help, Style::Help, PAD, 117.0, w - PAD);
+                if let Some(e) = &d.error {
+                    b.text(e.as_str(), Style::Error, PAD, 143.0, w - PAD);
+                }
+                let label = if d.busy { "Installing..." } else { "Install" };
+                b.footer(177.0, Some((Target::Cancel, "Later")), label, !d.busy)
             }
         };
         // Clicks anywhere on the dialog stop at it; the dimmed window around it is Body too.
@@ -1186,6 +1219,7 @@ impl Ui {
     pub fn dialog_error(&mut self, message: String) {
         if let Some(d) = self.dialog.as_mut() {
             d.error = Some(message);
+            d.busy = false;
             self.relayout = true;
         }
     }
@@ -1314,6 +1348,16 @@ impl Ui {
                 };
                 self.close_dialog();
                 DialogAction::DeletePlaylist(name)
+            }
+            // Enter reaches here even while Install is off.
+            Target::Primary if matches!(d.dialog, Dialog::Update(_)) && d.busy => return None,
+            Target::Primary if matches!(d.dialog, Dialog::Update(_)) => {
+                let Dialog::Update(release) = d.dialog.clone() else {
+                    unreachable!()
+                };
+                d.busy = true;
+                d.error = None;
+                DialogAction::InstallUpdate(release)
             }
             Target::Primary => {
                 self.close_dialog();

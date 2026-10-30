@@ -34,6 +34,7 @@ mod tags;
 mod thumbs;
 mod tonemap;
 mod ui;
+mod update;
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
@@ -165,7 +166,9 @@ const SLEEP_END_OF_FILE: usize = 5;
 
 fn main() {
     use_parent_console();
-    if let Err(e) = run() {
+    let result = run();
+    update::finish();
+    if let Err(e) = result {
         eprintln!("wushang: {e}");
         std::process::exit(1);
     }
@@ -213,6 +216,8 @@ struct App {
     audio: Arc<audio::Device>,
     library: Library,
     library_changed: bool,
+    /// An update downloading and installing: the exe to restart into, or why it failed.
+    installing: Option<mpsc::Receiver<Result<PathBuf, String>>>,
     session: Option<Session>,
     /// The frame on screen. It holds a decoder surface, so it goes before its session.
     current: Option<VideoFrame>,
@@ -1533,6 +1538,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         audio,
         library: Library::load(&Library::default_dir()),
         library_changed: false,
+        installing: None,
         session: None,
         current: None,
         queue: Queue::default(),
@@ -1640,6 +1646,9 @@ fn run() -> Result<(), Box<dyn Error>> {
     let prober = thumbs::Prober::new();
     let mut tracks: HashMap<PathBuf, (tags::Stamp, Track)> = HashMap::new();
     let mut music_scan = (!play_and_exit).then(|| scan_music(app.library.roots(Section::Music)));
+    update::clean_up();
+    let mut update_check = (!play_and_exit && prefs().check_updates).then(update::check);
+    let mut update_offer: Option<update::Release> = None;
     let mut tracks_changed = false;
     let mut tags_unsaved = false;
     let mut tracks_set = Instant::now();
@@ -1866,6 +1875,33 @@ fn run() -> Result<(), Box<dyn Error>> {
                     ui.browse.stale = true;
                 }
             });
+        }
+        // A newer release waits for a quiet moment: no dialog, no welcome, nothing playing.
+        if let Some(check) = &update_check
+            && let Ok(release) = check.try_recv()
+        {
+            update_check = None;
+            update_offer = Some(release);
+        }
+        let playing = app.session.is_some() && !app.shared.paused.load(Relaxed);
+        if !playing
+            && UI.with_borrow(|ui| ui.dialog.is_none() && ui.onboarding.is_none())
+            && let Some(release) = update_offer.take()
+        {
+            open_dialog(&app, Dialog::Update(release));
+        }
+        if let Some(installing) = &app.installing
+            && let Ok(result) = installing.try_recv()
+        {
+            app.installing = None;
+            match result {
+                // Quit as usual, saving everything, and start the new version after.
+                Ok(exe) => {
+                    update::restart_with(exe);
+                    unsafe { _ = DestroyWindow(hwnd) };
+                }
+                Err(e) => UI.with_borrow_mut(|ui| ui.dialog_error(e)),
+            }
         }
         for (path, info) in prober.take_ready() {
             let info = info.unwrap_or_default();
@@ -2937,6 +2973,7 @@ fn apply_dialog(app: &mut App, hwnd: HWND, action: DialogAction) {
                 }
             }
         },
+        DialogAction::InstallUpdate(release) => app.installing = Some(update::install(&release)),
         DialogAction::DeletePlaylist(name) => {
             if let Err(e) = app.library.delete_playlist(&name) {
                 eprintln!("library: cannot delete {name}: {e}");
