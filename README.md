@@ -5,7 +5,6 @@
 A small Windows video player in Rust, built with the same pipeline as VLC but without its plugin system.
 FFmpeg demuxes and decodes, the GPU decodes and presents through Direct3D 11, and WASAPI plays the audio.
 The interface follows Juxtopposed's VLC redesign (see Credits).
-[VLC_ANALYSIS.md](VLC_ANALYSIS.md) explains the VLC internals this design comes from.
 
 ## Download
 
