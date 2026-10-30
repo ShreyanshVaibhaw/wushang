@@ -11,6 +11,10 @@ The interface follows Juxtopposed's VLC redesign (see Credits).
 cargo run --release -- path\to\video.mp4
 ```
 
+To install it for your account (no admin rights), build it, then run [scripts/install.ps1](scripts/install.ps1).
+It copies `myvlc.exe` and the DLLs it loads to `%LOCALAPPDATA%\Programs\myvlc` and adds a Start menu shortcut.
+Run it again after a new build to update the installed copy.
+
 Without a file, myvlc opens on the library.
 The first time it does (no `settings.txt` yet), the design's welcome shows over it in three steps.
 The first shows the media folder the library starts from, and Browse adds another to Videos.
