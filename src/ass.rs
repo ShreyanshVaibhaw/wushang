@@ -34,6 +34,7 @@ type MessageCb = unsafe extern "C" fn(c_int, *const c_char, *mut c_void, *mut c_
 /// The libass functions myvlc calls, from the DLL.
 struct Api {
     library_init: unsafe extern "C" fn() -> *mut c_void,
+    library_done: unsafe extern "C" fn(*mut c_void),
     set_message_cb: unsafe extern "C" fn(*mut c_void, Option<MessageCb>, *mut c_void),
     add_font: unsafe extern "C" fn(*mut c_void, *const c_char, *const c_char, c_int),
     renderer_init: unsafe extern "C" fn(*mut c_void) -> *mut c_void,
@@ -58,15 +59,41 @@ struct Api {
         unsafe extern "C" fn(*mut c_void, *mut c_char, usize, *const c_char) -> *mut c_void,
 }
 
-/// The loaded DLL and its one ASS_Library, which holds the fonts files bring along.
+/// The loaded DLL, and the ASS_Library new tracks are made from, which holds the fonts the
+/// playing file brings along.
 struct Lib {
     api: Api,
-    library: Mutex<*mut c_void>,
+    library: Mutex<Arc<Library>>,
+}
+
+/// An ASS_Library. Each file gets its own, as libass reads added fonts in place: a renderer keeps
+/// pointing into the library's copy, so the fonts can only go with the last track made from it.
+struct Library(*mut c_void);
+
+impl Library {
+    fn new(api: &Api) -> Option<Arc<Library>> {
+        let library = unsafe { (api.library_init)() };
+        if library.is_null() {
+            return None;
+        }
+        // libass narrates font matching and every odd tag; myvlc's log has no use for it.
+        unsafe extern "C" fn quiet(_: c_int, _: *const c_char, _: *mut c_void, _: *mut c_void) {}
+        unsafe { (api.set_message_cb)(library, Some(quiet), std::ptr::null_mut()) };
+        Some(Arc::new(Library(library)))
+    }
+}
+
+impl Drop for Library {
+    fn drop(&mut self) {
+        if let Some(lib) = lib() {
+            unsafe { (lib.api.library_done)(self.0) };
+        }
+    }
 }
 
 // libass objects are only touched under the mutexes here and in `Track`.
-unsafe impl Send for Lib {}
-unsafe impl Sync for Lib {}
+unsafe impl Send for Library {}
+unsafe impl Sync for Library {}
 
 /// FontProvider ASS_FONTPROVIDER_AUTODETECT: DirectWrite on Windows.
 const AUTODETECT: c_int = 1;
@@ -83,6 +110,7 @@ fn lib() -> Option<&'static Lib> {
         }
         let api = Api {
             library_init: load!("ass_library_init"),
+            library_done: load!("ass_library_done"),
             set_message_cb: load!("ass_set_message_cb"),
             add_font: load!("ass_add_font"),
             renderer_init: load!("ass_renderer_init"),
@@ -97,13 +125,7 @@ fn lib() -> Option<&'static Lib> {
             process_chunk: load!("ass_process_chunk"),
             read_memory: load!("ass_read_memory"),
         };
-        let library = (api.library_init)();
-        if library.is_null() {
-            return None;
-        }
-        // libass narrates font matching and every odd tag; myvlc's log has no use for it.
-        unsafe extern "C" fn quiet(_: c_int, _: *const c_char, _: *mut c_void, _: *mut c_void) {}
-        (api.set_message_cb)(library, Some(quiet), std::ptr::null_mut());
+        let library = Library::new(&api)?;
         Some(Lib {
             api,
             library: Mutex::new(library),
@@ -131,6 +153,16 @@ pub fn styling() -> bool {
     STYLES.load(std::sync::atomic::Ordering::Relaxed) && available()
 }
 
+/// Starts the fonts over for a new file, so it doesn't get the fonts of the one played before it.
+/// Tracks made earlier keep the fonts they have.
+pub fn clear_fonts() {
+    if let Some(lib) = lib()
+        && let Some(fresh) = Library::new(&lib.api)
+    {
+        *lib.library.lock().unwrap() = fresh;
+    }
+}
+
 /// Makes a font a file carries (a Matroska attachment) available to the tracks made after.
 pub fn add_font(name: &str, data: &[u8]) {
     let (Some(lib), Ok(name)) = (lib(), CString::new(name)) else {
@@ -140,7 +172,7 @@ pub fn add_font(name: &str, data: &[u8]) {
         return;
     };
     let library = lib.library.lock().unwrap();
-    unsafe { (lib.api.add_font)(*library, name.as_ptr(), data.as_ptr().cast(), size) };
+    unsafe { (lib.api.add_font)(library.0, name.as_ptr(), data.as_ptr().cast(), size) };
 }
 
 /// The picture styled subtitles are drawn for: the video's stored size, and the size it shows
@@ -170,6 +202,8 @@ struct Inner {
     size: (u32, u32),
     /// The last picture and the time it was rendered for: a frame with nothing new reuses it.
     last: Option<(f64, Option<BitmapRect>)>,
+    /// The library the track and renderer were made from, kept until they are freed.
+    _library: Arc<Library>,
 }
 
 unsafe impl Send for Inner {}
@@ -179,24 +213,25 @@ impl Track {
     /// styles) up front.
     pub fn new(header: &[u8], canvas: Canvas) -> Option<Track> {
         let lib = lib()?;
-        let track = unsafe { (lib.api.new_track)(*lib.library.lock().unwrap()) };
+        let library = lib.library.lock().unwrap().clone();
+        let track = unsafe { (lib.api.new_track)(library.0) };
         if track.is_null() {
             return None;
         }
         unsafe {
             (lib.api.process_codec_private)(track, header.as_ptr().cast(), header.len() as c_int)
         };
-        Track::with(track, canvas)
+        Track::with(track, library, canvas)
     }
 
     /// A whole .ass or .ssa file.
     pub fn from_file(text: &[u8], canvas: Canvas) -> Option<Track> {
         let lib = lib()?;
         let mut copy = text.to_vec();
+        let library = lib.library.lock().unwrap().clone();
         let track = unsafe {
-            let library = *lib.library.lock().unwrap();
             (lib.api.read_memory)(
-                library,
+                library.0,
                 copy.as_mut_ptr().cast(),
                 copy.len(),
                 std::ptr::null(),
@@ -205,13 +240,13 @@ impl Track {
         if track.is_null() {
             return None;
         }
-        Track::with(track, canvas)
+        Track::with(track, library, canvas)
     }
 
-    fn with(track: *mut c_void, canvas: Canvas) -> Option<Track> {
+    fn with(track: *mut c_void, library: Arc<Library>, canvas: Canvas) -> Option<Track> {
         let lib = lib()?;
         unsafe {
-            let renderer = (lib.api.renderer_init)(*lib.library.lock().unwrap());
+            let renderer = (lib.api.renderer_init)(library.0);
             if renderer.is_null() {
                 (lib.api.free_track)(track);
                 return None;
@@ -236,6 +271,7 @@ impl Track {
                 renderer,
                 size: canvas.shown,
                 last: None,
+                _library: library,
             })))
         }
     }
@@ -426,6 +462,38 @@ mod tests {
         let (_, p) = track.render(1.5).unwrap();
         assert!(p.y > 500, "the line sits at the bottom, at {}", p.y);
         assert!(track.render(3.5).is_none());
+    }
+
+    /// A file's fonts serve its tracks, and are gone for the tracks of the file after it. Inter,
+    /// which myvlc bundles and Windows doesn't have, stands in for an attached font.
+    #[test]
+    fn a_files_fonts_go_with_it() {
+        let header = b"[Script Info]\nPlayResX: 640\nPlayResY: 360\n\n[V4+ Styles]\n\
+            Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, \
+            BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, \
+            BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\n\
+            Style: Default,Inter,40,&H00FFFFFF,&H00FFFFFF,&H00000000,&H00000000,0,0,0,0,100,100,\
+            0,0,1,0,0,2,10,10,10,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, \
+            MarginR, MarginV, Effect, Text\n";
+        let width = || {
+            let track = Track::new(header, (1280, 720).into()).unwrap();
+            track.add_event(
+                b"0,0,Default,,0,0,0,,Wide wavy windows 0123456789",
+                1.0,
+                2.0,
+            );
+            track.render(1.5).unwrap().1.w
+        };
+        let inter = include_bytes!("../assets/fonts/Inter-Regular.ttf");
+        add_font("Inter-Regular.ttf", inter);
+        let with = width();
+        clear_fonts();
+        let without = width();
+        let ratio = with as f32 / without as f32;
+        assert!(
+            !(0.98..=1.02).contains(&ratio),
+            "{with} and {without} px wide"
+        );
     }
 
     #[test]

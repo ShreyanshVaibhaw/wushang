@@ -637,8 +637,9 @@ impl App {
             return;
         };
         // Fonts the file carries, which its styled subtitles ask for by name, unless Settings'
-        // Extensions turned them off.
+        // Extensions turned them off. The last file's go first.
         let fonts = session.take_fonts();
+        ass::clear_fonts();
         if p.embedded_fonts {
             for (name, data) in fonts {
                 ass::add_font(&name, &data);

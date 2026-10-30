@@ -1199,10 +1199,10 @@ impl Library {
         self.tracks = tracks;
     }
 
-    /// Whether the background search found a listed folder empty since the last call, so the
-    /// listing on screen should be redone without it.
+    /// Whether the background search changed its answer for a listed folder since the last call,
+    /// so the listing on screen should be redone.
     pub fn media_folders_changed(&self) -> bool {
-        self.media_dirs.take_hid()
+        self.media_dirs.take_changed()
     }
 
     /// Searches every folder for media again on its next listing (Resync).
@@ -1418,35 +1418,41 @@ fn list_dir(dir: &Path) -> (Named, Named) {
 
 /// Which folders hold media, searched for by one background thread so a listing never waits on
 /// it: a drive root can hold thousands of folders, and the window froze for minutes walking them.
-/// A subfolder lists until the search finds no media in it. Answers last the run; `forget`
-/// (Resync) drops them.
+/// A subfolder lists until the search finds no media in it. A listing shows the answers it has
+/// at once and checks those older than `MEDIA_RECHECK` again, so a folder that gains or loses its
+/// media shows or goes the next time its parent is opened. `forget` (Resync) drops them all.
 #[derive(Default)]
 struct MediaDirs(Arc<Mutex<DirSearch>>);
 
+/// How old a folder's answer gets before a listing has it searched again. Long enough that the
+/// listings the search's own answers redo don't start it over.
+const MEDIA_RECHECK: std::time::Duration = std::time::Duration::from_secs(10);
+
 #[derive(Default)]
 struct DirSearch {
-    known: HashMap<PathBuf, bool>,
+    /// Whether each folder holds media, and when that was found.
+    known: HashMap<PathBuf, (bool, std::time::Instant)>,
     /// The folders the latest listing asked about and the search hasn't reached.
     queue: VecDeque<PathBuf>,
     running: bool,
-    /// Set when the search found a listed folder empty, so the listing should be redone.
-    hid: bool,
+    /// Set when the search's answer for a listed folder changed, so the listing should be redone.
+    changed: bool,
 }
 
 impl MediaDirs {
-    /// The subfolders of `dirs` to list. Those not searched yet are kept and queued, in place of
-    /// what an earlier listing queued.
+    /// The subfolders of `dirs` to list. Those not searched yet are kept; they and those with an
+    /// old answer are queued, in place of what an earlier listing queued.
     fn keep(&self, dirs: Named) -> Named {
         let mut s = self.0.lock().unwrap();
         s.queue.clear();
         let kept: Named = dirs
             .into_iter()
-            .filter(|(_, d)| match s.known.get(d) {
-                Some(&has) => has,
-                None => {
+            .filter(|(_, d)| {
+                let known = s.known.get(d).copied();
+                if known.is_none_or(|(_, at)| at.elapsed() > MEDIA_RECHECK) {
                     s.queue.push_back(d.clone());
-                    true
                 }
+                known.is_none_or(|(has, _)| has)
             })
             .collect();
         if !s.queue.is_empty() && !s.running {
@@ -1457,13 +1463,22 @@ impl MediaDirs {
         kept
     }
 
-    /// Whether a search hid a listed folder since the last call.
-    fn take_hid(&self) -> bool {
-        std::mem::take(&mut self.0.lock().unwrap().hid)
+    /// Whether a search changed its answer for a listed folder since the last call.
+    fn take_changed(&self) -> bool {
+        std::mem::take(&mut self.0.lock().unwrap().changed)
     }
 
     fn forget(&self) {
         self.0.lock().unwrap().known.clear();
+    }
+
+    /// Makes every answer old enough to be searched again.
+    #[cfg(test)]
+    fn age(&self) {
+        let then = std::time::Instant::now() - 2 * MEDIA_RECHECK;
+        for (_, at) in self.0.lock().unwrap().known.values_mut() {
+            *at = then;
+        }
     }
 
     /// Waits for the queued searches.
@@ -1487,8 +1502,10 @@ fn search_dirs(state: &Mutex<DirSearch>) {
         };
         let has = has_media(&dir, MEDIA_SEARCH_DEPTH);
         let mut s = state.lock().unwrap();
-        s.known.insert(dir, has);
-        s.hid |= !has;
+        // A folder listed before its first answer only changes the listing if it goes.
+        let was = s.known.get(&dir).is_none_or(|&(had, _)| had);
+        s.known.insert(dir, (has, std::time::Instant::now()));
+        s.changed |= has != was;
     }
 }
 
@@ -1657,6 +1674,17 @@ mod tests {
             labels(&entries),
             "Deep|season 1|Season 2|Season 10|e1.mkv|E2.mp4|E10.mp4"
         );
+        // A video added to an empty folder shows once its answer is old and the folder is
+        // listed again.
+        tmp.touch("Shows/Empty/new.mp4");
+        assert!(!labels(&lib.entries(&place)).contains("Empty"));
+        lib.media_dirs.settle();
+        assert!(!lib.media_folders_changed());
+        lib.media_dirs.age();
+        assert!(!labels(&lib.entries(&place)).contains("Empty"));
+        lib.media_dirs.settle();
+        assert!(lib.media_folders_changed());
+        assert!(labels(&lib.entries(&place)).starts_with("Deep|Empty|season 1"));
         assert_eq!(
             entries[1],
             folder(
