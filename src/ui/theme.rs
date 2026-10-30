@@ -12,12 +12,15 @@
 
 use std::cell::Cell;
 
-/// The design's orange.
-pub const DEFAULT_ACCENT: u32 = 0xD37918;
-/// The accent colours, in the design's order. Each is sampled where it's picked and so drawn
-/// bright (the "Onboarding" frames); the design dims the ones not picked.
+/// The design's orange: the interface's coloured constants are all shades of it.
+const DESIGN_ORANGE: u32 = 0xD37918;
+/// The logo's red-orange.
+pub const DEFAULT_ACCENT: u32 = 0xFC4511;
+/// The accent colours, in the design's order, except that the logo's red-orange comes first and
+/// takes the place of the design's red (0xEA4C31), which was too close to it. Each is sampled
+/// where it's picked and so drawn bright (the "Onboarding" frames); the design dims the others.
 pub const ACCENTS: [u32; 9] = [
-    0xD37918, 0xEA4C31, 0xC4A317, 0x1BA035, 0x17ACCD, 0x175FCD, 0x8E43F8, 0xEA55B3, 0xAFAFAF,
+    0xFC4511, 0xD37918, 0xC4A317, 0x1BA035, 0x17ACCD, 0x175FCD, 0x8E43F8, 0xEA55B3, 0xAFAFAF,
 ];
 
 const FIXED: u32 = 1 << 24;
@@ -96,7 +99,7 @@ fn map_in(t: Theme, c: u32) -> u32 {
     // A shade of the design's orange: k = 1 is the accent itself.
     let k = f32::from(r.max(g).max(b)) / f32::from(0xD3u8);
     if !t.light {
-        return if t.accent == DEFAULT_ACCENT {
+        return if t.accent == DESIGN_ORANGE {
             rgb
         } else {
             scale(t.accent, k)
@@ -173,17 +176,27 @@ pub fn svg(text: &str) -> String {
 mod tests {
     use super::*;
 
+    // The design's frames are drawn with its own orange, so the tests against them use it.
     const LIGHT: Theme = Theme {
         light: true,
-        accent: DEFAULT_ACCENT,
+        accent: DESIGN_ORANGE,
     };
 
     #[test]
-    fn dark_with_the_default_accent_changes_nothing() {
-        let t = Theme::default();
+    fn dark_with_the_designs_orange_changes_nothing() {
+        let t = Theme {
+            light: false,
+            accent: DESIGN_ORANGE,
+        };
         for c in [0x090909, 0x8F8F8F, 0xD37918, 0x371F06] {
             assert_eq!(map_in(t, c), c & 0xFF_FFFF);
         }
+    }
+
+    #[test]
+    fn the_default_accent_is_the_logos() {
+        assert_eq!(map_in(Theme::default(), DESIGN_ORANGE), 0xFC4511);
+        assert_eq!(ACCENTS[0], DEFAULT_ACCENT);
     }
 
     #[test]

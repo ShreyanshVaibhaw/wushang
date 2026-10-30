@@ -219,6 +219,7 @@ Changes apply at once and are kept in `settings.txt` next to the library state.
   The design has one light frame, and wushang turns every screen light from it, so menus, panels and dialogs follow the same greys.
   System follows the Windows "app mode" setting and switches when it changes.
   The accent replaces the design's orange everywhere except the logo and the volume meter.
+  It starts as the logo's red-orange; the design's amber is the next choice along.
   Its nine colours are the onboarding frames' bright ones; Settings dims all but the one picked, as the design does.
 - Interface: keep the window above others, remember its size and position, and when and how fast the controls hide.
 - Privacy: whether recently played files are saved, and a button that clears the history.
