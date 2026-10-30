@@ -78,7 +78,7 @@ use windows::Win32::UI::Shell::{
     SIGDN_FILESYSPATH,
 };
 use windows::Win32::UI::WindowsAndMessaging::*;
-use windows::core::{HSTRING, w};
+use windows::core::{HSTRING, PCWSTR, w};
 
 use bookmarks::Bookmarks;
 use captions::CaptionStyle;
@@ -3242,6 +3242,8 @@ fn create_window(title: &str, (video_w, video_h): (u32, u32)) -> windows::core::
             lpfnWndProc: Some(wndproc),
             hInstance: instance.into(),
             hCursor: LoadCursorW(None, IDC_ARROW)?,
+            // The taskbar and Alt+Tab icon: group 1 from build.rs, at the screen's size.
+            hIcon: LoadIconW(Some(instance.into()), PCWSTR(1 as _)).unwrap_or_default(),
             hbrBackground: HBRUSH(GetStockObject(BLACK_BRUSH).0),
             lpszClassName: w!("wushang"),
             ..Default::default()

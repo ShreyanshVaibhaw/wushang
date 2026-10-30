@@ -1,3 +1,5 @@
+<p align="center"><img src="assets/wushang.svg" width="128" alt="wushang logo"></p>
+
 # wushang
 
 A small Windows video player in Rust, built with the same pipeline as VLC but without its plugin system.
@@ -216,7 +218,7 @@ Changes apply at once and are kept in `settings.txt` next to the library state.
 - General: dark, light or system theme, and the accent colour.
   The design has one light frame, and wushang turns every screen light from it, so menus, panels and dialogs follow the same greys.
   System follows the Windows "app mode" setting and switches when it changes.
-  The accent replaces the design's orange everywhere except the VLC cone and the volume meter.
+  The accent replaces the design's orange everywhere except the logo and the volume meter.
   Its nine colours are the onboarding frames' bright ones; Settings dims all but the one picked, as the design does.
 - Interface: keep the window above others, remember its size and position, and when and how fast the controls hide.
 - Privacy: whether recently played files are saved, and a button that clears the history.
@@ -452,16 +454,25 @@ Each of these is marked with a `ponytail:` comment in the code, along with the u
 - Thumbnails stay in memory for the whole run, about 350 KB each.
 - The folder picker is modal, so the video pauses on screen while it is open (audio keeps playing).
 
-## Licence of the build
+## Licence
 
-Both FFmpeg builds are LGPL, so this player can use any licence as long as FFmpeg stays dynamically linked.
+wushang is under the MIT licence ([LICENSE](LICENSE)).
+The libraries, crates, design and font it uses keep their own licences, listed in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) with full texts in [licenses](licenses).
+The install script copies all three next to the exe, so a copy of that folder can be passed on as it is.
+
+Both FFmpeg builds are LGPL, which allows a MIT player as long as FFmpeg stays dynamically linked.
 A GPL FFmpeg build would make the player GPL.
 
 ## Credits
 
 The interface is based on [VLC Redesign](https://www.figma.com/community/file/1691465999134370980/vlc-redesign) by Juxtopposed, shared on the Figma Community under [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/).
-The icons in [assets/icons](assets/icons) are exported from that file; `volume_fill.svg` and `sidebar.svg` were rewritten into equivalent shapes that Direct2D's SVG renderer supports.
+The icons in [assets/icons](assets/icons) are exported from that file, except the logo; `volume_fill.svg` and `sidebar.svg` were rewritten into equivalent shapes that Direct2D's SVG renderer supports.
 The designer's video about it: https://youtu.be/ERFeOgqk324.
 This project is not affiliated with Juxtopposed or with VideoLAN.
+VLC is a trademark of VideoLAN.
+
+The wushang logo is [assets/wushang.svg](assets/wushang.svg); [assets/icons/logo.svg](assets/icons/logo.svg) is its W alone, for the title bar, and [assets/wushang.ico](assets/wushang.ico) the exe's icon, which [build.rs](build.rs) embeds.
+
+The equalizer presets are VLC's, under LGPL 2.1 or later.
 
 The Inter font in [assets/fonts](assets/fonts) is by The Inter Project Authors and licensed under the SIL Open Font License 1.1 ([OFL.txt](assets/fonts/OFL.txt)).

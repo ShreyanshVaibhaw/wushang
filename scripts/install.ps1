@@ -12,6 +12,10 @@ $files = 'wushang.exe', 'avcodec-63.dll', 'avdevice-63.dll', 'avformat-63.dll', 
 New-Item -ItemType Directory -Force $dst | Out-Null
 foreach ($f in $files) { Copy-Item (Join-Path $src $f) $dst -Force }
 Copy-Item "$repo\assets\fonts\OFL.txt" (Join-Path $dst 'Inter-OFL.txt') -Force
+# The licence, and the notices and texts the DLLs' licences ask to travel with them.
+Copy-Item "$repo\LICENSE", "$repo\THIRD_PARTY_NOTICES.md" $dst -Force
+$licenses = New-Item -ItemType Directory -Force (Join-Path $dst 'licenses')
+Copy-Item "$repo\licenses\*" $licenses -Force
 
 $shortcut = Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs\wushang.lnk'
 $link = (New-Object -ComObject WScript.Shell).CreateShortcut($shortcut)

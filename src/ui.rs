@@ -1095,8 +1095,8 @@ macro_rules! icons {
         impl Icons {
             fn load(ctx: &ID2D1DeviceContext5) -> Result<Self> {
                 let mut icons = Icons { $($name: svg(ctx, include_bytes!(concat!("../assets/icons/", $file)))?),* };
-                // VLC's cone stays orange whatever the accent, and the volume meter's green to red
-                // is a level scale, not the accent.
+                // The logo keeps its own oranges whatever the accent, and the volume meter's green
+                // to red is a level scale, not the accent.
                 icons.logo = svg_as_is(ctx, include_bytes!("../assets/icons/logo.svg"))?;
                 icons.volume_fill = svg_as_is(ctx, include_bytes!("../assets/icons/volume_fill.svg"))?;
                 Ok(icons)

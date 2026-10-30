@@ -1,5 +1,5 @@
 //! What the player's bars hold, from the design's "Player - customize" frames: the title bar's
-//! group after the cone, and the control bar's left, centre and right groups. Customize Player
+//! group after the logo, and the control bar's left, centre and right groups. Customize Player
 //! (customize.rs) edits it; it's kept in `toolbar.txt` next to the library state.
 //!
 //! The control bar is one row while its centre group is empty, the seek bar between the left
@@ -15,7 +15,7 @@ use super::*;
 const FILE: &str = "toolbar.txt";
 /// The two-row control bar, from the customize frames.
 pub const TALL_BAR: f32 = 100.0;
-/// The title bar group starts after the cone.
+/// The title bar group starts after the logo.
 const TITLE_X: f32 = 51.0;
 const EDGE: f32 = 20.0;
 
