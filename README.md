@@ -111,6 +111,7 @@ The gear opens the settings panel, with four tabs:
 
 - Playback: marks on the seek bar where the subtitles have lines, playback statistics over the video, reverse playback, a sleep timer, an audio visualizer, and speed from 0.25x to 2x without changing pitch.
 - Video: flip, rotation, zoom, resolution, aspect ratio, crop, render, and brightness, contrast, hue and saturation (under "Expand Settings"), all done by the GPU's video processor.
+  Zoom starts at Fill, which covers the window and cuts off what overflows; "1:1 Original" shows the whole picture with bars, and Reset goes back to Fill.
 - Audio: track, stereo mode (stereo, mono, left, right, reverse) with a Test button, audio delay, and VLC's 10-band equalizer with its 18 presets and the "2 Pass" option.
 - Subtitles: track, subtitle delay, speed and duration factor, text size, whether ASS and SSA keep their own styling, font, and text and outline colours.
 

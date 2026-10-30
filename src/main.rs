@@ -163,6 +163,9 @@ fn prefs() -> Prefs {
 /// Sleep timer choices in minutes, by index into the panel's list; the last one is "End of file".
 const SLEEP_MINUTES: [u64; 5] = [0, 15, 30, 45, 60];
 const SLEEP_END_OF_FILE: usize = 5;
+/// The zoom every video opens with, by index into `ui::panels::ZOOM`: Fill, so the picture
+/// covers the window with no black bars.
+const DEFAULT_ZOOM: usize = 1;
 
 fn main() {
     use_parent_console();
@@ -976,7 +979,7 @@ impl App {
             PanelAction::SetSaturation(v) => self.adjust.saturation = v,
             PanelAction::ResetVideo => {
                 self.adjust = VideoAdjust::default();
-                (self.zoom, self.aspect, self.crop) = (0, 0, 0);
+                (self.zoom, self.aspect, self.crop) = (DEFAULT_ZOOM, 0, 0);
             }
             PanelAction::SetSleepTimer(i) => {
                 self.sleep = i;
@@ -1548,7 +1551,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         bookmarks: Bookmarks::load(&Library::default_dir()),
         recorded: Instant::now(),
         adjust: VideoAdjust::default(),
-        zoom: 0,
+        zoom: DEFAULT_ZOOM,
         aspect: 0,
         crop: 0,
         embedded: None,
