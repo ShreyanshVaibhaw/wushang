@@ -7,6 +7,7 @@
 #![cfg_attr(not(test), windows_subsystem = "windows")]
 
 mod ass;
+mod assoc;
 mod audio;
 mod bookmarks;
 mod captions;
@@ -1512,6 +1513,8 @@ fn run() -> Result<(), Box<dyn Error>> {
     if play_and_exit && path.is_none() {
         return Err(USAGE.into());
     }
+    // Off the window's thread; it only writes the registry when the exe has moved.
+    thread::spawn(assoc::register);
 
     ff::init()?;
     // Sets up Winsock and TLS once, instead of on every stream opened.

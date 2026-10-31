@@ -10,6 +10,8 @@ The interface follows Juxtopposed's VLC redesign (see Credits).
 
 Get `wushang-<version>-windows-x64.zip` from the [latest release](https://github.com/ShreyanshVaibhaw/wushang/releases/latest), unzip it into a folder of your own, such as `%LOCALAPPDATA%\Programs\wushang`, and run `wushang.exe`.
 It needs Windows 10 or 11 on x64, and nothing else installed.
+Once it has run, it is listed in Explorer's "Open with" for video and audio files and in Settings > Apps > Default apps, where you can make it your default player.
+If you move its folder, run it once from the new place.
 
 ### Updates
 
