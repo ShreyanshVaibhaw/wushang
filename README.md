@@ -8,18 +8,25 @@ The interface follows Juxtopposed's VLC redesign (see Credits).
 
 ## Download
 
-Get `wushang-<version>-windows-x64.zip` from the [latest release](https://github.com/ShreyanshVaibhaw/wushang/releases/latest), unzip it into a folder of your own, such as `%LOCALAPPDATA%\Programs\wushang`, and run `wushang.exe`.
+Get `wushang-<version>-windows-x64.msi` from the [latest release](https://github.com/ShreyanshVaibhaw/wushang/releases/latest) and open it.
+It installs wushang for your account, with no admin rights, in `%LOCALAPPDATA%\Programs\wushang`, adds it to the Start menu, and starts it.
+Settings > Apps > Installed apps uninstalls it.
 It needs Windows 10 or 11 on x64, and nothing else installed.
+
+To run it without installing, get `wushang-<version>-windows-x64.zip` instead, unzip it into a folder of your own, and run `wushang.exe`.
+
 Once it has run, it is listed in Explorer's "Open with" for video and audio files and in Settings > Apps > Default apps, where you can make it your default player.
-If you move its folder, run it once from the new place.
+A copy from the zip that you move should be run once from its new place.
 
 ### Updates
 
 When wushang starts, it asks GitHub for the latest release, and when that one is newer it offers it in a window once nothing is playing.
-Install downloads the release's zip, puts its files in place of the old ones, and restarts wushang; the library, settings and history stay as they were.
+For a copy the installer put in, Install downloads the new installer; wushang closes, Windows Installer updates it with a progress bar, and the new version opens.
+For a copy from the zip, Download saves the new zip to your Downloads folder and opens it in Explorer next to wushang's folder; close wushang and copy the files in the zip over the ones in its folder.
+Either way the library, settings and history stay as they were.
+wushang never replaces its own files, because antivirus programs take a running app that swaps in a downloaded exe for malware.
 Later closes the window, and wushang asks again next time it starts.
 Settings > General > "Check for updates when wushang starts" turns the check off.
-The update replaces files beside `wushang.exe`, so it needs a folder you can write to; a copy under `Program Files` can't update itself.
 
 ## Run from source
 
@@ -31,9 +38,10 @@ To install it for your account (no admin rights), build it, then run [scripts/in
 It copies `wushang.exe` and the DLLs it loads to `%LOCALAPPDATA%\Programs\wushang` and adds a Start menu shortcut.
 Run it again after a new build to update the installed copy.
 
-To make a release, raise `version` in [Cargo.toml](Cargo.toml) and run [scripts/package.ps1](scripts/package.ps1), which builds and writes `wushang-<version>-windows-x64.zip` to the build folder.
-It builds with your user folder cut out of the source paths the exe embeds, so the zip doesn't carry your Windows user name.
-Attach that zip to a GitHub release tagged `v<version>`; the updater only installs a zip named that way.
+To make a release, raise `version` in [Cargo.toml](Cargo.toml) and run [scripts/package.ps1](scripts/package.ps1), which builds and writes `wushang-<version>-windows-x64.zip` and `.msi` to the build folder.
+The installer is [installer/wushang.wxs](installer/wushang.wxs), built with WiX 6 (`dotnet tool install --global wix --version 6.0.2`).
+It builds with your user folder cut out of the source paths the exe embeds, so neither file carries your Windows user name.
+Attach both to a GitHub release tagged `v<version>`; the updater only takes files named that way.
 
 Without a file, wushang opens on the library.
 The first time it does (no `settings.txt` yet), the design's welcome shows over it in three steps.

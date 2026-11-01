@@ -36,7 +36,7 @@ pub fn register() {
     };
     let open = format!("\"{exe}\" \"%1\"");
     let command = format!(r"{APP}\shell\open\command");
-    if read(&command).as_deref() == Some(open.as_str()) {
+    if read(&command, "").as_deref() == Some(open.as_str()) {
         return;
     }
     let icon = format!("\"{exe}\",0");
@@ -75,15 +75,16 @@ pub fn register() {
     unsafe { SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_IDLIST, None, None) };
 }
 
-/// A key's string value (`""` for its default), if it has one.
-fn read(key: &str) -> Option<String> {
+/// A string value under HKEY_CURRENT_USER (`""` names the key's default), if it has one.
+pub fn read(key: &str, name: &str) -> Option<String> {
+    let name = (!name.is_empty()).then(|| HSTRING::from(name));
     let mut buf = [0u16; 1024];
     let mut size = std::mem::size_of_val(&buf) as u32;
     unsafe {
         RegGetValueW(
             HKEY_CURRENT_USER,
             &HSTRING::from(key),
-            PCWSTR::null(),
+            name.as_ref().map_or(PCWSTR::null(), |n| PCWSTR(n.as_ptr())),
             RRF_RT_REG_SZ,
             None,
             Some(buf.as_mut_ptr().cast()),

@@ -1,12 +1,13 @@
 //! Updates from GitHub Releases. At start (unless Settings > General turns it off) wushang asks for
 //! the latest release and offers it when its version is newer than this build.
 //!
-//! Installing downloads the release's zip, unpacks it with Windows' own tar.exe, and swaps the
-//! files in beside the running exe. Windows lets a running exe and its loaded DLLs be renamed, so
-//! each old file steps aside as `<name>.wushang-old` and the new one takes its place; the next
-//! start deletes those. Then wushang quits as usual (saving everything) and starts again.
+//! wushang never replaces its own files: a running exe that renames itself, writes a downloaded
+//! exe in its place and starts it is what droppers do, and antivirus (Bitdefender's Advanced
+//! Threat Defense) took 1.0.2's updater for one and deleted the whole install. Instead:
+//! - A copy the MSI installed downloads the next MSI, and once wushang has exited, Windows' own
+//!   msiexec upgrades it and starts it again (installer/wushang.wxs).
+//! - A copy someone unzipped saves the next zip to Downloads for them to copy over.
 
-use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Mutex;
@@ -14,26 +15,38 @@ use std::sync::mpsc::{Receiver, channel};
 use std::time::Duration;
 use std::{env, fs, thread};
 
-use crate::net;
+use windows::Win32::UI::Shell::FOLDERID_Downloads;
+
+use crate::{assoc, net, snapshot};
 
 const LATEST: &str = "https://api.github.com/repos/ShreyanshVaibhaw/wushang/releases/latest";
-/// The release asset to install: `wushang-<version>-windows-x64.zip`, from this repository's
+/// The release assets: `wushang-<version>-windows-x64.zip` and `.msi`, from this repository's
 /// releases and nowhere else.
 const ASSET_PREFIX: &str = "https://github.com/ShreyanshVaibhaw/wushang/releases/download/";
-const ASSET_SUFFIX: &str = "-windows-x64.zip";
+const ZIP_SUFFIX: &str = "-windows-x64.zip";
+const MSI_SUFFIX: &str = "-windows-x64.msi";
 /// Largest download accepted; a release is about 15 MB.
 const MAX_DOWNLOAD: usize = 200 << 20;
-const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
-/// The exe to start once this process has saved and exited, after an update.
-static RESTART: Mutex<Option<PathBuf>> = Mutex::new(None);
+/// The installer msiexec runs once this process has saved and exited.
+static INSTALL: Mutex<Option<PathBuf>> = Mutex::new(None);
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Release {
     /// Without the tag's "v", like "1.0.1".
     pub version: String,
     /// The zip to download.
-    pub url: String,
+    pub zip: String,
+    /// The installer to run instead, when an MSI installed this copy and the release has one.
+    pub msi: Option<String>,
+}
+
+/// What an update download saved.
+pub enum Saved {
+    /// The installer, run when wushang exits.
+    Installer(PathBuf),
+    /// The zip, in Downloads for the user to copy over.
+    Zip(PathBuf),
 }
 
 /// Asks GitHub for the latest release on a thread of its own. The receiver gets it only when it
@@ -43,7 +56,7 @@ pub fn check() -> Receiver<Release> {
     thread::spawn(
         move || match net::fetch_text(LATEST, Duration::from_secs(10)) {
             Ok(json) => {
-                if let Some(release) = newer(&json, env!("CARGO_PKG_VERSION")) {
+                if let Some(release) = newer(&json, env!("CARGO_PKG_VERSION"), installed()) {
                     _ = send.send(release);
                 }
             }
@@ -53,14 +66,33 @@ pub fn check() -> Receiver<Release> {
     recv
 }
 
-/// The release in GitHub's JSON, when it is newer than `current` and has a Windows zip.
-fn newer(json: &str, current: &str) -> Option<Release> {
+/// The release in GitHub's JSON, when it is newer than `current` and has a Windows zip. Its
+/// installer comes along only for a copy the MSI `installed`.
+fn newer(json: &str, current: &str, installed: bool) -> Option<Release> {
     let tag = json_strings(json, "tag_name").into_iter().next()?;
     let version = tag.trim_start_matches('v').to_owned();
-    let url = json_strings(json, "browser_download_url")
-        .into_iter()
-        .find(|u| u.starts_with(ASSET_PREFIX) && u.ends_with(ASSET_SUFFIX) && !u.contains(".."))?;
-    (version_parts(&version)? > version_parts(current)?).then_some(Release { version, url })
+    let urls = json_strings(json, "browser_download_url");
+    let asset = |suffix: &str| {
+        urls.iter()
+            .find(|u| u.starts_with(ASSET_PREFIX) && u.ends_with(suffix) && !u.contains(".."))
+            .cloned()
+    };
+    let zip = asset(ZIP_SUFFIX)?;
+    let msi = asset(MSI_SUFFIX).filter(|_| installed);
+    (version_parts(&version)? > version_parts(current)?).then_some(Release { version, zip, msi })
+}
+
+/// Whether the MSI installed this copy: it records its folder, which is this exe's.
+fn installed() -> bool {
+    let Some(dir) = assoc::read(r"Software\wushang", "InstallDir") else {
+        return false;
+    };
+    let exe = env::current_exe().ok();
+    let here = exe.as_deref().and_then(Path::parent);
+    here.is_some_and(|h| {
+        h.to_string_lossy()
+            .eq_ignore_ascii_case(dir.trim_end_matches('\\'))
+    })
 }
 
 /// "1.2.3" as [1, 2, 3], padded to three parts. A pre-release tag like "1.2.0-beta" is None, so
@@ -106,72 +138,72 @@ fn json_strings(json: &str, key: &str) -> Vec<String> {
     out
 }
 
-/// Downloads and puts `release` in place on a thread. The receiver gets the exe to start once
-/// wushang has exited, or why it failed (nothing is changed then).
-pub fn install(release: &Release) -> Receiver<Result<PathBuf, String>> {
+/// Downloads `release` on a thread: its installer into a temporary folder, or else its zip into
+/// Downloads. The receiver gets what was saved, or why it failed.
+pub fn download(release: &Release) -> Receiver<Result<Saved, String>> {
     let (send, recv) = channel();
     let release = release.clone();
-    thread::spawn(move || _ = send.send(download_and_swap(&release)));
+    thread::spawn(move || _ = send.send(save(&release)));
     recv
 }
 
-fn download_and_swap(release: &Release) -> Result<PathBuf, String> {
-    // Taken before the swap renames the running exe.
-    let exe = env::current_exe().map_err(|e| format!("Can't find wushang.exe: {e}"))?;
-    let dir = exe.parent().ok_or("Can't find wushang's folder.")?;
-    let temp = env::temp_dir().join(format!("wushang-update-{}", release.version));
-    _ = fs::remove_dir_all(&temp);
-    let files = temp.join("files");
-    fs::create_dir_all(&files).map_err(|e| format!("Can't make a folder for the update: {e}"))?;
-
-    let zip = temp.join("update.zip");
-    let bytes = net::fetch(&release.url, Duration::from_secs(60), MAX_DOWNLOAD)
+fn save(release: &Release) -> Result<Saved, String> {
+    let (url, dir, suffix) = match &release.msi {
+        Some(msi) => (msi, update_dir(), MSI_SUFFIX),
+        None => (
+            &release.zip,
+            snapshot::known_folder(&FOLDERID_Downloads)
+                .map_err(|e| format!("Can't find your Downloads folder: {e}"))?,
+            ZIP_SUFFIX,
+        ),
+    };
+    let bytes = net::fetch(url, Duration::from_secs(60), MAX_DOWNLOAD)
         .map_err(|e| format!("Can't download the update: {e}"))?;
-    fs::write(&zip, bytes).map_err(|e| format!("Can't save the update: {e}"))?;
-    // Windows' tar (bsdtar) reads zip; a Git or MSYS tar earlier on PATH wouldn't.
-    let tar = PathBuf::from(env::var_os("SystemRoot").unwrap_or("C:\\Windows".into()))
-        .join("System32\\tar.exe");
-    let unpacked = Command::new(tar)
-        .arg("-xf")
-        .arg(&zip)
-        .arg("-C")
-        .arg(&files)
-        .creation_flags(CREATE_NO_WINDOW)
-        .status()
-        .is_ok_and(|s| s.success());
-    if !unpacked || !files.join("wushang.exe").is_file() {
-        return Err("The update didn't unpack. Try again later.".into());
-    }
-    swap(&files, dir).map_err(|e| format!("Can't replace wushang's files: {e}"))?;
-    _ = fs::remove_dir_all(&temp);
-    Ok(exe)
+    fs::create_dir_all(&dir).map_err(|e| format!("Can't save the update: {e}"))?;
+    // Named from the version, which is only digits and dots, never from the address.
+    let path = dir.join(format!("wushang-{}{suffix}", release.version));
+    fs::write(&path, bytes).map_err(|e| format!("Can't save the update: {e}"))?;
+    Ok(match release.msi {
+        Some(_) => Saved::Installer(path),
+        None => Saved::Zip(path),
+    })
 }
 
-/// Every file under `dir`, relative to it.
-fn files_under(dir: &Path) -> std::io::Result<Vec<PathBuf>> {
-    let mut out = Vec::new();
-    let mut stack = vec![PathBuf::new()];
-    while let Some(rel) = stack.pop() {
-        for entry in fs::read_dir(dir.join(&rel))? {
-            let entry = entry?;
-            let rel = rel.join(entry.file_name());
-            if entry.file_type()?.is_dir() {
-                stack.push(rel);
-            } else {
-                out.push(rel);
-            }
-        }
-    }
-    Ok(out)
+/// Where a downloaded installer waits; the next start deletes it.
+fn update_dir() -> PathBuf {
+    env::temp_dir().join("wushang-update")
 }
 
-/// What a replaced file is renamed to until the next start deletes it. The suffix is wushang's
-/// own because wushang may sit in a folder of other people's files (unzipped into Downloads),
-/// and only its leftovers may go.
+/// Runs `msi` once this process has finished.
+pub fn install_on_exit(msi: PathBuf) {
+    *INSTALL.lock().unwrap() = Some(msi);
+}
+
+/// The last thing main does: hands a downloaded installer to msiexec, which closes nothing (this
+/// process is gone by then), shows its progress bar, and starts the new wushang.
+pub fn finish() {
+    let Some(msi) = INSTALL.lock().unwrap().take() else {
+        return;
+    };
+    // By full path, so an msiexec.exe beside wushang or in the current folder can't stand in.
+    let msiexec = PathBuf::from(env::var_os("SystemRoot").unwrap_or("C:\\Windows".into()))
+        .join("System32\\msiexec.exe");
+    if let Err(e) = Command::new(msiexec)
+        .arg("/i")
+        .arg(&msi)
+        .arg("/passive")
+        .spawn()
+    {
+        eprintln!("update: can't start the installer: {e}");
+    }
+}
+
+/// What 1.0.2's updater renamed a replaced file to, for the next start to delete. The suffix is
+/// wushang's own because wushang may sit in a folder of other people's files (unzipped into
+/// Downloads), and only its leftovers may go.
 const ASIDE: &str = ".wushang-old";
 
 /// The files 1.0.0 and 1.0.1 shipped, which their updater set aside as `<name>.old`.
-// ponytail: only for updates made by those versions; drop once nobody runs them.
 const OLD_ASIDE: [&str; 18] = [
     "wushang.exe",
     "avcodec-63.dll",
@@ -193,12 +225,6 @@ const OLD_ASIDE: [&str; 18] = [
     "zlib.txt",
 ];
 
-fn aside(path: &Path) -> PathBuf {
-    let mut name = path.file_name().unwrap_or_default().to_owned();
-    name.push(ASIDE);
-    path.with_file_name(name)
-}
-
 /// Whether `name` is a file an update set aside, which the next start may delete.
 fn is_aside(name: &str) -> bool {
     name.ends_with(ASIDE)
@@ -207,40 +233,11 @@ fn is_aside(name: &str) -> bool {
             .is_some_and(|n| OLD_ASIDE.iter().any(|o| o.eq_ignore_ascii_case(n)))
 }
 
-/// Puts every file from `from` in `to`, moving the ones it replaces aside. On any failure the
-/// files already placed are taken back out and the old ones restored.
-fn swap(from: &Path, to: &Path) -> std::io::Result<()> {
-    let mut placed: Vec<(PathBuf, Option<PathBuf>)> = Vec::new();
-    let result = files_under(from).and_then(|files| {
-        for rel in files {
-            let target = to.join(&rel);
-            if let Some(parent) = target.parent() {
-                fs::create_dir_all(parent)?;
-            }
-            let old = target.exists().then(|| aside(&target));
-            if let Some(old) = &old {
-                _ = fs::remove_file(old);
-                fs::rename(&target, old)?;
-            }
-            placed.push((target.clone(), old));
-            fs::copy(from.join(&rel), &target)?;
-        }
-        Ok(())
-    });
-    if result.is_err() {
-        for (target, old) in placed.into_iter().rev() {
-            _ = fs::remove_file(&target);
-            if let Some(old) = old {
-                _ = fs::rename(old, &target);
-            }
-        }
-    }
-    result
-}
-
-/// Deletes the files a previous update set aside beside the exe. One still held by the exiting
-/// old process stays until next time.
+/// Deletes a downloaded installer that has run, and the files an older version's update set
+/// aside beside the exe.
 pub fn clean_up() {
+    _ = fs::remove_dir_all(update_dir());
+    // ponytail: the rest only for updates made by 1.0.0 to 1.0.2; drop once nobody runs them.
     let Some(dir) = env::current_exe()
         .ok()
         .and_then(|e| e.parent().map(Path::to_owned))
@@ -263,49 +260,45 @@ pub fn clean_up() {
     }
 }
 
-/// Starts `exe` once this process has finished, after an installed update.
-pub fn restart_with(exe: PathBuf) {
-    *RESTART.lock().unwrap() = Some(exe);
-}
-
-/// The last thing main does: starts the updated wushang, if an update asked for it.
-pub fn finish() {
-    if let Some(exe) = RESTART.lock().unwrap().take()
-        && let Err(e) = Command::new(&exe).spawn()
-    {
-        eprintln!("update: can't start {}: {e}", exe.display());
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     const JSON: &str = r#"{"url":"x","tag_name": "v1.2.0","assets":[
         {"name":"a.txt","browser_download_url":"https://github.com/ShreyanshVaibhaw/wushang/releases/download/v1.2.0/a.txt"},
-        {"name":"z","browser_download_url" : "https:\/\/github.com\/ShreyanshVaibhaw\/wushang\/releases\/download\/v1.2.0\/wushang-1.2.0-windows-x64.zip"}]}"#;
+        {"name":"z","browser_download_url" : "https:\/\/github.com\/ShreyanshVaibhaw\/wushang\/releases\/download\/v1.2.0\/wushang-1.2.0-windows-x64.zip"},
+        {"name":"m","browser_download_url":"https://github.com/ShreyanshVaibhaw/wushang/releases/download/v1.2.0/wushang-1.2.0-windows-x64.msi"}]}"#;
 
     #[test]
     fn a_newer_release_is_offered_with_its_zip() {
-        let r = newer(JSON, "1.0.0").unwrap();
+        let r = newer(JSON, "1.0.0", false).unwrap();
         assert_eq!(r.version, "1.2.0");
         assert_eq!(
-            r.url,
+            r.zip,
             "https://github.com/ShreyanshVaibhaw/wushang/releases/download/v1.2.0/wushang-1.2.0-windows-x64.zip"
         );
-        assert_eq!(newer(JSON, "1.2.0"), None, "same version");
+        assert_eq!(r.msi, None, "an unzipped copy gets the zip");
         assert_eq!(
-            newer(JSON, "1.10.0"),
+            newer(JSON, "1.0.0", true).unwrap().msi.as_deref(),
+            Some(
+                "https://github.com/ShreyanshVaibhaw/wushang/releases/download/v1.2.0/wushang-1.2.0-windows-x64.msi"
+            )
+        );
+        assert_eq!(newer(JSON, "1.2.0", false), None, "same version");
+        assert_eq!(
+            newer(JSON, "1.10.0", false),
             None,
             "older, compared by number not text"
         );
         assert_eq!(
-            newer(&JSON.replace("v1.2.0\"", "v1.2.0-beta\""), "1.0.0"),
+            newer(&JSON.replace("v1.2.0\"", "v1.2.0-beta\""), "1.0.0", false),
             None
         );
         // Only this repository's release downloads install.
-        let elsewhere = JSON.replace("ShreyanshVaibhaw\\/wushang", "evil\\/wushang");
-        assert_eq!(newer(&elsewhere, "1.0.0"), None);
+        let elsewhere = JSON
+            .replace("ShreyanshVaibhaw\\/wushang", "evil\\/wushang")
+            .replace("ShreyanshVaibhaw/wushang", "evil/wushang");
+        assert_eq!(newer(&elsewhere, "1.0.0", true), None);
     }
 
     #[test]
@@ -316,31 +309,5 @@ mod tests {
         assert!(!is_aside("report.docx.old"));
         assert!(!is_aside("notes.old"));
         assert!(!is_aside("wushang.exe"));
-    }
-
-    #[test]
-    fn swapping_moves_old_files_aside_and_adds_new_ones() {
-        let root = env::temp_dir().join(format!("wushang-swap-{}", std::process::id()));
-        _ = fs::remove_dir_all(&root);
-        let (new, app) = (root.join("new"), root.join("app"));
-        fs::create_dir_all(new.join("licenses")).unwrap();
-        fs::create_dir_all(&app).unwrap();
-        fs::write(new.join("wushang.exe"), "new exe").unwrap();
-        fs::write(new.join("licenses/a.txt"), "licence").unwrap();
-        fs::write(app.join("wushang.exe"), "old exe").unwrap();
-        swap(&new, &app).unwrap();
-        assert_eq!(
-            fs::read_to_string(app.join("wushang.exe")).unwrap(),
-            "new exe"
-        );
-        assert_eq!(
-            fs::read_to_string(app.join("wushang.exe.wushang-old")).unwrap(),
-            "old exe"
-        );
-        assert_eq!(
-            fs::read_to_string(app.join("licenses/a.txt")).unwrap(),
-            "licence"
-        );
-        _ = fs::remove_dir_all(&root);
     }
 }

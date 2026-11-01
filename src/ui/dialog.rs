@@ -41,6 +41,8 @@ pub enum Dialog {
     DeletePlaylist(String),
     /// Offers a newer release from GitHub.
     Update(crate::update::Release),
+    /// Says where the release's zip was saved, and what to do with it.
+    Downloaded(PathBuf),
     /// Names a new settings profile.
     NewProfile,
     /// Asks for a stream to play, or a podcast feed to add.
@@ -74,9 +76,9 @@ pub enum DialogAction {
     /// Play the stream or add the feed at the typed address; on success close the dialog, else
     /// report with [`Ui::dialog_error`].
     OpenAddress(NetKind, String),
-    /// Download and install the release; on success wushang restarts, else report with
-    /// [`Ui::dialog_error`].
-    InstallUpdate(crate::update::Release),
+    /// Download the release; on success install it or show [`Dialog::Downloaded`], else report
+    /// with [`Ui::dialog_error`].
+    DownloadUpdate(crate::update::Release),
 }
 
 /// What a click lands on.
@@ -388,6 +390,7 @@ impl State {
             | Dialog::Shortcuts
             | Dialog::DeletePlaylist(_)
             | Dialog::Update(_)
+            | Dialog::Downloaded(_)
             | Dialog::NewProfile
             | Dialog::Address(_) => {}
         }
@@ -403,6 +406,7 @@ impl State {
             Dialog::Properties(_) => "Properties",
             Dialog::DeletePlaylist(_) => "Delete Playlist",
             Dialog::Update(_) => "Update Available",
+            Dialog::Downloaded(_) => "Update Downloaded",
             Dialog::NewProfile => "New Profile",
             Dialog::Address(NetKind::Podcast) => "Add Podcast",
             Dialog::Address(_) => "Open Network Stream",
@@ -847,7 +851,7 @@ impl Painter {
             Dialog::Properties(_) => 640.0,
             Dialog::About | Dialog::Shortcuts => 600.0,
             Dialog::DeletePlaylist(_) | Dialog::NewProfile => 520.0,
-            Dialog::Address(_) | Dialog::Update(_) => 600.0,
+            Dialog::Address(_) | Dialog::Update(_) | Dialog::Downloaded(_) => 600.0,
         };
         let mut b = Builder {
             w,
@@ -913,8 +917,11 @@ impl Painter {
                     87.0,
                     w - PAD,
                 );
-                let help = if d.busy {
-                    "Downloading and installing. wushang restarts when it's done.".to_owned()
+                let installer = release.msi.is_some();
+                let help = if d.busy && installer {
+                    "Downloading. wushang closes, updates and opens again.".to_owned()
+                } else if d.busy {
+                    "Downloading to your Downloads folder.".to_owned()
                 } else {
                     format!(
                         "You have {}. Your library and settings stay as they are.",
@@ -927,12 +934,37 @@ impl Painter {
                     b.text(e.as_str(), Style::Error, PAD, 143.0, w - PAD);
                     top += 20.0;
                 }
-                // No Later while it installs: the files are already being replaced.
                 if d.busy {
-                    b.footer(top, None, "Installing...", false)
+                    b.footer(top, None, "Downloading...", false)
                 } else {
-                    b.footer(top, Some((Target::Cancel, "Later")), "Install", true)
+                    let go = if installer { "Install" } else { "Download" };
+                    b.footer(top, Some((Target::Cancel, "Later")), go, true)
                 }
+            }
+            Dialog::Downloaded(zip) => {
+                let name = zip.file_name().unwrap_or_default().to_string_lossy();
+                b.text(
+                    format!("{name} is in Downloads"),
+                    Style::Heading,
+                    PAD,
+                    87.0,
+                    w - PAD,
+                );
+                b.text(
+                    "Close wushang, then copy the files in the zip over the ones in",
+                    Style::Help,
+                    PAD,
+                    117.0,
+                    w - PAD,
+                );
+                b.text(
+                    "wushang's folder. Explorer has both open.",
+                    Style::Help,
+                    PAD,
+                    139.0,
+                    w - PAD,
+                );
+                b.footer(179.0, None, "Close", true)
             }
         };
         // Clicks anywhere on the dialog stop at it; the dimmed window around it is Body too.
@@ -1366,7 +1398,7 @@ impl Ui {
                 };
                 d.busy = true;
                 d.error = None;
-                DialogAction::InstallUpdate(release)
+                DialogAction::DownloadUpdate(release)
             }
             Target::Primary => {
                 self.close_dialog();

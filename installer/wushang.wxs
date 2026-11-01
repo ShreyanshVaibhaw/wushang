@@ -1,0 +1,76 @@
+<!--
+  The wushang installer: a per-user MSI (no admin rights) that puts the release's files in
+  %LOCALAPPDATA%\Programs\wushang, adds a Start menu shortcut, and starts wushang when it's done.
+  Windows' own msiexec does the copying, which antivirus trusts in a way it didn't trust wushang
+  replacing its own files. A newer MSI upgrades in place; uninstalling also takes out the "Open
+  with" entries wushang registers when it runs (src/assoc.rs).
+
+  scripts/package.ps1 builds and checks it. The checks skip ICE38 and ICE91, which are about
+  roaming profiles: they want per-user files tracked by registry values so they follow a user to
+  other PCs, and %LOCALAPPDATA% never roams.
+-->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <Package Name="wushang" Manufacturer="Shreyansh Vaibhaw" Version="$(Version)"
+           UpgradeCode="0dfa5741-08df-4b1f-a519-7625c40fadfc" Scope="perUser" Compressed="yes">
+    <MajorUpgrade Schedule="afterInstallInitialize"
+                  DowngradeErrorMessage="A newer wushang is already installed." />
+    <MediaTemplate EmbedCab="yes" />
+
+    <Icon Id="wushang.ico" SourceFile="$(sys.SOURCEFILEDIR)..\assets\wushang.ico" />
+    <Property Id="ARPPRODUCTICON" Value="wushang.ico" />
+    <Property Id="ARPURLINFOABOUT" Value="https://github.com/ShreyanshVaibhaw/wushang" />
+    <Property Id="ARPNOMODIFY" Value="1" />
+    <!-- An update never asks to restart Windows; a file still in use is replaced next time. -->
+    <Property Id="REBOOT" Value="ReallySuppress" />
+
+    <StandardDirectory Id="LocalAppDataFolder">
+      <Directory Id="ProgramsFolder" Name="Programs">
+        <Directory Id="INSTALLFOLDER" Name="wushang">
+          <Directory Id="LicensesFolder" Name="licenses" />
+        </Directory>
+      </Directory>
+    </StandardDirectory>
+
+    <ComponentGroup Id="Files" Directory="INSTALLFOLDER">
+      <Files Include="!(bindpath.stage)*">
+        <Exclude Files="!(bindpath.stage)wushang.exe" />
+      </Files>
+      <Files Directory="LicensesFolder" Include="!(bindpath.stage)licenses\*" />
+    </ComponentGroup>
+
+    <!-- The exe and its Start menu shortcut. The key path is the value wushang reads to know an
+         MSI installed it, and so updates with the next MSI rather than a zip. -->
+    <Component Id="Shell" Directory="INSTALLFOLDER" Guid="5b818c74-198c-4ca0-b9e5-07b9e52814b6">
+      <RegistryValue Root="HKCU" Key="Software\wushang" Name="InstallDir" Value="[INSTALLFOLDER]"
+                     Type="string" KeyPath="yes" />
+      <File Id="wushangExe" Name="wushang.exe" Source="!(bindpath.stage)wushang.exe">
+        <Shortcut Id="StartMenu" Directory="ProgramMenuFolder" Name="wushang"
+                  Description="Video and music player" WorkingDirectory="INSTALLFOLDER"
+                  Advertise="no" />
+      </File>
+      <RemoveFolder Id="RemoveLicenses" Directory="LicensesFolder" On="uninstall" />
+      <RemoveFolder Id="RemoveInstall" On="uninstall" />
+      <RemoveFolder Id="RemovePrograms" Directory="ProgramsFolder" On="uninstall" />
+      <!-- What wushang registers at its start for "Open with" and Default apps. -->
+      <RegistryValue Root="HKCU" Key="Software\RegisteredApplications" Name="wushang"
+                     Value="Software\wushang\Capabilities" Type="string" />
+      <RemoveRegistryKey Root="HKCU" Key="Software\Classes\Applications\wushang.exe"
+                         Action="removeOnUninstall" />
+      <RemoveRegistryKey Root="HKCU" Key="Software\Classes\wushang.video" Action="removeOnUninstall" />
+      <RemoveRegistryKey Root="HKCU" Key="Software\Classes\wushang.audio" Action="removeOnUninstall" />
+      <RemoveRegistryKey Root="HKCU" Key="Software\wushang\Capabilities" Action="removeOnUninstall" />
+    </Component>
+
+    <Feature Id="Main">
+      <ComponentGroupRef Id="Files" />
+      <ComponentRef Id="Shell" />
+    </Feature>
+
+    <!-- Starts wushang after an install or update, not after an uninstall. -->
+    <CustomAction Id="Launch" FileRef="wushangExe" ExeCommand="" Return="asyncNoWait"
+                  Impersonate="yes" Execute="immediate" />
+    <InstallExecuteSequence>
+      <Custom Action="Launch" After="InstallFinalize" Condition="NOT REMOVE" />
+    </InstallExecuteSequence>
+  </Package>
+</Wix>

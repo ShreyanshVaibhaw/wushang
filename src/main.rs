@@ -227,8 +227,8 @@ struct App {
     audio: Arc<audio::Device>,
     library: Library,
     library_changed: bool,
-    /// An update downloading and installing: the exe to restart into, or why it failed.
-    installing: Option<mpsc::Receiver<Result<PathBuf, String>>>,
+    /// An update downloading: what it saved, or why it failed.
+    downloading: Option<mpsc::Receiver<Result<update::Saved, String>>>,
     session: Option<Session>,
     /// The frame on screen. It holds a decoder surface, so it goes before its session.
     current: Option<VideoFrame>,
@@ -1556,7 +1556,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         audio,
         library: Library::load(&Library::default_dir()),
         library_changed: false,
-        installing: None,
+        downloading: None,
         session: None,
         current: None,
         queue: Queue::default(),
@@ -1908,22 +1908,33 @@ fn run() -> Result<(), Box<dyn Error>> {
         {
             open_dialog(&app, Dialog::Update(release));
         }
-        if let Some(installing) = &app.installing
-            && let Ok(result) = installing.try_recv()
+        if let Some(downloading) = &app.downloading
+            && let Ok(result) = downloading.try_recv()
         {
-            app.installing = None;
+            app.downloading = None;
             match result {
-                // Quit as usual, saving everything, and start the new version after. With the
-                // dialog closed meanwhile, the new version starts next time instead.
-                Ok(exe) => {
+                // Quit as usual, saving everything, and let msiexec update and start wushang.
+                // With the dialog closed meanwhile, nothing happens until the next offer.
+                Ok(update::Saved::Installer(msi)) => {
                     if UI.with_borrow(|ui| {
                         ui.dialog
                             .as_ref()
                             .is_some_and(|d| matches!(d.dialog, Dialog::Update(_)))
                     }) {
-                        update::restart_with(exe);
+                        update::install_on_exit(msi);
                         unsafe { _ = DestroyWindow(hwnd) };
                     }
+                }
+                // The zip selected in Downloads, and wushang's folder beside it to copy into.
+                Ok(update::Saved::Zip(zip)) => {
+                    if let Some(dir) = std::env::current_exe()
+                        .ok()
+                        .and_then(|e| e.parent().map(Path::to_owned))
+                    {
+                        _ = std::process::Command::new("explorer.exe").arg(dir).spawn();
+                    }
+                    menu_action(&mut app, hwnd, MenuAction::ShowInExplorer(zip.clone()));
+                    open_dialog(&app, Dialog::Downloaded(zip));
                 }
                 Err(e) => UI.with_borrow_mut(|ui| ui.dialog_error(e)),
             }
@@ -3007,7 +3018,7 @@ fn apply_dialog(app: &mut App, hwnd: HWND, action: DialogAction) {
                 }
             }
         },
-        DialogAction::InstallUpdate(release) => app.installing = Some(update::install(&release)),
+        DialogAction::DownloadUpdate(release) => app.downloading = Some(update::download(&release)),
         DialogAction::DeletePlaylist(name) => {
             if let Err(e) = app.library.delete_playlist(&name) {
                 eprintln!("library: cannot delete {name}: {e}");
