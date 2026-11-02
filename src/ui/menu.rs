@@ -754,10 +754,11 @@ pub fn main_menu(
     // The optical drives, then a disc's files on disk or a Blu-ray image.
     let mut discs: Vec<Item> = (crate::disc::drives().into_iter())
         .map(|d| {
-            Item::new(
-                format!("Disc in {}", d.display()),
-                MenuAction::OpenDisc(Some(d)),
-            )
+            // Drives are /Volumes/<label>; the label is what Finder shows.
+            let label = d.file_name().map_or(d.display().to_string(), |n| {
+                n.to_string_lossy().into_owned()
+            });
+            Item::new(format!("Disc: {label}"), MenuAction::OpenDisc(Some(d)))
         })
         .collect();
     discs.push(Item::new("Disc Folder...", MenuAction::OpenDisc(None)).key("⌘D"));
