@@ -195,9 +195,9 @@ define_class!(
         }
 
         /// Command shortcuts reach the window before the menu bar. The ones the interface
-        /// knows go through the same path as other keys, so an open dialog still takes them
-        /// first, as it takes Ctrl shortcuts on Windows; the rest (Quit, Hide, Settings) are
-        /// the menu bar's.
+        /// knows, the menu bar's own included, go through the same path as other keys, so an
+        /// open dialog still takes them first, as it takes Ctrl shortcuts on Windows; the rest
+        /// (Hide, Hide Others) are the menu bar's.
         #[unsafe(method(performKeyEquivalent:))]
         fn perform_key_equivalent(&self, event: &NSEvent) -> bool {
             let flags = event.modifierFlags();
@@ -207,7 +207,8 @@ define_class!(
             let ours = shortcut && matches!(
                 keys::from_event(event),
                 Some(
-                    VK_O | VK_R | VK_D | VK_N | VK_F | VK_P | VK_M | VK_I | VK_OEM_5 | VK_A
+                    VK_O | VK_R | VK_D | VK_N | VK_F | VK_P | VK_M | VK_I | VK_Q | VK_OEM_5
+                        | VK_OEM_COMMA | VK_A
                         | VK_C | VK_V | VK_X | VK_LEFT | VK_RIGHT | VK_UP | VK_DOWN | VK_BACK
                         | VK_DELETE | VK_HOME | VK_END | VK_INSERT | VK_RETURN
                 )

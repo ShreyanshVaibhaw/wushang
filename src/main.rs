@@ -49,8 +49,8 @@ use std::time::{Duration, Instant};
 
 use d2d::{
     IDC_HAND, IDC_IBEAM, VIRTUAL_KEY, VK_BACK, VK_D, VK_DELETE, VK_DOWN, VK_END, VK_ESCAPE, VK_F,
-    VK_F1, VK_HOME, VK_I, VK_LEFT, VK_M, VK_N, VK_O, VK_OEM_5, VK_P, VK_Q, VK_R, VK_RETURN,
-    VK_RIGHT, VK_S, VK_SPACE, VK_UP,
+    VK_F1, VK_HOME, VK_I, VK_LEFT, VK_M, VK_N, VK_O, VK_OEM_5, VK_OEM_COMMA, VK_P, VK_Q, VK_R,
+    VK_RETURN, VK_RIGHT, VK_S, VK_SPACE, VK_UP,
 };
 use ffmpeg_next as ff;
 use platform::{Event, Rect, Window};
@@ -78,6 +78,9 @@ static SHARED: OnceLock<Arc<Shared>> = OnceLock::new();
 static DURATION: AtomicU64 = AtomicU64::new(0);
 /// A file dropped on the window; the render loop opens it.
 static OPEN: Mutex<Option<PathBuf>> = Mutex::new(None);
+/// Files opened from Finder or the Dock while running, in order; the render loop plays them, as
+/// a second launch did on Windows.
+static OPEN_PLAY: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
 static RESIZED: AtomicBool = AtomicBool::new(false);
 /// Screens changed (HDR mode, brightness, layout) or the window moved: check for HDR again.
 static DISPLAY_CHANGED: AtomicBool = AtomicBool::new(false);
@@ -416,7 +419,7 @@ impl App {
         if net::is_address(path) {
             return self.play(path, vec![path.to_owned()]);
         }
-        // A DVD or Blu-ray folder, or a Blu-ray image, opened or dropped like a file.
+        // A DVD or Blu-ray folder, or a disc image, opened or dropped like a file.
         if (path.is_dir()
             || path
                 .extension()
@@ -1409,9 +1412,11 @@ fn run() -> Result<(), Box<dyn Error>> {
     let audio = audio::Device::open(shared.clone());
     // A file opened from Finder (Open With, a double-click, a drop on the Dock icon) arrives
     // as AppKit starts, as a command-line file does on Windows.
-    let opened = platform::init();
-    if path.is_none() {
-        path = opened.into_iter().next();
+    let mut opened = platform::init();
+    if path.is_none() && !opened.is_empty() {
+        path = Some(opened[0].clone());
+    } else {
+        opened.clear();
     }
     // No settings yet means wushang hasn't run here before: the welcome shows.
     let first_run = !Library::default_dir().join("settings.txt").exists();
@@ -1501,6 +1506,9 @@ fn run() -> Result<(), Box<dyn Error>> {
                 &app.audio,
             )?);
             true
+        } else if opened.len() > 1 {
+            // Several files opened together play in that order.
+            app.play(path, opened)
         } else {
             app.play_file(path)
         };
@@ -1589,6 +1597,20 @@ fn run() -> Result<(), Box<dyn Error>> {
                     Err(e) => eprintln!("library: cannot add to {name}: {e}"),
                 }
             } else if app.play_file(&path) {
+                UI.with_borrow_mut(|ui| ui.show(Page::Player));
+            }
+        }
+        let opened = std::mem::take(&mut *OPEN_PLAY.lock().unwrap());
+        if let Some(first) = opened.first().cloned() {
+            let played = if opened.len() > 1 {
+                app.play(&first, opened)
+            } else {
+                app.play_file(&first)
+            };
+            if played {
+                if is_mini() {
+                    MINI_REQUEST.set(Some(Some(Page::Player)));
+                }
                 UI.with_borrow_mut(|ui| ui.show(Page::Player));
             }
         }
@@ -2009,6 +2031,15 @@ fn run() -> Result<(), Box<dyn Error>> {
             if ui.settle_seek_preview() || ui.dialog_tick() || ui.preferences_tick() {
                 ui.dirty = true;
             }
+            // The menu bar's commands wait while something in the window takes the keys, as
+            // an open dialog took every key on Windows.
+            platform::set_menu_enabled(
+                ui.dialog.is_none()
+                    && ui.preferences.is_none()
+                    && ui.onboarding.is_none()
+                    && ui.customize.is_none()
+                    && !ui.menu.is_open(),
+            );
             std::mem::take(&mut ui.dirty)
         });
 
@@ -2578,7 +2609,7 @@ fn menu_action(app: &mut App, win: Window, action: MenuAction) {
         MenuAction::OpenDisc(Some(folder)) => open_disc(app, &folder),
         MenuAction::OpenDisc(None) => pick_folder(Picked::Disc),
         MenuAction::OpenDiscImage => {
-            let images = vec![("Blu-ray images", "*.iso".to_owned())];
+            let images = vec![("Disc images", "*.iso".to_owned())];
             pick(Picker::Files(images, false), Picked::Disc);
         }
         MenuAction::OpenCapture(address, name) => {
@@ -3352,12 +3383,8 @@ fn on_event(event: Event) {
                 *OPEN.lock().unwrap() = Some(first);
             }
         }
-        // Opened from Finder or the Dock while running: it plays, as a dropped file does.
-        Event::Open(paths) => {
-            if let Some(first) = paths.into_iter().next() {
-                *OPEN.lock().unwrap() = Some(first);
-            }
-        }
+        // Opened from Finder or the Dock while running: it plays, whatever is on screen.
+        Event::Open(paths) => OPEN_PLAY.lock().unwrap().extend(paths),
         Event::Char(c) => {
             // An open dialog takes typing before the search box, then the Settings window.
             if UI.with_borrow_mut(|ui| ui.dialog_char(c) || ui.preferences_char(c)) {
@@ -3621,7 +3648,7 @@ fn use_tool(app: &mut App, win: Window, item: ui::ToolItem) {
     }
 }
 
-/// Plays the DVD or Blu-ray in `path` (a drive, a folder, or a Blu-ray image).
+/// Plays the DVD or Blu-ray in `path` (a drive, a folder, or a disc image).
 fn open_disc(app: &mut App, path: &Path) {
     match disc::address(path) {
         Some(address) => {
@@ -3786,7 +3813,7 @@ fn on_key(win: Window, shared: &Shared, key: VIRTUAL_KEY, shift: bool, ctrl: boo
         VK_D if ctrl => Some(MenuAction::OpenDisc(None)),
         VK_N if ctrl => Some(MenuAction::OpenNetwork),
         VK_F if ctrl => Some(MenuAction::OpenFolder),
-        VK_P if ctrl => Some(MenuAction::Preferences(Category::Playback)),
+        VK_P | VK_OEM_COMMA if ctrl => Some(MenuAction::Preferences(Category::Playback)),
         VK_Q if ctrl => Some(MenuAction::Quit),
         VK_OEM_5 if ctrl && page == Page::Player => Some(MenuAction::HideUi),
         VK_M if ctrl => Some(MenuAction::MiniPlayer),

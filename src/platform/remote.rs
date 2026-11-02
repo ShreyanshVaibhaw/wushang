@@ -10,6 +10,7 @@
 //! - `frame <x> <y> <w> <h>`: moves and sizes the window (top-left points)
 //! - `menu <n>`: the menu bar's command `n` (1 = About ...), `open <path>`, `drop <path>`
 //! - `cancel`: closes the open file picker; `terminate`: quits as the Dock does
+//! - `menukey <code> <chars>`: a Command shortcut given to the menu bar alone
 //! - `track <secs>`: holds a menu open (AppKit's own loop); `appearance dark|light|system`
 
 use std::collections::VecDeque;
@@ -107,6 +108,21 @@ fn command(line: &str) -> Result<(), String> {
             for kind in [NSEventType::KeyDown, NSEventType::KeyUp] {
                 send(key_event(kind, mods, chars, code))?;
             }
+            Ok(())
+        }
+        // A Command shortcut offered to the menu bar alone, as when it gets the key first.
+        "menukey" => {
+            let chars = words.get(2).copied().unwrap_or("");
+            let event = key_event(
+                NSEventType::KeyDown,
+                NSEventModifierFlags::Command,
+                chars,
+                num(1)? as u16,
+            )
+            .ok_or("AppKit made no event")?;
+            let menu = app.mainMenu().ok_or("no menu bar")?;
+            let took = menu.performKeyEquivalent(&event);
+            eprintln!("remote: menu bar took {chars:?}: {took}");
             Ok(())
         }
         "move" => send(mouse(NSEventType::MouseMoved, num(1)?, num(2)?, 0)),

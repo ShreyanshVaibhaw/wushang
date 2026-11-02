@@ -751,7 +751,7 @@ pub fn main_menu(
         Converting::File(path) => Item::submenu("Convert", convert_menu(path)),
         Converting::Running => Item::new("Stop Converting", MenuAction::CancelConvert),
     };
-    // The optical drives, then a disc's files on disk or a Blu-ray image.
+    // The optical drives, then a disc's files on disk or a disc image.
     let mut discs: Vec<Item> = (crate::disc::drives().into_iter())
         .map(|d| {
             // Drives are /Volumes/<label>; the label is what Finder shows.
@@ -762,7 +762,7 @@ pub fn main_menu(
         })
         .collect();
     discs.push(Item::new("Disc Folder...", MenuAction::OpenDisc(None)).key("⌘D"));
-    discs.push(Item::new("Blu-ray Image...", MenuAction::OpenDiscImage));
+    discs.push(Item::new("Disc Image...", MenuAction::OpenDiscImage));
     let devices = devices
         .iter()
         .map(|d| {

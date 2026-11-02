@@ -125,7 +125,7 @@ const FG_BUTTON_OFF: u32 = 0x606060;
 /// The keys main.rs handles, for the Keyboard Shortcuts dialog.
 // ponytail: a copy of on_key and the menus' accelerators; one table both read would keep them
 // in step.
-const SHORTCUTS: [(&str, &str); 24] = [
+const SHORTCUTS: [(&str, &str); 25] = [
     ("Space", "Play or pause"),
     ("Left / Right", "Skip back or forward (Settings > Controls)"),
     ("⌥ / ⇧ / ⌘ + arrows", "Very short, medium or long skip"),
@@ -137,18 +137,16 @@ const SHORTCUTS: [(&str, &str); 24] = [
         "Esc",
         "Close a panel, leave fullscreen, or go to the library",
     ),
-    ("Backspace", "Back, in the library"),
+    ("Delete (⌫)", "Back, in the library"),
     ("S / P / N", "Stop, previous file, next file"),
     ("⇧S", "Snapshot, saved in Pictures/wushang"),
     ("R", "Record, saved in Movies/wushang; R again stops"),
     ("⌘O", "Open files"),
     ("⌘F", "Open a folder"),
     ("⌘N", "Open a network stream"),
-    (
-        "⌘R",
-        "Convert the open file to MP4, saved in Movies/wushang",
-    ),
-    ("⌘P", "Settings"),
+    ("⌘D", "Open a DVD or Blu-ray folder"),
+    ("⌘R", "Convert to MP4, saved in Movies/wushang"),
+    ("⌘P or ⌘,", "Settings"),
     ("⌘M", "Mini player, and back"),
     ("⌘I", "Properties of the file playing or pointed at"),
     ("⌘\\", "Hide the controls until the mouse moves"),
@@ -871,8 +869,24 @@ impl Painter {
                     b.footer(top, Some((Target::Cancel, "Later")), go, true)
                 }
             }
-            Dialog::Downloaded(zip) => {
-                let name = zip.file_name().unwrap_or_default().to_string_lossy();
+            Dialog::Downloaded(file) => {
+                let name = file.file_name().unwrap_or_default().to_string_lossy();
+                // update.rs saves the release's disk image, or its zip when it has none, and
+                // selects it in Finder.
+                let image = file
+                    .extension()
+                    .is_some_and(|e| e.eq_ignore_ascii_case("dmg"));
+                let (first, second) = if image {
+                    (
+                        "Open it, quit wushang, then drag wushang from it into",
+                        "Applications and choose Replace. Finder has it selected.",
+                    )
+                } else {
+                    (
+                        "Open it to unzip it, quit wushang, then drag the new wushang",
+                        "into Applications and choose Replace. Finder has it selected.",
+                    )
+                };
                 b.text(
                     format!("{name} is in Downloads"),
                     Style::Heading,
@@ -880,20 +894,8 @@ impl Painter {
                     87.0,
                     w - PAD,
                 );
-                b.text(
-                    "Close wushang, then copy the files in the zip over the ones in",
-                    Style::Help,
-                    PAD,
-                    117.0,
-                    w - PAD,
-                );
-                b.text(
-                    "wushang's folder. Finder has both open.",
-                    Style::Help,
-                    PAD,
-                    139.0,
-                    w - PAD,
-                );
+                b.text(first, Style::Help, PAD, 117.0, w - PAD);
+                b.text(second, Style::Help, PAD, 139.0, w - PAD);
                 b.footer(179.0, None, "Close", true)
             }
         };

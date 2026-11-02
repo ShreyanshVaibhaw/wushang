@@ -61,6 +61,8 @@ thread_local! {
     pub(super) static CLOSED: Cell<bool> = const { Cell::new(false) };
     /// The system is logging out or shutting down, which can't wait for wushang to save.
     static POWER_OFF: Cell<bool> = const { Cell::new(false) };
+    /// Whether the menu bar's commands are on; off while the window's own dialogs have the keys.
+    static MENU_ENABLED: Cell<bool> = const { Cell::new(true) };
     /// A pass runs from the timer inside AppKit's own loop, which mustn't be waited in.
     static IN_MODAL: Cell<bool> = const { Cell::new(false) };
     static MODAL_TIMER: OnceCell<Retained<NSTimer>> = const { OnceCell::new() };
@@ -81,7 +83,8 @@ define_class!(
             LAUNCHED.set(true);
         }
 
-        /// Finder's Open and Open With, files dropped on the Dock icon, `open -a wushang`.
+        /// Finder's Open and Open With, files dropped on the Dock icon, `open -a wushang`: they
+        /// play, and the window comes back if it was minimized.
         #[unsafe(method(application:openURLs:))]
         fn open_urls(&self, _: &NSApplication, urls: &NSArray<NSURL>) {
             let paths: Vec<PathBuf> = urls
@@ -95,6 +98,9 @@ define_class!(
                 })
                 .collect();
             if !paths.is_empty() {
+                if LAUNCHED.get() {
+                    window::deminiaturize();
+                }
                 dispatch(Event::Open(paths));
             }
         }
@@ -215,6 +221,13 @@ define_class!(
             }
         }
 
+        /// Greys out the menu bar's commands while a dialog, Settings, the welcome, Customize
+        /// or a menu of the window's own is open; Hide and Quit's neighbours stay AppKit's.
+        #[unsafe(method(validateMenuItem:))]
+        fn validate_menu_item(&self, item: &NSMenuItem) -> bool {
+            item.action() != Some(sel!(wushangMenu:)) || MENU_ENABLED.get()
+        }
+
         #[unsafe(method(willPowerOff:))]
         fn will_power_off(&self, _: &NSNotification) {
             POWER_OFF.set(true);
@@ -289,6 +302,11 @@ pub fn init() -> Vec<PathBuf> {
     #[cfg(debug_assertions)]
     super::remote::start();
     super::EARLY_OPEN.with_borrow_mut(std::mem::take)
+}
+
+/// Turns the menu bar's commands on or off; see `validateMenuItem:`.
+pub fn set_menu_enabled(on: bool) {
+    MENU_ENABLED.set(on);
 }
 
 /// Whether wushang was started hidden (`open -j`), which Windows' "Run: Minimized" stands for.
