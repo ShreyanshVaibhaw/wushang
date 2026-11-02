@@ -17,7 +17,6 @@ use crate::dsp::EQ_PRESETS;
 use crate::prefs::{self, Choices, Prefs};
 use crate::session::LANGUAGES;
 use panels::{ASPECT, STEREO};
-use windows::Win32::UI::Input::KeyboardAndMouse::*;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Category {
@@ -950,10 +949,10 @@ impl Builder<'_> {
                 self.section("Keyboard Shortcuts");
                 self.button("Keyboard shortcuts", "Show", Ctl::Shortcuts);
                 self.section("Skip Amounts");
-                self.choice("Very short skip (Alt + Left/Right)", Ctl::Skip(0));
+                self.choice("Very short skip (⌥ + Left/Right)", Ctl::Skip(0));
                 self.choice("Short skip (Left/Right)", Ctl::Skip(1));
-                self.choice("Medium skip (Shift + Left/Right)", Ctl::Skip(2));
-                self.choice("Long skip (Ctrl + Left/Right)", Ctl::Skip(3));
+                self.choice("Medium skip (⇧ + Left/Right)", Ctl::Skip(2));
+                self.choice("Long skip (⌘ + Left/Right)", Ctl::Skip(3));
                 self.section("Mouse");
                 self.choice("Single click on the video", Ctl::Click);
                 self.choice("Double click on the video", Ctl::DoubleClick);

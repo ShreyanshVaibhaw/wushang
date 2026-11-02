@@ -1,8 +1,11 @@
-//! Converting, VLC's "Convert": a file re-encoded into an MP4 (H.264 and AAC) or an MP3 with
-//! Windows' own Media Foundation encoders, so the FFmpeg build carries no encoder library and
-//! stays LGPL. A job runs on a thread of its own, reports how far it got, and can be cancelled;
-//! a job that doesn't finish leaves no file behind.
+//! Converting, VLC's "Convert": a file re-encoded into an MP4 (H.264 and AAC) or an MP3. H.264
+//! and AAC come from macOS's own encoders (VideoToolbox, AudioToolbox), so no encoder library is
+//! needed for them; FFmpeg's software ones stand in where those are missing. MP3 needs LAME,
+//! which Homebrew's FFmpeg has; without it the sound goes into an M4A instead. A job runs on a
+//! thread of its own, reports how far it got, and can be cancelled; a job that doesn't finish
+//! leaves no file behind.
 
+use std::ffi::c_void;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::Ordering::Relaxed;
@@ -20,15 +23,39 @@ use ffmpeg_next as ff;
 pub enum Target {
     /// H.264 video and AAC audio in MP4.
     Mp4,
-    /// The sound alone, in MP3.
+    /// The sound alone, in MP3 (AAC in M4A with an FFmpeg that has no LAME).
     Mp3,
 }
 
+/// The encoders tried for each stream, best first: macOS's own, then FFmpeg's.
+const H264: [&str; 2] = ["h264_videotoolbox", "libx264"];
+const AAC: [&str; 2] = ["aac_at", "aac"];
+const MP3: &str = "libmp3lame";
+
 impl Target {
+    /// The output's file extension, which also names its muxer.
     pub fn extension(self) -> &'static str {
         match self {
             Target::Mp4 => "mp4",
-            Target::Mp3 => "mp3",
+            Target::Mp3 if encoder::find_by_name(MP3).is_some() => "mp3",
+            Target::Mp3 => "m4a",
+        }
+    }
+
+    /// The FFmpeg muxer for the output.
+    fn muxer(self) -> &'static str {
+        match self.extension() {
+            // FFmpeg's name for the M4A flavour of MP4.
+            "m4a" => "ipod",
+            ext => ext,
+        }
+    }
+
+    /// The sound encoders to try.
+    fn audio_encoders(self) -> &'static [&'static str] {
+        match self.extension() {
+            "mp3" => &[MP3],
+            _ => &AAC,
         }
     }
 }
@@ -50,13 +77,6 @@ impl Job {
         let (input, out) = (input.to_owned(), output.clone());
         let (p, c) = (progress.clone(), cancel.clone());
         thread::spawn(move || {
-            // Media Foundation's encoders are COM objects.
-            unsafe {
-                _ = windows::Win32::System::Com::CoInitializeEx(
-                    None,
-                    windows::Win32::System::Com::COINIT_MULTITHREADED,
-                )
-            };
             let result = run(&input, target, &out, &p, &c);
             if result.is_err() {
                 _ = std::fs::remove_file(&out);
@@ -102,7 +122,7 @@ fn run(
         return Err("wushang can't write a file whose name isn't valid Unicode".into());
     };
     let mut ictx = crate::session::open_file(input)?;
-    let mut octx = ff::format::output_as(output, target.extension())
+    let mut octx = ff::format::output_as(output, target.muxer())
         .map_err(|e| format!("can't write {output}: {e}"))?;
     let global_header = octx
         .format()
@@ -134,15 +154,11 @@ fn run(
         )?),
         None => None,
     };
-    let codec_name = match target {
-        Target::Mp4 => "aac_mf",
-        Target::Mp3 => "mp3_mf",
-    };
     let mut audio = match audio_stream {
         Some(i) => Some(AudioPath::new(
             &ictx.stream(i).unwrap(),
             &mut octx,
-            codec_name,
+            target.audio_encoders(),
             global_header,
         )?),
         None => None,
@@ -157,7 +173,7 @@ fn run(
         );
     }
     let mut options = ff::Dictionary::new();
-    if target == Target::Mp4 {
+    if target.extension() != "mp3" {
         // The index up front, so the file starts playing before it has all arrived.
         options.set("movflags", "+faststart");
     }
@@ -214,8 +230,16 @@ fn open_decoder(stream: &ff::Stream) -> Result<codec::Context, String> {
     Ok(ctx)
 }
 
-fn find_encoder(name: &str) -> Result<ff::Codec, String> {
-    encoder::find_by_name(name).ok_or_else(|| format!("this FFmpeg has no {name} encoder"))
+/// The encoders of `names` this FFmpeg has, in order, or why there are none.
+fn encoders(names: &[&str]) -> Result<Vec<ff::Codec>, String> {
+    let found: Vec<ff::Codec> = names
+        .iter()
+        .filter_map(|n| encoder::find_by_name(n))
+        .collect();
+    if found.is_empty() {
+        return Err(format!("this FFmpeg has no {} encoder", names.join(" or ")));
+    }
+    Ok(found)
 }
 
 /// Sends what `encoder` has ready to the muxer as `out`'s packets.
@@ -262,13 +286,6 @@ impl VideoPath {
             .decoder()
             .video()
             .map_err(|e| format!("can't decode the video: {e}"))?;
-        let codec = find_encoder("h264_mf")?;
-        let mut ost = octx.add_stream(codec).map_err(|e| e.to_string())?;
-        let out = ost.index();
-        let mut enc = codec::Context::new_with_codec(codec)
-            .encoder()
-            .video()
-            .map_err(|e| e.to_string())?;
         // H.264 in 4:2:0 wants even sides.
         let size = (decoder.width() & !1, decoder.height() & !1);
         let rate = stream.avg_frame_rate();
@@ -277,20 +294,43 @@ impl VideoPath {
         } else {
             ff::Rational(30, 1)
         };
-        enc.set_width(size.0);
-        enc.set_height(size.1);
-        enc.set_format(Pixel::NV12);
-        enc.set_aspect_ratio(decoder.aspect_ratio());
-        enc.set_frame_rate(Some(rate));
-        enc.set_time_base(rate.invert());
         let bits = f64::from(size.0 * size.1) * f64::from(rate) * VIDEO_BITS_PER_PIXEL;
-        enc.set_bit_rate(bits.clamp(500e3, 40e6) as usize);
-        if global_header {
-            enc.set_flags(codec::Flags::GLOBAL_HEADER);
+        // A hardware encoder can be there and still not start (no such hardware in a virtual
+        // machine), so each is tried in turn.
+        let mut last = String::new();
+        let mut opened = None;
+        for codec in encoders(&H264)? {
+            let mut enc = codec::Context::new_with_codec(codec)
+                .encoder()
+                .video()
+                .map_err(|e| e.to_string())?;
+            enc.set_width(size.0);
+            enc.set_height(size.1);
+            enc.set_format(Pixel::NV12);
+            enc.set_aspect_ratio(decoder.aspect_ratio());
+            enc.set_frame_rate(Some(rate));
+            enc.set_time_base(rate.invert());
+            enc.set_bit_rate(bits.clamp(500e3, 40e6) as usize);
+            if global_header {
+                enc.set_flags(codec::Flags::GLOBAL_HEADER);
+            }
+            let mut options = ff::Dictionary::new();
+            // VideoToolbox: the software encoder when the GPU has none; x264: quick enough to
+            // run beside playback.
+            options.set("allow_sw", "1");
+            options.set("preset", "fast");
+            match enc.open_as_with(codec, options) {
+                Ok(encoder) => {
+                    opened = Some((codec, encoder));
+                    break;
+                }
+                Err(e) => last = e.to_string(),
+            }
         }
-        let encoder = enc
-            .open_as(codec)
-            .map_err(|e| format!("can't start the H.264 encoder: {e}"))?;
+        let (codec, encoder) =
+            opened.ok_or_else(|| format!("can't start the H.264 encoder: {last}"))?;
+        let mut ost = octx.add_stream(codec).map_err(|e| e.to_string())?;
+        let out = ost.index();
         ost.set_parameters(&encoder);
         Ok(VideoPath {
             index: stream.index(),
@@ -372,36 +412,42 @@ struct AudioPath {
     resampler: Option<software::resampling::Context>,
     rate: u32,
     layout: ff::ChannelLayout,
-    channels: usize,
+    /// The encoder's sample format: packed 16-bit for AudioToolbox, planar for LAME and FFmpeg.
+    format: ff::format::Sample,
     /// Samples per encoder frame.
     frame_size: usize,
-    /// Interleaved 16-bit samples waiting to fill a frame.
-    pending: Vec<i16>,
+    /// Converted samples waiting to fill a frame.
+    pending: Fifo,
     /// The next frame's first sample, counted from the start.
     next: i64,
     out: usize,
     out_base: ff::Rational,
 }
 
+/// An AVAudioFifo: samples in the encoder's format, packed or planar, cut into its frames.
+struct Fifo(*mut ff::ffi::AVAudioFifo);
+
+impl Drop for Fifo {
+    fn drop(&mut self) {
+        unsafe { ff::ffi::av_audio_fifo_free(self.0) };
+    }
+}
+
+// The FIFO is only used by the conversion thread that owns its AudioPath.
+unsafe impl Send for Fifo {}
+
 impl AudioPath {
     fn new(
         stream: &ff::Stream,
         octx: &mut ff::format::context::Output,
-        codec_name: &str,
+        names: &[&str],
         global_header: bool,
     ) -> Result<AudioPath, String> {
         let decoder = open_decoder(stream)?
             .decoder()
             .audio()
             .map_err(|e| format!("can't decode the sound: {e}"))?;
-        let codec = find_encoder(codec_name)?;
-        let mut ost = octx.add_stream(codec).map_err(|e| e.to_string())?;
-        let out = ost.index();
-        let mut enc = codec::Context::new_with_codec(codec)
-            .encoder()
-            .audio()
-            .map_err(|e| e.to_string())?;
-        // Media Foundation's AAC and MP3 encoders take 44.1 or 48 kHz, in mono or stereo.
+        // 44.1 or 48 kHz, in mono or stereo, which every AAC and MP3 encoder takes.
         let rate = if decoder.rate() == 44_100 {
             44_100
         } else {
@@ -409,22 +455,47 @@ impl AudioPath {
         };
         let channels = decoder.channels().clamp(1, 2) as usize;
         let layout = ff::ChannelLayout::default(channels as i32);
-        enc.set_rate(rate as i32);
-        enc.set_channel_layout(layout);
-        enc.set_format(ff::format::Sample::I16(ff::format::sample::Type::Packed));
-        enc.set_bit_rate(AUDIO_BIT_RATE);
-        enc.set_time_base(ff::Rational(1, rate as i32));
-        if global_header {
-            enc.set_flags(codec::Flags::GLOBAL_HEADER);
+        let mut last = String::new();
+        let mut opened = None;
+        for codec in encoders(names)? {
+            // The encoder's own first choice of sample format.
+            let format = (codec.audio().ok())
+                .and_then(|a| a.formats()?.next())
+                .unwrap_or(ff::format::Sample::I16(ff::format::sample::Type::Packed));
+            let mut enc = codec::Context::new_with_codec(codec)
+                .encoder()
+                .audio()
+                .map_err(|e| e.to_string())?;
+            enc.set_rate(rate as i32);
+            enc.set_channel_layout(layout);
+            enc.set_format(format);
+            enc.set_bit_rate(AUDIO_BIT_RATE);
+            enc.set_time_base(ff::Rational(1, rate as i32));
+            if global_header {
+                enc.set_flags(codec::Flags::GLOBAL_HEADER);
+            }
+            match enc.open_as(codec) {
+                Ok(encoder) => {
+                    opened = Some((codec, format, encoder));
+                    break;
+                }
+                Err(e) => last = format!("can't start the {} encoder: {e}", codec.name()),
+            }
         }
-        let encoder = enc
-            .open_as(codec)
-            .map_err(|e| format!("can't start the {codec_name} encoder: {e}"))?;
+        let (codec, format, encoder) = opened.ok_or(last)?;
+        let mut ost = octx.add_stream(codec).map_err(|e| e.to_string())?;
+        let out = ost.index();
         ost.set_parameters(&encoder);
         let frame_size = match encoder.frame_size() {
             0 => 1152,
             n => n as usize,
         };
+        let fifo = unsafe {
+            ff::ffi::av_audio_fifo_alloc(format.into(), channels as i32, frame_size as i32)
+        };
+        if fifo.is_null() {
+            return Err("out of memory".into());
+        }
         Ok(AudioPath {
             index: stream.index(),
             decoder,
@@ -432,9 +503,9 @@ impl AudioPath {
             resampler: None,
             rate,
             layout,
-            channels,
+            format,
             frame_size,
-            pending: Vec::new(),
+            pending: Fifo(fifo),
             next: 0,
             out,
             out_base: ff::Rational(1, 1),
@@ -458,7 +529,7 @@ impl AudioPath {
                     decoded.format(),
                     decoded.channel_layout(),
                     decoded.rate(),
-                    ff::format::Sample::I16(ff::format::sample::Type::Packed),
+                    self.format,
                     self.layout,
                     self.rate,
                 )
@@ -471,15 +542,14 @@ impl AudioPath {
                 .unwrap()
                 .run(&decoded, &mut converted)
                 .map_err(|e| format!("can't convert the sound: {e}"))?;
-            let n = converted.samples() * self.channels;
-            let bytes = &converted.data(0)[..n * 2];
-            self.pending.extend(
-                bytes
-                    .as_chunks::<2>()
-                    .0
-                    .iter()
-                    .map(|b| i16::from_ne_bytes(*b)),
-            );
+            let samples = converted.samples() as i32;
+            let written = unsafe {
+                let data = (*converted.as_ptr()).extended_data as *const *mut c_void;
+                ff::ffi::av_audio_fifo_write(self.pending.0, data, samples)
+            };
+            if written < samples {
+                return Err("out of memory".into());
+            }
             self.send_full_frames(octx, false)?;
         }
         Ok(())
@@ -491,26 +561,26 @@ impl AudioPath {
         octx: &mut ff::format::context::Output,
         last: bool,
     ) -> Result<(), String> {
-        let whole = self.frame_size * self.channels;
-        if last && !self.pending.is_empty() {
-            let padded = self.pending.len().div_ceil(whole) * whole;
-            self.pending.resize(padded, 0);
-        }
-        while self.pending.len() >= whole {
-            let mut f = frame::Audio::new(
-                ff::format::Sample::I16(ff::format::sample::Type::Packed),
-                self.frame_size,
-                self.layout,
-            );
+        loop {
+            let pending = unsafe { ff::ffi::av_audio_fifo_size(self.pending.0) } as usize;
+            if pending == 0 || (pending < self.frame_size && !last) {
+                return Ok(());
+            }
+            let mut f = frame::Audio::new(self.format, self.frame_size, self.layout);
             f.set_rate(self.rate);
             f.set_pts(Some(self.next));
-            for (dst, src) in f.data_mut(0)[..whole * 2]
-                .as_chunks_mut::<2>()
-                .0
-                .iter_mut()
-                .zip(self.pending.drain(..whole))
-            {
-                *dst = src.to_ne_bytes();
+            unsafe {
+                let data = (*f.as_mut_ptr()).extended_data;
+                let channels = self.layout.channels();
+                ff::ffi::av_samples_set_silence(
+                    data,
+                    0,
+                    self.frame_size as i32,
+                    channels,
+                    self.format.into(),
+                );
+                let size = self.frame_size as i32;
+                ff::ffi::av_audio_fifo_read(self.pending.0, data as *const *mut c_void, size);
             }
             self.next += self.frame_size as i64;
             self.encoder
@@ -519,7 +589,6 @@ impl AudioPath {
             let base = ff::Rational(1, self.rate as i32);
             drain(&mut self.encoder, base, self.out, self.out_base, octx)?;
         }
-        Ok(())
     }
 
     fn finish(&mut self, octx: &mut ff::format::context::Output) -> Result<(), String> {
@@ -574,7 +643,15 @@ mod tests {
             .streams()
             .map(|s| s.parameters().id().name())
             .collect();
-        assert_eq!(names, ["mp3"]);
+        let sound = if Target::Mp3.extension() == "mp3" {
+            "mp3"
+        } else {
+            "aac"
+        };
+        assert_eq!(names, [sound]);
+        // Five seconds and more of the six-second clip's sound came through.
+        let seconds = input.duration() as f64 / f64::from(ff::ffi::AV_TIME_BASE);
+        assert!((5.5..6.5).contains(&seconds), "{seconds} s");
         drop(input);
         std::fs::remove_file(&mp3).unwrap();
     }

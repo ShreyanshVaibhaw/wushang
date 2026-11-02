@@ -747,7 +747,7 @@ pub fn main_menu(
 ) -> Vec<Item> {
     // A submenu row has its arrow where the shortcut would go.
     let convert = match converting {
-        Converting::Nothing => Item::off("Convert").key("Ctrl + R"),
+        Converting::Nothing => Item::off("Convert").key("⌘R"),
         Converting::File(path) => Item::submenu("Convert", convert_menu(path)),
         Converting::Running => Item::new("Stop Converting", MenuAction::CancelConvert),
     };
@@ -760,7 +760,7 @@ pub fn main_menu(
             )
         })
         .collect();
-    discs.push(Item::new("Disc Folder...", MenuAction::OpenDisc(None)).key("Ctrl + D"));
+    discs.push(Item::new("Disc Folder...", MenuAction::OpenDisc(None)).key("⌘D"));
     discs.push(Item::new("Blu-ray Image...", MenuAction::OpenDiscImage));
     let devices = devices
         .iter()
@@ -786,13 +786,13 @@ pub fn main_menu(
     vec![
         Item::new("Open File(s)", MenuAction::OpenFiles)
             .icon(Icon::OpenFile)
-            .key("Ctrl + O"),
+            .key("⌘O"),
         Item::new("Open Folder", MenuAction::OpenFolder)
             .icon(Icon::Folder)
-            .key("Ctrl + F"),
+            .key("⌘F"),
         Item::new("Open Network Stream", MenuAction::OpenNetwork)
             .icon(Icon::Network)
-            .key("Ctrl + N"),
+            .key("⌘N"),
         Item::submenu("Open Disc", discs).icon(Icon::Disc),
         Item::submenu("Open Capture Device", devices).icon(Icon::Capture),
         convert.icon(Icon::Convert),
@@ -806,10 +806,10 @@ pub fn main_menu(
             MenuAction::Preferences(crate::ui::Category::Playback),
         )
         .icon(Icon::Settings)
-        .key("Ctrl + P"),
+        .key("⌘P"),
         Item::new("About wushang", MenuAction::ShowAbout)
             .icon(Icon::Info)
-            .key("Shift + F1"),
+            .key("⇧F1"),
     ]
 }
 
@@ -883,7 +883,7 @@ pub fn player_menu(d: &PanelData, paused: bool) -> Vec<Item> {
             "Video Track",
             tracks(TrackTab::Video, &d.video_tracks, d.video_selected),
         ),
-        Item::new("Take Snapshot", MenuAction::Snapshot).key("Shift + S"),
+        Item::new("Take Snapshot", MenuAction::Snapshot).key("⇧S"),
         Item::divider(),
         flip(1, "Flip Horizontally"),
         flip(2, "Flip Vertically"),
@@ -953,10 +953,10 @@ pub fn player_menu(d: &PanelData, paused: bool) -> Vec<Item> {
     let open = vec![
         Item::new("Open File(s)", MenuAction::OpenFiles)
             .icon(Icon::OpenFile)
-            .key("Ctrl + O"),
+            .key("⌘O"),
         Item::new("Open Folder", MenuAction::OpenFolder)
             .icon(Icon::Folder)
-            .key("Ctrl + F"),
+            .key("⌘F"),
     ];
 
     vec![
@@ -1005,10 +1005,10 @@ pub fn player_menu(d: &PanelData, paused: bool) -> Vec<Item> {
         Item::divider(),
         Item::new("Hide UI", MenuAction::HideUi)
             .icon(Icon::HideUi)
-            .key("Ctrl + \\"),
+            .key("⌘\\"),
         Item::new("Mini Player", MenuAction::MiniPlayer)
             .icon(Icon::Mini)
-            .key("Ctrl + M"),
+            .key("⌘M"),
         // Here too, since Customize Player can take the "..." button out of the bars.
         Item::new("Customize Player", MenuAction::CustomizePlayer).icon(Icon::Brush),
         Item::divider(),
@@ -1022,7 +1022,7 @@ pub fn player_menu(d: &PanelData, paused: bool) -> Vec<Item> {
         Item::divider(),
         Item::new("Quit wushang", MenuAction::Quit)
             .icon(Icon::Quit)
-            .key("Ctrl + Q"),
+            .key("⌘Q"),
     ]
 }
 
@@ -1129,7 +1129,7 @@ fn file_menu(path: &Path, playlists: &[String], within: Option<&str>) -> Vec<Ite
         Item::new("Add to Queue", MenuAction::AddToQueue(one())).icon(Icon::Queue),
         Item::submenu("Add to Playlist", add).icon(Icon::Playlist),
         Item::new(
-            "Show in File Explorer",
+            "Show in Finder",
             MenuAction::ShowInExplorer(path.to_owned()),
         )
         .icon(Icon::Folder),

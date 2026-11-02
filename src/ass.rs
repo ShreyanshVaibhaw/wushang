@@ -1,17 +1,13 @@
 //! ASS and SSA subtitles drawn by libass, as VLC and mpv draw them: positions, styles, fonts,
-//! colours, borders, rotation, karaoke and animation. libass ships as one DLL beside wushang.exe
-//! (`scripts/build-libass.sh`), loaded at run time; without it, ASS falls back to the plain text
-//! `subs.rs` makes of every format.
+//! colours, borders, rotation, karaoke and animation. libass ships in wushang.app's Frameworks
+//! folder (`scripts/bundle-macos.sh`), or comes from Homebrew for `cargo run`, and is loaded at
+//! run time; without it, ASS falls back to the plain text `subs.rs` makes of every format.
 //!
 //! A [`Track`] renders at the video's own size into one picture of what is on screen, which
 //! `subs::Cues` hands the caption painter like a DVD or Blu-ray subtitle.
 
 use std::ffi::{CString, c_char, c_int, c_longlong, c_void};
 use std::sync::{Arc, Mutex, OnceLock};
-
-use windows::Win32::Foundation::HMODULE;
-use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
-use windows::core::{PCSTR, w};
 
 use crate::subs::BitmapRect;
 
@@ -31,7 +27,7 @@ struct Image {
 
 type MessageCb = unsafe extern "C" fn(c_int, *const c_char, *mut c_void, *mut c_void);
 
-/// The libass functions wushang calls, from the DLL.
+/// The libass functions wushang calls, from the dylib.
 struct Api {
     library_init: unsafe extern "C" fn() -> *mut c_void,
     library_done: unsafe extern "C" fn(*mut c_void),
@@ -59,7 +55,7 @@ struct Api {
         unsafe extern "C" fn(*mut c_void, *mut c_char, usize, *const c_char) -> *mut c_void,
 }
 
-/// The loaded DLL, and the ASS_Library new tracks are made from, which holds the fonts the
+/// The loaded dylib, and the ASS_Library new tracks are made from, which holds the fonts the
 /// playing file brings along.
 struct Lib {
     api: Api,
@@ -95,17 +91,40 @@ impl Drop for Library {
 unsafe impl Send for Library {}
 unsafe impl Sync for Library {}
 
-/// FontProvider ASS_FONTPROVIDER_AUTODETECT: DirectWrite on Windows.
+/// FontProvider ASS_FONTPROVIDER_AUTODETECT: Core Text on macOS, so libass finds the fonts the
+/// system and the user have installed.
 const AUTODETECT: c_int = 1;
 
-/// libass, or None when its DLL isn't there.
+/// Where libass is looked for, in order: the app bundle's own copy, then Homebrew's (Apple
+/// Silicon, then Intel). Only full paths, so no library planted in the current folder can stand
+/// in for them.
+fn candidates() -> Vec<std::path::PathBuf> {
+    const NAME: &str = "libass.9.dylib";
+    let mut paths = Vec::new();
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(dir) = exe.parent()
+    {
+        paths.push(dir.join("../Frameworks").join(NAME));
+    }
+    for dir in ["/opt/homebrew/lib", "/usr/local/lib"] {
+        paths.push(std::path::Path::new(dir).join(NAME));
+    }
+    paths
+}
+
+/// libass, or None when its dylib isn't there.
 fn lib() -> Option<&'static Lib> {
     static LIB: OnceLock<Option<Lib>> = OnceLock::new();
     LIB.get_or_init(|| unsafe {
-        let module = LoadLibraryW(w!("libass-9.dll")).ok()?;
+        let module = candidates()
+            .into_iter()
+            .filter(|p| p.is_file())
+            .find_map(|p| libloading::Library::new(p).ok())?;
+        // Kept loaded for the life of the process: the function pointers below point into it.
+        let module: &'static libloading::Library = Box::leak(Box::new(module));
         macro_rules! load {
             ($name:literal) => {
-                symbol(module, concat!($name, "\0"))?
+                *module.get(concat!($name, "\0").as_bytes()).ok()?
             };
         }
         let api = Api {
@@ -132,13 +151,6 @@ fn lib() -> Option<&'static Lib> {
         })
     })
     .as_ref()
-}
-
-/// The function `name` (NUL-terminated) of `module`, as the function pointer type `F`.
-unsafe fn symbol<F: Copy>(module: HMODULE, name: &str) -> Option<F> {
-    let f = unsafe { GetProcAddress(module, PCSTR(name.as_ptr()))? };
-    // Every `F` here is an `unsafe extern "C" fn`, the size of the pointer GetProcAddress gives.
-    Some(unsafe { std::mem::transmute_copy::<_, F>(&f) })
 }
 
 pub fn available() -> bool {
@@ -416,7 +428,7 @@ mod tests {
     fn renders_positions_colours_and_timing() {
         assert!(
             available(),
-            "libass-9.dll should sit next to the test binary"
+            "libass should be installed (brew install libass)"
         );
         let file =
             std::fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/testdata/styled.ass")).unwrap();
@@ -465,7 +477,7 @@ mod tests {
     }
 
     /// A file's fonts serve its tracks, and are gone for the tracks of the file after it. Inter,
-    /// which wushang bundles and Windows doesn't have, stands in for an attached font.
+    /// which wushang bundles and macOS doesn't have, stands in for an attached font.
     #[test]
     fn a_files_fonts_go_with_it() {
         let header = b"[Script Info]\nPlayResX: 640\nPlayResY: 360\n\n[V4+ Styles]\n\

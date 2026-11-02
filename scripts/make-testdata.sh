@@ -4,7 +4,7 @@
 # test_subs.mkv, tracks.srt) are committed instead.
 #
 # Needs an ffmpeg with libx264, libx265, libvpx-vp9, libsvtav1 and libopus (a GPL build, e.g.
-# `winget install yt-dlp.FFmpeg`). Set FFMPEG to its path if it isn't on PATH.
+# Homebrew's `brew install ffmpeg`). Set FFMPEG to its path if it isn't on PATH.
 #
 #   bash scripts/make-testdata.sh
 set -euo pipefail
@@ -17,11 +17,13 @@ clip() { "$ff" -v error -y "$@"; }
 pattern() { echo "-f lavfi -i $1=size=1920x1080:rate=30:duration=$2"; }
 tone() { echo "-f lavfi -i sine=frequency=440:duration=$1:sample_rate=$2"; }
 
-# 44.1 kHz audio on purpose: it exercises resampling to the device's 48 kHz.
+# 44.1 kHz audio on purpose: it exercises resampling to the device's 48 kHz. The minute-long
+# clips have a keyframe every 2 s, which seeking and streaming tests count on.
 clip $(pattern testsrc 6) $(tone 6 44100) -c:v libx264 -preset veryfast -pix_fmt yuv420p -c:a aac -shortest "$out/test_h264.mp4"
-clip $(pattern testsrc2 60) $(tone 60 44100) -c:v libx264 -preset veryfast -pix_fmt yuv420p -c:a aac -shortest "$out/test_60s.mp4"
-clip $(pattern testsrc2 60) -c:v libx264 -preset veryfast -pix_fmt yuv420p "$out/test_60s_noaudio.mp4"
+clip $(pattern testsrc2 60) $(tone 60 44100) -c:v libx264 -preset veryfast -g 60 -pix_fmt yuv420p -c:a aac -shortest "$out/test_60s.mp4"
+clip $(pattern testsrc2 60) -c:v libx264 -preset veryfast -g 60 -pix_fmt yuv420p "$out/test_60s_noaudio.mp4"
 clip $(pattern testsrc 6) $(tone 6 48000) -c:v libx265 -preset veryfast -pix_fmt yuv420p -c:a libopus -shortest "$out/test_hevc.mkv"
 clip $(pattern testsrc 6) $(tone 6 48000) -c:v libvpx-vp9 -deadline realtime -cpu-used 8 -b:v 2M -pix_fmt yuv420p -c:a libopus -shortest "$out/test_vp9.webm"
-clip $(pattern testsrc 6) $(tone 6 48000) -c:v libsvtav1 -preset 11 -svtav1-params log-level=0 -pix_fmt yuv420p -c:a libopus -shortest "$out/test_av1.mkv"
+# SVT-AV1 4 ignores log-level for its banner; SVT_LOG=1 keeps only errors.
+SVT_LOG=1 clip $(pattern testsrc 6) $(tone 6 48000) -c:v libsvtav1 -preset 11 -svtav1-params log-level=0 -pix_fmt yuv420p -c:a libopus -shortest "$out/test_av1.mkv"
 echo "testdata ready in $out"

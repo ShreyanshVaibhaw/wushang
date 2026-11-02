@@ -662,13 +662,13 @@ mod tests {
     #[test]
     fn sort_by_name_is_natural_and_keeps_the_current_item() {
         let mut q = Queue::new(
-            paths(&[r"x\E10.mkv", r"y\e2.mkv", r"x\E1.mkv"]),
-            Some(Path::new(r"y\e2.mkv")),
+            paths(&["x/E10.mkv", "y/e2.mkv", "x/E1.mkv"]),
+            Some(Path::new("y/e2.mkv")),
         );
         q.sort_by_name();
-        assert_eq!(names(&q), [r"x\E1.mkv", r"y\e2.mkv", r"x\E10.mkv"]);
+        assert_eq!(names(&q), ["x/E1.mkv", "y/e2.mkv", "x/E10.mkv"]);
         assert_eq!(q.current(), Some(1));
-        assert_eq!(name(q.next()).as_deref(), Some(r"x\E10.mkv"));
+        assert_eq!(name(q.next()).as_deref(), Some("x/E10.mkv"));
     }
 
     #[test]

@@ -1,12 +1,7 @@
 //! Paints subtitle cues over the video with Direct2D: outlined text stacked up from the bottom of
 //! the picture, and bitmap subtitles scaled from the canvas they were authored on.
 
-use windows::Win32::Graphics::Direct2D::Common::*;
-use windows::Win32::Graphics::Direct2D::*;
-use windows::Win32::Graphics::DirectWrite::*;
-use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
-use windows::core::{HSTRING, Result, w};
-use windows_numerics::{Matrix3x2, Vector2};
+use crate::d2d::*;
 
 use crate::subs::{Cue, CueContent, Span};
 
@@ -259,7 +254,7 @@ impl CaptionRenderer {
         let format = unsafe {
             let format = dwrite.CreateTextFormat(
                 &HSTRING::from(family),
-                // The embedded collection only has Inter; other families are Windows' own.
+                // The embedded collection only has Inter; other families are the system's own.
                 (self.fonts.as_ref())
                     .filter(|_| family == "Inter")
                     .map(|f| -> &IDWriteFontCollection { f }),
@@ -391,13 +386,6 @@ mod tests {
     use super::*;
     use crate::subs::BitmapRect;
     use std::sync::Arc;
-    use windows::Win32::Foundation::HMODULE;
-    use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_WARP;
-    use windows::Win32::Graphics::Direct3D11::{
-        D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_SDK_VERSION, D3D11CreateDevice, ID3D11Device,
-    };
-    use windows::Win32::Graphics::Dxgi::IDXGIDevice;
-    use windows::core::Interface;
 
     const W: u32 = 1280;
     const H: u32 = 720;
@@ -436,55 +424,17 @@ mod tests {
         }
     }
 
-    /// Renders `cues` over a flat frame on a WARP device and returns the BGRA pixels.
+    /// Renders `cues` over a flat frame into a bitmap context and returns the BGRA pixels.
     fn render(cues: &[Cue]) -> Vec<u8> {
         unsafe {
-            let mut device: Option<ID3D11Device> = None;
-            D3D11CreateDevice(
-                None,
-                D3D_DRIVER_TYPE_WARP,
-                HMODULE::default(),
-                D3D11_CREATE_DEVICE_BGRA_SUPPORT,
-                None,
-                D3D11_SDK_VERSION,
-                Some(&mut device),
-                None,
-                None,
-            )
-            .unwrap();
-            let dxgi: IDXGIDevice = device.unwrap().cast().unwrap();
-            let factory: ID2D1Factory1 =
-                D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, None).unwrap();
-            let ctx: ID2D1DeviceContext5 = factory
-                .CreateDevice(&dxgi)
-                .unwrap()
-                .CreateDeviceContext(D2D1_DEVICE_CONTEXT_OPTIONS_NONE)
-                .unwrap()
-                .cast()
-                .unwrap();
+            let canvas = Canvas::new(W, H).unwrap();
+            let ctx = ID2D1DeviceContext5::new();
             ctx.SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
-            let props = |options| D2D1_BITMAP_PROPERTIES1 {
-                pixelFormat: D2D1_PIXEL_FORMAT {
-                    format: DXGI_FORMAT_B8G8R8A8_UNORM,
-                    alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED,
-                },
-                dpiX: 96.0,
-                dpiY: 96.0,
-                bitmapOptions: options,
-                colorContext: std::mem::ManuallyDrop::new(None),
-            };
-            let size = D2D_SIZE_U {
-                width: W,
-                height: H,
-            };
-            let target = ctx
-                .CreateBitmap(size, None, 0, &props(D2D1_BITMAP_OPTIONS_TARGET))
-                .unwrap();
             let dwrite: IDWriteFactory6 = DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED).unwrap();
             let fonts = inter(&dwrite);
             let mut captions = CaptionRenderer::new(&ctx, &dwrite, Some(&fonts)).unwrap();
 
-            ctx.SetTarget(&target);
+            ctx.begin(&canvas.cg, (W, H), 1.0);
             ctx.BeginDraw();
             ctx.Clear(Some(&color(BACKGROUND)));
             let video = (0.0, 0.0, W as f32, H as f32);
@@ -496,28 +446,9 @@ mod tests {
                 .draw(&ctx, video, cues, &CaptionStyle::default())
                 .unwrap();
             ctx.EndDraw(None, None).unwrap();
+            ctx.end();
             assert_eq!((captions.layouts.len(), captions.bitmaps.len()), (2, 1));
-
-            let readback = ctx
-                .CreateBitmap(
-                    size,
-                    None,
-                    0,
-                    &props(D2D1_BITMAP_OPTIONS_CPU_READ | D2D1_BITMAP_OPTIONS_CANNOT_DRAW),
-                )
-                .unwrap();
-            readback.CopyFromBitmap(None, &target, None).unwrap();
-            let mapped = readback.Map(D2D1_MAP_OPTIONS_READ).unwrap();
-            let mut pixels = Vec::with_capacity((W * H * 4) as usize);
-            for y in 0..H as usize {
-                let row = std::slice::from_raw_parts(
-                    mapped.bits.add(y * mapped.pitch as usize),
-                    W as usize * 4,
-                );
-                pixels.extend_from_slice(row);
-            }
-            readback.Unmap().unwrap();
-            pixels
+            canvas.pixels()
         }
     }
 

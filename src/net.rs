@@ -10,16 +10,13 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 use std::thread;
 use std::time::Duration;
 
-use windows::Win32::Networking::WinHttp::*;
-use windows::core::{HSTRING, PCWSTR};
-
 /// Where the radio directory comes from: the community run Radio Browser, no key needed.
 const RADIO_DIRECTORY: &str = "https://de1.api.radio-browser.info/xml/stations/topvote/100";
 /// Feeds and directories bigger than this are not worth parsing.
 const MAX_FETCH: usize = 4 << 20;
 
-/// The schemes FFmpeg can open as a stream here, and that the slim build carries protocols for.
-/// See `scripts/build-ffmpeg.sh`: rtmp, mms, srt and ftp would need more of FFmpeg.
+/// The schemes FFmpeg can open as a stream here, the same as the Windows build's slim FFmpeg
+/// (`scripts/build-ffmpeg.sh`) carries protocols for, so a saved library means the same on both.
 const SCHEMES: [&str; 6] = ["http", "https", "rtsp", "udp", "rtp", "tcp"];
 
 /// Which shelf of the Network page a saved address sits on.
@@ -454,7 +451,7 @@ fn resolve(base: &str, href: &str) -> String {
 }
 
 /// Fetches `url` (http or https) and returns the body as text. Follows redirects,
-/// honours the system proxy, and gives up after `timeout` per stage.
+/// honours the proxy in the environment, and gives up after `timeout` per stage.
 pub fn fetch_text(url: &str, timeout: Duration) -> Result<String, String> {
     fetch(url, timeout, MAX_FETCH).map(|body| String::from_utf8_lossy(&body).into_owned())
 }
@@ -469,108 +466,62 @@ pub fn fetch(url: &str, timeout: Duration, max: usize) -> Result<Vec<u8>, String
         "https" => true,
         _ => return Err(format!("only http and https load, not {scheme}")),
     };
-    let (authority, path) = match rest.find('/') {
+    let (authority, path) = match rest.find(['/', '?', '#']) {
         Some(i) => (&rest[..i], &rest[i..]),
         None => (rest, "/"),
     };
+    // A user name and password in the address are never sent anywhere.
     let authority = authority.rsplit('@').next().unwrap_or(authority);
-    let (host, port) = match authority.rsplit_once(':') {
-        Some((h, p)) if p.chars().all(|c| c.is_ascii_digit()) => {
-            (h, p.parse().map_err(|_| "bad port".to_owned())?)
-        }
-        _ => (authority, if secure { 443 } else { 80 }),
+    let host = host_of(url).unwrap_or_default();
+    let path = path.split('#').next().unwrap_or(path);
+    let path = if path.starts_with('?') {
+        format!("/{path}")
+    } else {
+        path.to_owned()
     };
-    let host = host.trim_matches(['[', ']']);
-    let ms = (timeout.as_millis()).clamp(1_000, 60_000) as i32;
+    let stage = Some(timeout.clamp(Duration::from_secs(1), Duration::from_secs(60)));
 
-    let wide = |s: &str| s.encode_utf16().chain([0]).collect::<Vec<u16>>();
-    let agent = HSTRING::from(concat!("wushang/", env!("CARGO_PKG_VERSION")));
-    unsafe {
-        struct Handle(*mut std::ffi::c_void);
-        impl Drop for Handle {
-            fn drop(&mut self) {
-                _ = unsafe { WinHttpCloseHandle(self.0) };
-            }
-        }
-        let session = WinHttpOpen(
-            PCWSTR(agent.as_ptr()),
-            WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
-            PCWSTR::null(),
-            PCWSTR::null(),
-            0,
-        );
-        if session.is_null() {
-            return Err(format!("network: {}", windows::core::Error::from_thread()));
-        }
-        let session = Handle(session);
-        WinHttpSetTimeouts(session.0, ms, ms, ms, ms).map_err(|e| format!("network: {e}"))?;
-        let connect = WinHttpConnect(session.0, PCWSTR(wide(host).as_ptr()), port, 0);
-        if connect.is_null() {
-            return Err(format!("network: {}", windows::core::Error::from_thread()));
-        }
-        let connect = Handle(connect);
-        let flags = if secure {
-            WINHTTP_FLAG_SECURE
-        } else {
-            WINHTTP_OPEN_REQUEST_FLAGS(0)
-        };
-        let request = WinHttpOpenRequest(
-            connect.0,
-            PCWSTR(wide("GET").as_ptr()),
-            PCWSTR(wide(path).as_ptr()),
-            PCWSTR::null(),
-            PCWSTR::null(),
-            std::ptr::null(),
-            flags,
-        );
-        if request.is_null() {
-            return Err(format!("network: {}", windows::core::Error::from_thread()));
-        }
-        let request = Handle(request);
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .user_agent(concat!("wushang/", env!("CARGO_PKG_VERSION")))
         // Feeds and directories redirect between hosts; follow, but never from https down to
         // http, where anyone on the network could swap what comes back (an update, say).
-        _ = WinHttpSetOption(
-            Some(request.0 as *const _),
-            WINHTTP_OPTION_REDIRECT_POLICY,
-            Some(&WINHTTP_OPTION_REDIRECT_POLICY_DISALLOW_HTTPS_TO_HTTP.to_ne_bytes()),
-        );
-        WinHttpSendRequest(request.0, None, None, 0, 0, 0)
-            .and_then(|()| WinHttpReceiveResponse(request.0, std::ptr::null_mut()))
-            .map_err(|e| format!("cannot reach {}: {e}", host_of(url).unwrap_or_default()))?;
-        let (mut status, mut len) = (0u32, 4u32);
-        let mut index = 0u32;
-        _ = WinHttpQueryHeaders(
-            request.0,
-            WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
-            PCWSTR::null(),
-            Some(&mut status as *mut u32 as *mut _),
-            &mut len,
-            &mut index,
-        );
-        if !(200..300).contains(&status) {
-            return Err(format!("the server at {host} answered HTTP {status}"));
-        }
-        let mut body = Vec::new();
-        let mut buf = [0u8; 16 * 1024];
-        loop {
-            let mut read = 0u32;
-            WinHttpReadData(
-                request.0,
-                buf.as_mut_ptr() as *mut _,
-                buf.len() as u32,
-                &mut read,
-            )
-            .map_err(|e| format!("network: {e}"))?;
-            if read == 0 {
-                break;
+        .https_only(secure)
+        .max_redirects(10)
+        .timeout_resolve(stage)
+        .timeout_connect(stage)
+        .timeout_send_request(stage)
+        .timeout_recv_response(stage)
+        // Per read, as WinHTTP's receive timeout was: a slow but steady download goes on.
+        .timeout_per_read(stage)
+        .build()
+        .into();
+    let mut response = agent
+        .get(format!("{scheme}://{authority}{path}"))
+        .call()
+        .map_err(|e| match e {
+            ureq::Error::StatusCode(status) => {
+                format!("the server at {host} answered HTTP {status}")
             }
-            body.extend_from_slice(&buf[..read as usize]);
-            if body.len() > max {
-                return Err("that download is too large".into());
+            ureq::Error::RequireHttpsOnly(_) => {
+                format!("{host} sent wushang from https to plain http")
             }
-        }
-        Ok(body)
+            e => format!("cannot reach {host}: {e}"),
+        })?;
+    // One more than allowed, so a body of exactly `max` bytes still loads.
+    let limit = u64::try_from(max).unwrap_or(u64::MAX).saturating_add(1);
+    let body = response
+        .body_mut()
+        .with_config()
+        .limit(limit)
+        .read_to_vec()
+        .map_err(|e| match e {
+            ureq::Error::BodyExceedsLimit(_) => "that download is too large".to_owned(),
+            e => format!("network: {e}"),
+        })?;
+    if body.len() > max {
+        return Err("that download is too large".into());
     }
+    Ok(body)
 }
 
 /// What a finished fetch means for the caller.
@@ -800,5 +751,122 @@ mod tests {
 <station name="Split" url="http://a.example/&#10;root&#9;music&#9;\\evil\s"/>
 </stations>"#;
         assert!(parse_stations(xml).is_empty());
+    }
+
+    /// A one-thread web server on a free local port: each request gets what `answer` makes of
+    /// its path, written as is.
+    fn serve(answer: fn(&str) -> Vec<u8>) -> String {
+        use std::io::{BufRead, BufReader, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = format!("http://{}", listener.local_addr().unwrap());
+        thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                let mut reader = BufReader::new(stream);
+                let mut line = String::new();
+                _ = reader.read_line(&mut line);
+                let path = line.split(' ').nth(1).unwrap_or("/").to_owned();
+                // The rest of the request, up to its blank line.
+                while reader.read_line(&mut line).is_ok_and(|n| n > 2) {}
+                _ = reader.get_mut().write_all(&answer(&path));
+            }
+        });
+        address
+    }
+
+    #[test]
+    fn fetches_with_limits_and_says_what_went_wrong() {
+        let base = serve(|path| match path {
+            "/feed?x=1" => {
+                format!("HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello")
+                    .into_bytes()
+            }
+            "/moved" => {
+                b"HTTP/1.1 302 Found\r\nLocation: /feed?x=1\r\nContent-Length: 0\r\n\r\n".to_vec()
+            }
+            "/big" => {
+                let body = "x".repeat(2000);
+                format!("HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n{body}").into_bytes()
+            }
+            "/stall" => {
+                thread::sleep(Duration::from_secs(3));
+                b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n".to_vec()
+            }
+            _ => {
+                b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec()
+            }
+        });
+        let second = Duration::from_secs(1);
+        assert_eq!(
+            fetch_text(&format!("{base}/feed?x=1"), second).as_deref(),
+            Ok("hello")
+        );
+        // Redirects are followed; a user name in the address is never sent.
+        let with_user = base.replace("http://", "http://me:secret@");
+        assert_eq!(
+            fetch_text(&format!("{with_user}/moved"), second).as_deref(),
+            Ok("hello")
+        );
+        assert_eq!(
+            fetch_text(&format!("{base}/gone"), second),
+            Err("the server at 127.0.0.1 answered HTTP 404".into())
+        );
+        assert_eq!(
+            fetch(&format!("{base}/big"), second, 1000),
+            Err("that download is too large".into())
+        );
+        assert_eq!(
+            fetch(&format!("{base}/big"), second, 2000).map(|b| b.len()),
+            Ok(2000)
+        );
+        let stalled = fetch_text(&format!("{base}/stall"), second).unwrap_err();
+        assert!(stalled.starts_with("cannot reach 127.0.0.1"), "{stalled}");
+        assert!(fetch_text("ftp://example.com/x", second).is_err());
+        assert!(fetch_text("not an address", second).is_err());
+    }
+
+    /// The real podcast directory and radio directory, and GitHub's release answer. Needs the
+    /// internet: `cargo test live -- --ignored`.
+    #[test]
+    #[ignore]
+    fn live_feeds_and_radio_directory() {
+        let timeout = Duration::from_secs(20);
+        let fetcher = Fetcher::new();
+        fetcher.feed("https://feeds.npr.org/510289/podcast.xml", timeout);
+        fetcher.stations(timeout);
+        let mut done = Vec::new();
+        while done.len() < 2 {
+            done.extend(fetcher.take_ready());
+            thread::sleep(Duration::from_millis(50));
+        }
+        for fetched in done {
+            match fetched {
+                Fetched::Feed { result, .. } => {
+                    let feed = result.unwrap();
+                    assert!(
+                        !feed.title.is_empty() && feed.episodes.len() > 5,
+                        "{feed:?}"
+                    );
+                    assert!(feed.episodes.iter().all(|e| is_web_url(&e.url)));
+                }
+                Fetched::Stations(stations) => {
+                    let stations = stations.unwrap();
+                    assert!(stations.len() > 50, "{} stations", stations.len());
+                    assert!(stations.iter().all(|s| is_web_url(&s.url)));
+                }
+            }
+        }
+        // GitHub sends its release JSON gzipped when asked; it comes back as text.
+        let json = fetch_text(
+            "https://api.github.com/repos/ShreyanshVaibhaw/wushang/releases/latest",
+            timeout,
+        )
+        .unwrap();
+        assert!(json.contains("\"tag_name\""), "{json}");
+        // An https address that redirects to plain http is refused.
+        let down = fetch_text(
+            "https://httpbin.org/redirect-to?url=http%3A%2F%2Fexample.com%2F",
+            timeout,
+        );
+        assert!(down.is_err(), "{down:?}");
     }
 }

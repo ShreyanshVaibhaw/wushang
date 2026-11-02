@@ -6,8 +6,6 @@
 //! Sizes are DIPs from the 1048x653 dialog; it grows a row when the palette needs a fifth, and
 //! scales down to fit between the bars.
 
-use windows::Win32::UI::Input::KeyboardAndMouse::*;
-
 use super::toolbar::{Item, Placed, ZONES, Zone};
 use super::*;
 

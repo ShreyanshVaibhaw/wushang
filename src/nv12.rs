@@ -1,6 +1,6 @@
-//! Software frames repacked into NV12, or P010 for 10-bit and deeper YUV, for the GPU's video
-//! processor, which converts them to RGB and applies the colour filters as for hardware frames
-//! (drivers skip those filters on RGB input). The decoder thread does it, off the render thread:
+//! Software frames repacked into NV12, or P010 for 10-bit and deeper YUV, the two-plane layouts
+//! VideoToolbox decodes into, so the renderer's shader converts them to RGB and applies the colour
+//! adjustments exactly as for hardware frames. The decoder thread does it, off the render thread:
 //! a 4K frame takes several milliseconds even split across every core.
 
 use ff::ffi;

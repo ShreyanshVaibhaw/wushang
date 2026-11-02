@@ -57,24 +57,9 @@ pub fn set(theme: Theme) {
     THEME.with(|t| t.set(theme));
 }
 
-/// Whether Windows apps are set to light mode (Settings > Personalization > Colors).
+/// Whether macOS is in light mode (System Settings > Appearance).
 pub fn system_light() -> bool {
-    use windows::Win32::System::Registry::{HKEY_CURRENT_USER, RRF_RT_REG_DWORD, RegGetValueW};
-    use windows::core::w;
-    let mut value = 0u32;
-    let mut size = 4u32;
-    let read = unsafe {
-        RegGetValueW(
-            HKEY_CURRENT_USER,
-            w!("Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize"),
-            w!("AppsUseLightTheme"),
-            RRF_RT_REG_DWORD,
-            None,
-            Some((&raw mut value).cast()),
-            Some(&mut size),
-        )
-    };
-    read.is_ok() && value != 0
+    !crate::platform::system_dark_mode()
 }
 
 /// A design colour, possibly marked [`fixed`], in the active theme.

@@ -1,125 +1,89 @@
-//! Tells Windows that wushang opens video and audio files, so it is listed in Explorer's "Open
-//! with" and in Settings > Apps > Default apps. Everything goes under HKEY_CURRENT_USER, so it needs
-//! no admin rights, and it follows the exe: the copy that ran last is the one files open in.
+//! Tells macOS that wushang opens video and audio files, so it is listed in Finder's "Open With"
+//! and in Get Info's "Open with". The types themselves are the bundle's `CFBundleDocumentTypes`
+//! (assets/macos/Info.plist; a test checks it lists every one of `VIDEO_EXTS` and `AUDIO_EXTS`),
+//! ranked Alternate so wushang never takes a type over unasked; Launch Services reads them when
+//! the app is copied in or first opened. Registering the running bundle as well makes the copy that ran last
+//! the one Finder knows about, as the Windows registry entries did, with no admin rights.
 
-use windows::Win32::System::Registry::{
-    HKEY_CURRENT_USER, REG_NONE, REG_SZ, REG_VALUE_TYPE, RRF_RT_REG_SZ, RegGetValueW,
-    RegSetKeyValueW,
-};
-use windows::Win32::UI::Shell::{SHCNE_ASSOCCHANGED, SHCNF_IDLIST, SHChangeNotify};
-use windows::core::{HSTRING, PCWSTR};
+use std::path::{Path, PathBuf};
 
-use crate::library::{AUDIO_EXTS, VIDEO_EXTS};
+use objc2_core_foundation::CFURL;
 
-const APP: &str = r"Software\Classes\Applications\wushang.exe";
-const CAPABILITIES: &str = r"Software\wushang\Capabilities";
-/// The file types wushang offers, and what Explorer calls a file of each.
-const KINDS: [(&str, &str, &[&str]); 2] = [
-    ("wushang.video", "Video file", VIDEO_EXTS),
-    ("wushang.audio", "Audio file", AUDIO_EXTS),
-];
+#[link(name = "CoreServices", kind = "framework")]
+unsafe extern "C" {
+    /// Launch Services: adds the bundle at `url` to its database. `update` false leaves a bundle
+    /// it already has, unchanged since, alone, so this costs next to nothing on later starts.
+    fn LSRegisterURL(url: &CFURL, update: u8) -> i32;
+}
 
-/// Registers the running exe, unless it already is.
+/// Registers the running app bundle, unless it already is. A bare exe (`cargo run`) has no
+/// bundle and no document types, so it registers nothing.
 pub fn register() {
-    let Ok(exe) = std::env::current_exe() else {
+    let Some(bundle) = std::env::current_exe().ok().as_deref().and_then(bundle_of) else {
         return;
     };
-    // A build in Cargo's output folder isn't the copy to open files with.
-    if exe
-        .parent()
-        .is_some_and(|d| d.join(".fingerprint").is_dir())
-    {
-        return;
-    }
-    let Some(exe) = exe.to_str() else {
+    let Some(url) = CFURL::from_directory_path(&bundle) else {
         return;
     };
-    let open = format!("\"{exe}\" \"%1\"");
-    let command = format!(r"{APP}\shell\open\command");
-    if read(&command, "").as_deref() == Some(open.as_str()) {
-        return;
+    let status = unsafe { LSRegisterURL(&url, 0) };
+    if status != 0 {
+        eprintln!("assoc: cannot register {} ({status})", bundle.display());
     }
-    let icon = format!("\"{exe}\",0");
-
-    set(APP, "FriendlyAppName", "wushang");
-    set(CAPABILITIES, "ApplicationName", "wushang");
-    set(
-        CAPABILITIES,
-        "ApplicationDescription",
-        "A video and music player",
-    );
-    set(CAPABILITIES, "ApplicationIcon", &icon);
-    for (progid, name, exts) in KINDS {
-        let class = format!(r"Software\Classes\{progid}");
-        set(&class, "", name);
-        set(&format!(r"{class}\DefaultIcon"), "", &icon);
-        set(&format!(r"{class}\shell\open\command"), "", &open);
-        for ext in exts {
-            set(&format!(r"{APP}\SupportedTypes"), &format!(".{ext}"), "");
-            set(
-                &format!(r"{CAPABILITIES}\FileAssociations"),
-                &format!(".{ext}"),
-                progid,
-            );
-            set_value(
-                &format!(r"Software\Classes\.{ext}\OpenWithProgids"),
-                progid,
-                REG_NONE,
-                &[],
-            );
-        }
-    }
-    set(r"Software\RegisteredApplications", "wushang", CAPABILITIES);
-    // Last, so a registration cut off halfway is redone on the next start.
-    set(&command, "", &open);
-    unsafe { SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_IDLIST, None, None) };
 }
 
-/// A string value under HKEY_CURRENT_USER (`""` names the key's default), if it has one.
-pub fn read(key: &str, name: &str) -> Option<String> {
-    let name = (!name.is_empty()).then(|| HSTRING::from(name));
-    let mut buf = [0u16; 1024];
-    let mut size = std::mem::size_of_val(&buf) as u32;
-    unsafe {
-        RegGetValueW(
-            HKEY_CURRENT_USER,
-            &HSTRING::from(key),
-            name.as_ref().map_or(PCWSTR::null(), |n| PCWSTR(n.as_ptr())),
-            RRF_RT_REG_SZ,
-            None,
-            Some(buf.as_mut_ptr().cast()),
-            Some(&mut size),
-        )
+/// The `.app` folder an exe at `<name>.app/Contents/MacOS/<exe>` belongs to.
+fn bundle_of(exe: &Path) -> Option<PathBuf> {
+    let macos = exe.parent()?;
+    let contents = macos.parent()?;
+    let app = contents.parent()?;
+    let is_app = app
+        .extension()
+        .is_some_and(|e| e.eq_ignore_ascii_case("app"));
+    (macos.file_name()? == "MacOS" && contents.file_name()? == "Contents" && is_app)
+        .then(|| app.to_path_buf())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn finds_the_bundle_an_exe_runs_from() {
+        assert_eq!(
+            bundle_of(Path::new(
+                "/Applications/wushang.app/Contents/MacOS/wushang"
+            )),
+            Some(PathBuf::from("/Applications/wushang.app"))
+        );
+        assert_eq!(bundle_of(Path::new("/Users/me/target/debug/wushang")), None);
+        assert_eq!(bundle_of(Path::new("/wushang")), None);
     }
-    .ok()
-    .ok()?;
-    let len = (size as usize / 2).saturating_sub(1);
-    Some(String::from_utf16_lossy(&buf[..len]))
-}
 
-/// Sets a string value, creating the key if needed. `""` names the key's default value.
-fn set(key: &str, name: &str, value: &str) {
-    let data: Vec<u8> = value
-        .encode_utf16()
-        .chain([0])
-        .flat_map(u16::to_le_bytes)
-        .collect();
-    set_value(key, name, REG_SZ, &data);
-}
+    /// Info.plist claims every extension the library plays, each once, and nothing else.
+    #[test]
+    fn the_bundle_lists_every_media_type() {
+        use crate::library::{AUDIO_EXTS, VIDEO_EXTS};
+        let plist = include_str!("../assets/macos/Info.plist");
+        let mut listed: Vec<&str> = plist
+            .split("<string>")
+            .filter_map(|s| s.split_once("</string>"))
+            .map(|(ext, _)| ext)
+            .filter(|ext| plist_ext(plist, ext))
+            .collect();
+        listed.sort();
+        let mut wanted: Vec<&str> = VIDEO_EXTS.iter().chain(AUDIO_EXTS).copied().collect();
+        wanted.sort();
+        assert_eq!(listed, wanted);
+    }
 
-fn set_value(key: &str, name: &str, kind: REG_VALUE_TYPE, data: &[u8]) {
-    let name = (!name.is_empty()).then(|| HSTRING::from(name));
-    let result = unsafe {
-        RegSetKeyValueW(
-            HKEY_CURRENT_USER,
-            &HSTRING::from(key),
-            name.as_ref().map_or(PCWSTR::null(), |n| PCWSTR(n.as_ptr())),
-            kind.0,
-            (!data.is_empty()).then_some(data.as_ptr().cast()),
-            data.len() as u32,
-        )
-    };
-    if result.is_err() {
-        eprintln!("assoc: cannot set {key} {name:?} ({result:?})");
+    /// Whether `ext` sits in a CFBundleTypeExtensions array of `plist`.
+    fn plist_ext(plist: &str, ext: &str) -> bool {
+        plist
+            .split("<key>CFBundleTypeExtensions</key>")
+            .skip(1)
+            .any(|types| {
+                let array = types.split("</array>").next().unwrap_or("");
+                array.contains(&format!("<string>{ext}</string>"))
+            })
     }
 }

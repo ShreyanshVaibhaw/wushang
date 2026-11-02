@@ -115,3 +115,46 @@ pub fn system_dark_mode() -> bool;                   // NSApp effectiveAppearanc
 ## Contract changes
 
 (Append here: who, what, why.)
+
+- **shell**: keys, cursors and the clipboard for `src/ui/**`. The UI takes gfx's `d2d::VIRTUAL_KEY` (below); the shell's key mapping (`crate::platform::keys`) produces it, passing Cmd or Ctrl as `ctrl`.
+  - `crate::platform::keys::shift_down() -> bool` replaces `GetKeyState(VK_SHIFT) < 0` (in `dialog_down`).
+  - Typed text still arrives as `dialog_char(c: u32)` / `preferences_char(c: u32)`, one call per character after the key's `*_key` call, with Backspace also sent as 8, Enter 13, Esc 27, the way WM_CHAR sends them. Text comes through `interpretKeyEvents`, so dead keys and input methods work; Cmd/Ctrl shortcuts type nothing.
+  - `Ui::dialog_cursor()` may keep returning `Option<d2d::PCWSTR>`; the shell maps `IDC_IBEAM` / `IDC_HAND` to `crate::platform::Cursor`.
+  - `crate::platform::clipboard_text() -> Option<String>` and `crate::platform::set_clipboard_text(&str) -> bool` (NSPasteboard) replace dialog.rs's own clipboard functions.
+  - `crate::platform::system_dark_mode()` is there for `ui::theme::system_light()`; the shell re-applies the theme when the system appearance changes.
+  - Also in `crate::platform`: `reveal_in_finder`, `open_with_default_app`, `edit_text_file(&Path)` (the user's text editor), `play_sound(Vec<u8>)` (a WAV in memory), `keep_awake(bool)`.
+
+- **gfx**: `crate::d2d` also carries the few non-graphics Win32 names the UI files use, so they keep their Windows shapes:
+  `d2d::VIRTUAL_KEY(pub u16)` with the Windows `VK_*` values (`VK_ESCAPE`, `VK_RETURN`, `VK_LEFT`, `VK_A`, ...), which `Ui::dialog_key`, `preferences_key`, `customize_key` and `onboarding_key` take.
+  The shell translates NSEvent key codes into these (Return, Escape, arrows, Home/End, Backspace = `VK_BACK`, forward Delete = `VK_DELETE`, letters = `VK_A`..`VK_Z`) and passes Cmd as `ctrl`.
+  `Ui::dialog_cursor()` still returns `Option<d2d::PCWSTR>`; compare it with `d2d::IDC_IBEAM` / `d2d::IDC_HAND` and set `NSCursor.IBeamCursor` / `pointingHandCursor`.
+  `d2d::Vector2`, `d2d::Matrix3x2` replace `windows_numerics`.
+- **gfx**: `ui::theme::system_light()` calls `crate::platform::system_dark_mode()` (from the contract above) and negates it.
+- **video**: renderer, decoding and snapshots.
+  - `snapshot::Folder { Pictures, Desktop, Videos, Music, Downloads }` replaces the `FOLDERID_*` GUIDs, by value: `known_folder(Folder) -> std::io::Result<PathBuf>` (~/Pictures, ~/Desktop, ~/Movies, ~/Music, ~/Downloads) and `output_dir(key, Folder, &Path) -> std::io::Result<PathBuf>`. Errors print with `{e}`, not `e.message()`.
+  - `Renderer::update_display(&NSWindow, allowed, force)` reads the screen's EDR headroom and the window's occlusion on every call (a few property reads), so call it every pass; `force` adds nothing. While the window is occluded `present` returns at once without drawing, so a hidden window never waits on `nextDrawable`.
+  - The shell sets the layer's `contentsScale` (backingScaleFactor) and frame; the renderer sets device, pixel format (BGR10A2Unorm, or RGBA16Float in EDR), colour space (sRGB, or extended linear Display P3), `wantsExtendedDynamicRangeContent`, vsync, three drawables and `drawableSize` (from `new` and `resize`, in pixels).
+  - EDR switches on only while an HDR10 or HLG frame is shown with HDR "Auto" on a screen whose potential headroom is above 1; the interface stays at SDR white. SDR video and the library never ask the screen for headroom.
+  - `DeviceLock::from_hw(&HwDevice)` returns None: nothing needs locking on Metal. `HwDevice` is `Send`.
+  - `render::takes(&frame) -> bool` says whether a VideoToolbox frame is shown straight from its pixel buffer; the decoder thread copies the others (one-plane formats such as ProRes 4444) back and repacks them.
+  - Never `.clone()` a decoded frame: ffmpeg-next's `Clone` copies pixel data, which drops a VideoToolbox frame's pixel buffer. Move frames instead.
+  - The interface bitmap is a Metal buffer's memory (shared on Apple silicon) wrapped in a `CGBitmapContext`, rather than an IOSurface: also no copy, and no IOSurface locking. `d2d.begin(&cg, size, scale)` gets a bitmap cleared to transparent each frame.
+- **gfx**: `ID2D1DeviceContext5::begin(cg, size, scale)` saves the context's state, sets a top-left, y-down CTM in DIPs (`translate(0, h) * scale(scale, -scale)`), grayscale text, and takes the bitmap's colour space for every colour and image (so bytes come out as Direct2D's would, unconverted). It resets the world transform and clears nothing. `end()` pops any clip or layer still pushed, restores the context, and drops DrawText layouts not drawn for 3 frames: call it once per frame.
+  `BeginDraw`/`EndDraw`/`Clear`/`SetDpi`/`GetSize` exist for code that still calls them; `EndDraw` does nothing (`end` finishes the frame).
+  The shim's objects use `Rc`, so `Painter` and the context stay on one thread, as COM's did.
+  `d2d::Canvas::new(w, h)` makes a premultiplied BGRA sRGB bitmap context (with `pixels()` and `save_png()`), for tests and tools.
+  `cargo test render_check -- --ignored` paints the player, a menu, Settings, About, the library, the welcome, Customize Player and the settings popup into PNGs in `$WUSHANG_RENDER_DIR` (or the temp directory).
+- **services**: folders, updates, capture, discs, converting.
+  - `Library::default_dir()` is `~/Library/Application Support/wushang` (`WUSHANG_HOME` overrides); first run seeds ~/Movies and ~/Music. Hidden files are dot files and those with Finder's hidden flag (`UF_HIDDEN`).
+  - `update::Release` keeps its fields: `zip` is the download (the release's `-macos-arm64.dmg`, else its `.zip`), `msi` is always None. `update::download` saves into ~/Downloads (through `snapshot::known_folder(Folder::Downloads)`) and selects the file in Finder itself (`open -R`); main only shows `Dialog::Downloaded`. `Saved::Installer` is never made; `install_on_exit`, `finish` and `clean_up` do nothing.
+  - `assoc::register()` registers the running `.app` with Launch Services (`LSRegisterURL`) and does nothing for a bare exe. The document types are `assets/macos/Info.plist`'s (a test keeps them in step with `VIDEO_EXTS`/`AUDIO_EXTS`). `assoc::read` is gone.
+  - Capture addresses are `avfoundation://video=<name>`, `avfoundation://audio=<name>` and `screen://` (`screen://1`, ... for more displays); `capture::devices()`, `open()` and `is_capture_path()` keep their shapes. Cameras open at their biggest mode up to 1080p that runs at 30 fps, in NV12 when they have it.
+  - `disc::drives()` lists mounted volumes in /Volumes that hold a disc (UDF, ISO 9660, CD audio) or a VIDEO_TS/BDMV folder at the top; an empty drive shows nothing. Blu-ray no longer needs libbluray (Homebrew's FFmpeg has none): `disc::url` plays the longest BDMV/PLAYLIST/*.mpls's clips through `concat:`, and `disc::dvd_title` now also gives a Blu-ray's length and chapters. A `.iso` is mounted read-only with `hdiutil` under the temp folder (not in Finder) and detached when wushang exits.
+  - `convert::Target::extension()` is "m4a" for `Mp3` when FFmpeg has no libmp3lame (AAC goes in M4A); name output files with it, as main does. Encoders: `h264_videotoolbox` then `libx264`, `aac_at` then `aac`, `libmp3lame`.
+  - `prefs::FONTS` swaps Segoe UI and Consolas for Helvetica Neue and Menlo. `SNAP_DIR`/`RECORD_DIR` keys are unchanged (`pictures`, `videos`); their labels read Pictures/wushang and Movies/wushang.
+  - `session::open_file` also leaves out the rtp, concat, avfoundation and lavfi demuxers, which Homebrew's FFmpeg has and the Windows build's slim FFmpeg doesn't.
+  - `tags::Stamp`'s time is nanoseconds since 1970 (was FILETIME), so a tags.txt from Windows is probed again.
+  - Packaging: `scripts/bundle-macos.sh` builds `<target>/bundle/wushang.app`, `wushang-<version>-macos-arm64.dmg` and `.zip`, with FFmpeg, libass and their Homebrew dependencies in Contents/Frameworks; `build.rs` links bins with `-headerpad_max_install_names` and an rpath to `@executable_path/../Frameworks`. `scripts/make-testdata.sh` makes the test clips with Homebrew's ffmpeg (the minute-long ones now with a keyframe every 2 s, which record.rs's streaming test needs).
+    Open issue: Homebrew's bottles are built for the Mac's own macOS (26 here) and its FFmpeg is GPL (`--enable-gpl`, x264, x265), so the bundle runs on macOS 26+ only and is GPL; the script warns about the first. Both need an FFmpeg and libass built from source with `MACOSX_DEPLOYMENT_TARGET=13.0` and the Windows build's LGPL options, the way scripts/build-ffmpeg.sh does for Windows.
+- **shell**: `Prefs::window` now holds the window's frame in points (left, top, width, height) measured from the main screen's top-left corner, y down, as AppKit sizes go; the "screen pixels" comment in `prefs.rs` (services) should say so. A Windows `settings.txt` copied over is just ignored when the spot is off every screen.
+- **shell**: debug builds take scripted input for testing without the real mouse and keyboard: `WUSHANG_REMOTE=<fifo>`, one command per line (`key 49`, `click 300 20 2`, `move`, `drag`, `scroll`, `frame`, `menu`, `open`, `drop`, `cancel`, `track`, `appearance`, `terminate`); see `src/platform/remote.rs`. Not compiled into release builds.

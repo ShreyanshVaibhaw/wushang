@@ -598,20 +598,20 @@ mod tests {
         assert_picture(&still, 320, 180);
         // Past the end it still finds the last keyframe; a file that isn't there gives none.
         assert!(still_at(&testdata("test_h264.mp4"), 600.0, 160).is_some());
-        assert!(still_at(Path::new("C:/nonexistent/clip.mp4"), 1.0, 160).is_none());
+        assert!(still_at(Path::new("/nonexistent/clip.mp4"), 1.0, 160).is_none());
     }
 
     #[test]
     fn bad_input_gives_none() {
-        assert!(render(Path::new("C:/nonexistent/clip.mp4"), 320, 180).is_none());
-        assert!(probe(Path::new("C:/nonexistent/clip.mp4")).is_none());
+        assert!(render(Path::new("/nonexistent/clip.mp4"), 320, 180).is_none());
+        assert!(probe(Path::new("/nonexistent/clip.mp4")).is_none());
         let noise: Vec<u8> = (0..65536u32)
             .map(|i| (i.wrapping_mul(2654435761) >> 13) as u8)
             .collect();
         assert!(render(&temp("noise.mkv", &noise), 320, 180).is_none());
         // A clip cut short, with its index missing: whatever comes back, no panic.
         let clip = std::fs::read(testdata("test_h264.mp4")).unwrap();
-        _ = render(&temp("cut.mp4", &clip[..200_000]), 320, 180);
+        _ = render(&temp("cut.mp4", &clip[..clip.len() * 4 / 5]), 320, 180);
     }
 
     #[test]

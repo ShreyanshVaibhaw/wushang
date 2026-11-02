@@ -14,10 +14,6 @@ use ff::ffi;
 use ffmpeg_next as ff;
 
 use crate::record;
-use windows::Win32::Graphics::Direct3D11::{
-    D3D11_DECODER_PROFILE_AV1_VLD_PROFILE0, ID3D11Device, ID3D11VideoDevice,
-};
-use windows::core::Interface;
 
 /// Decoded frames waiting for the renderer.
 pub const FRAME_QUEUE_LEN: usize = 3;
@@ -430,53 +426,38 @@ impl FrameQueue {
     }
 }
 
-/// A D3D11VA device created by FFmpeg. The decoder writes into its textures and the renderer
-/// presents them with the same ID3D11Device, so decoded frames never leave the GPU.
+/// A VideoToolbox device created by FFmpeg. Decoded frames are CVPixelBuffers on IOSurfaces,
+/// which the renderer reads as Metal textures, so they never leave the GPU's memory.
 pub struct HwDevice(*mut ffi::AVBufferRef);
 
+// The buffer reference is atomic and the device context is only read after it is made.
+unsafe impl Send for HwDevice {}
+
 impl HwDevice {
-    /// Wraps our own device rather than letting FFmpeg create one: Direct2D draws the interface
-    /// on the same device, and that needs BGRA support, which FFmpeg's device lacks.
-    pub fn from_d3d11(device: &ID3D11Device) -> Option<Self> {
-        unsafe {
-            let buf = ffi::av_hwdevice_ctx_alloc(ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_D3D11VA);
-            if buf.is_null() {
-                return None;
-            }
-            let ctx = (*buf).data as *mut ffi::AVHWDeviceContext;
-            let d3d11 = (*ctx).hwctx as *mut ffi::AVD3D11VADeviceContext;
-            // FFmpeg releases this reference when the context is freed.
-            (*d3d11).device = device.clone().into_raw().cast();
-            let mut hw = HwDevice(buf);
-            if ffi::av_hwdevice_ctx_init(hw.0) < 0 {
-                ffi::av_buffer_unref(&mut hw.0);
-                return None;
-            }
-            Some(hw)
-        }
+    pub fn videotoolbox() -> Option<Self> {
+        let mut buf = std::ptr::null_mut();
+        let made = unsafe {
+            ffi::av_hwdevice_ctx_create(
+                &mut buf,
+                ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_VIDEOTOOLBOX,
+                std::ptr::null(),
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        (made >= 0 && !buf.is_null()).then_some(HwDevice(buf))
     }
 
-    pub fn d3d11(&self) -> &ffi::AVD3D11VADeviceContext {
-        unsafe {
-            let device = (*self.0).data as *const ffi::AVHWDeviceContext;
-            &*((*device).hwctx as *const ffi::AVD3D11VADeviceContext)
-        }
-    }
-
-    /// Whether the GPU's video decoder lists an AV1 profile.
+    /// Whether this Mac decodes AV1 in hardware (M3 and later).
     fn decodes_av1(&self) -> bool {
-        unsafe {
-            let raw = self.d3d11().video_device as *mut std::ffi::c_void;
-            let Some(video) = ID3D11VideoDevice::from_raw_borrowed(&raw) else {
-                return false;
-            };
-            (0..video.GetVideoDecoderProfileCount()).any(|i| {
-                video
-                    .GetVideoDecoderProfile(i)
-                    .is_ok_and(|p| p == D3D11_DECODER_PROFILE_AV1_VLD_PROFILE0)
-            })
-        }
+        // kCMVideoCodecType_AV1, 'av01'.
+        unsafe { VTIsHardwareDecodeSupported(u32::from_be_bytes(*b"av01")) != 0 }
     }
+}
+
+#[link(name = "VideoToolbox", kind = "framework")]
+unsafe extern "C" {
+    fn VTIsHardwareDecodeSupported(codec: u32) -> u8;
 }
 
 /// Another reference to the same device, so a session can open decoders after `Session::open`.
@@ -492,16 +473,16 @@ impl Drop for HwDevice {
     }
 }
 
-/// libavcodec offers the formats it can decode into; take D3D11 textures when the GPU supports
-/// the stream, otherwise let FFmpeg pick its software format.
-unsafe extern "C" fn prefer_d3d11(
+/// libavcodec offers the formats it can decode into; take VideoToolbox buffers when the GPU
+/// supports the stream, otherwise let FFmpeg pick its software format.
+unsafe extern "C" fn prefer_videotoolbox(
     ctx: *mut ffi::AVCodecContext,
     formats: *const ffi::AVPixelFormat,
 ) -> ffi::AVPixelFormat {
     unsafe {
         let mut p = formats;
         while *p != ffi::AVPixelFormat::AV_PIX_FMT_NONE {
-            if *p == ffi::AVPixelFormat::AV_PIX_FMT_D3D11 {
+            if *p == ffi::AVPixelFormat::AV_PIX_FMT_VIDEOTOOLBOX {
                 return *p;
             }
             p = p.add(1);
@@ -521,17 +502,17 @@ pub fn open_video_decoder(
     hw: Option<&HwDevice>,
 ) -> Result<ff::decoder::Video, ff::Error> {
     let id = parameters.id();
-    // Only these have D3D11VA hwaccels in the build. Anything else (MJPEG webcams, BMP screen
-    // grabs, MPEG-4 Part 2) decodes in software from the start, instead of being opened for the
-    // GPU, turned down and reopened, which also seeks, and live sources can't.
+    // Only these have VideoToolbox hwaccels that Apple's decoders take. Anything else (MJPEG
+    // webcams, BMP screen grabs, MPEG-4 Part 2) decodes in software from the start, instead of
+    // being opened for the GPU, turned down and reopened, which also seeks, and live sources can't.
     use ff::codec::Id;
     let gpu = matches!(
         id,
-        Id::H264 | Id::HEVC | Id::AV1 | Id::VP9 | Id::MPEG2VIDEO | Id::VC1 | Id::WMV3
+        Id::H264 | Id::HEVC | Id::AV1 | Id::VP9 | Id::MPEG2VIDEO | Id::MPEG1VIDEO | Id::PRORES
     );
     let hw = hw.filter(|_| gpu);
     // libavcodec prefers libdav1d for AV1, and libdav1d never uses the GPU. Take FFmpeg's own AV1
-    // decoder when the GPU has an AV1 profile; otherwise keep libdav1d and give it every core.
+    // decoder when VideoToolbox decodes AV1 here; otherwise keep libdav1d and give it every core.
     // A stream the GPU then turns down is reopened in software by the decoder thread.
     let (codec, hw) = match hw {
         Some(device) if id == ff::codec::Id::AV1 && device.decodes_av1() => {
@@ -548,10 +529,10 @@ pub fn open_video_decoder(
         match hw {
             Some(hw) => {
                 (*raw).hw_device_ctx = ffi::av_buffer_ref(hw.0);
-                (*raw).get_format = Some(prefer_d3d11);
+                (*raw).get_format = Some(prefer_videotoolbox);
                 (*raw).extra_hw_frames = EXTRA_HW_FRAMES;
             }
-            // The hardware path decodes on one thread to keep the surface pool small; software
+            // The hardware path decodes on one thread, as VideoToolbox does the work; software
             // takes every core.
             None => (*raw).thread_count = 0,
         }
@@ -871,6 +852,23 @@ fn software_decoder(decoder: &ff::decoder::Video) -> Option<ff::decoder::Video> 
     open_video_decoder(ff::codec::Parameters::from(decoder), time_base, None).ok()
 }
 
+/// A hardware frame copied to system memory with its timestamps and colour tags; a software
+/// frame as it is.
+fn download(frame: ff::frame::Video) -> Result<ff::frame::Video, ff::Error> {
+    if frame.format() != ff::format::Pixel::VIDEOTOOLBOX {
+        return Ok(frame);
+    }
+    let mut soft = ff::frame::Video::empty();
+    unsafe {
+        let err = ffi::av_hwframe_transfer_data(soft.as_mut_ptr(), frame.as_ptr(), 0);
+        if err < 0 {
+            return Err(ff::Error::from(err));
+        }
+        ffi::av_frame_copy_props(soft.as_mut_ptr(), frame.as_ptr());
+    }
+    Ok(soft)
+}
+
 pub fn spawn_video_decoder(
     mut decoder: ff::decoder::Video,
     time_base: f64,
@@ -924,7 +922,7 @@ pub fn spawn_video_decoder(
                 match decoder.receive_frame(&mut frame) {
                     Ok(()) => {
                         if gpu
-                            && frame.format() != ff::format::Pixel::D3D11
+                            && frame.format() != ff::format::Pixel::VIDEOTOOLBOX
                             && to_software(&mut decoder, &mut gpu)
                         {
                             break;
@@ -932,8 +930,8 @@ pub fn spawn_video_decoder(
                         if format != Some(frame.format()) {
                             format = Some(frame.format());
                             match frame.format() {
-                                ff::format::Pixel::D3D11 => {
-                                    eprintln!("video: decoding on the GPU (D3D11VA)")
+                                ff::format::Pixel::VIDEOTOOLBOX => {
+                                    eprintln!("video: decoding on the GPU (VideoToolbox)")
                                 }
                                 f => eprintln!("video: decoding in software ({f:?} frames)"),
                             }
@@ -944,10 +942,14 @@ pub fn spawn_video_decoder(
                         if shared.exact() && pts + frame_duration / 2.0 < shared.seek_floor() {
                             continue;
                         }
-                        // Software frames are repacked for the GPU here, off the render thread.
+                        // Software frames are repacked for the GPU here, off the render thread, and
+                        // so are the rare hardware ones the renderer can't read as two planes
+                        // (ProRes 4444 comes as one packed plane), after a copy back.
                         let frame = match frame.format() {
-                            ff::format::Pixel::D3D11 => frame,
-                            _ => match nv12.convert(&frame) {
+                            ff::format::Pixel::VIDEOTOOLBOX if crate::render::takes(&frame) => {
+                                frame
+                            }
+                            _ => match download(frame).and_then(|f| nv12.convert(&f)) {
                                 Ok(f) => f,
                                 Err(e) => {
                                     eprintln!("video: cannot repack a frame ({e})");

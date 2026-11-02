@@ -6,8 +6,6 @@
 
 use std::mem::ManuallyDrop;
 
-use windows::core::Interface;
-
 use super::*;
 
 pub const W: f32 = 391.0;

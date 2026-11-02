@@ -2,8 +2,6 @@
 //! grid or list, and the mini player card. Sizes are DIPs from the design's 1920x1080 library
 //! frames ("Videos > Shows > The Wand > S01"), colours sampled from them.
 
-use windows_numerics::Vector2;
-
 use super::*;
 use crate::library::{Crumb, Entry, Library, MediaKind, Place};
 

@@ -13,6 +13,8 @@ pub mod onboarding;
 pub mod panels;
 pub mod preferences;
 pub mod queue;
+#[cfg(test)]
+mod render_check;
 pub mod theme;
 pub mod toolbar;
 
@@ -20,6 +22,8 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
+use crate::d2d::*;
+use crate::library::Section;
 pub use browse::Browse;
 pub use dialog::{Dialog, DialogAction};
 pub use menu::MenuAction;
@@ -27,16 +31,6 @@ pub use panels::{Panel, PanelAction, PanelData, TrackTab};
 pub use preferences::{Category, PrefsAction};
 pub use queue::{QueueAction, QueueData, QueueItem};
 pub use toolbar::{Item as ToolItem, Toolbar};
-use windows::Win32::Foundation::E_FAIL;
-use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
-
-use crate::library::Section;
-use windows::Win32::Graphics::Direct2D::Common::*;
-use windows::Win32::Graphics::Direct2D::*;
-use windows::Win32::Graphics::DirectWrite::*;
-use windows::Win32::UI::Shell::SHCreateMemStream;
-use windows::core::{Error, Result, w};
-use windows_numerics::Matrix3x2;
 
 const TITLE_BAR: f32 = 40.0;
 const CONTROL_BAR: f32 = 54.0;
@@ -1212,9 +1206,7 @@ fn svg_as_is(ctx: &ID2D1DeviceContext5, bytes: &[u8]) -> Result<Svg> {
     let (width, height) = (attr("width"), attr("height"));
     // Direct2D's SVG parser rejects the CSS that Figma adds for the web.
     let cleaned = text.replace(" style=\"display: block;\"", "");
-    let stream =
-        unsafe { SHCreateMemStream(Some(cleaned.as_bytes())) }.ok_or(Error::from(E_FAIL))?;
-    let doc = unsafe { ctx.CreateSvgDocument(&stream, D2D_SIZE_F { width, height })? };
+    let doc = unsafe { ctx.CreateSvgDocument(cleaned.as_bytes(), D2D_SIZE_F { width, height })? };
     Ok(Svg { doc, width })
 }
 
@@ -1759,7 +1751,7 @@ impl Painter {
                 let sink = path.Open()?;
                 let cy = area.t + area.h() / 2.0;
                 let amp = area.h() * 0.3;
-                let point = |i: usize| windows_numerics::Vector2 {
+                let point = |i: usize| Vector2 {
                     X: left + w * i as f32 / (v.len() - 1).max(1) as f32,
                     Y: cy - v[i].clamp(-1.0, 1.0) * amp,
                 };

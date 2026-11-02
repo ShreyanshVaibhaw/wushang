@@ -1,10 +1,8 @@
 //! wushang: a small video player built in the shape of VLC's pipeline, with the interface from
 //! Juxtopposed's VLC redesign.
 //!
-//! demux thread -> video and audio decoder threads -> D3D11 renderer + Direct2D UI (this thread)
-//!                                                 -> WASAPI callback (drives the clock)
-// A GUI program: started from Explorer it opens no console window. See `main` for the log.
-#![cfg_attr(not(test), windows_subsystem = "windows")]
+//! demux thread -> video and audio decoder threads -> Metal renderer + Core Graphics UI (this thread)
+//!                                                 -> Core Audio callback (drives the clock)
 
 mod ass;
 mod assoc;
@@ -14,12 +12,14 @@ mod captions;
 mod capture;
 mod codepage;
 mod convert;
+mod d2d;
 mod disc;
 mod dsp;
 mod hdr;
 mod library;
 mod net;
 mod nv12;
+mod platform;
 mod player;
 mod prefs;
 mod probe;
@@ -47,40 +47,13 @@ use std::sync::{Arc, Mutex, OnceLock, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use d2d::{
+    IDC_HAND, IDC_IBEAM, VIRTUAL_KEY, VK_BACK, VK_D, VK_DELETE, VK_DOWN, VK_END, VK_ESCAPE, VK_F,
+    VK_F1, VK_HOME, VK_I, VK_LEFT, VK_M, VK_N, VK_O, VK_OEM_5, VK_P, VK_Q, VK_R, VK_RETURN,
+    VK_RIGHT, VK_S, VK_SPACE, VK_UP,
+};
 use ffmpeg_next as ff;
-use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
-use windows::Win32::Graphics::Dwm::{
-    DWM_WINDOW_CORNER_PREFERENCE, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_DONOTROUND, DWMWCP_ROUND,
-    DwmExtendFrameIntoClientArea, DwmSetWindowAttribute,
-};
-use windows::Win32::Graphics::Gdi::{
-    BLACK_BRUSH, GetMonitorInfoW, GetStockObject, HBRUSH, MONITOR_DEFAULTTONEAREST,
-    MONITOR_DEFAULTTONULL, MONITORINFO, MonitorFromRect, MonitorFromWindow, ScreenToClient,
-};
-use windows::Win32::System::Com::{
-    CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx, CoTaskMemFree,
-};
-use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::System::Power::{
-    ES_CONTINUOUS, ES_DISPLAY_REQUIRED, ES_SYSTEM_REQUIRED, SetThreadExecutionState,
-};
-use windows::Win32::System::Threading::{
-    GetCurrentThread, GetStartupInfoW, STARTF_USESHOWWINDOW, STARTUPINFOW, SetThreadPriority,
-    THREAD_PRIORITY_ABOVE_NORMAL,
-};
-use windows::Win32::UI::Controls::{MARGINS, WM_MOUSELEAVE};
-use windows::Win32::UI::HiDpi::{
-    DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, GetDpiForSystem, GetDpiForWindow,
-    GetSystemMetricsForDpi, SetProcessDpiAwarenessContext,
-};
-use windows::Win32::UI::Input::KeyboardAndMouse::*;
-use windows::Win32::UI::Shell::{
-    DragAcceptFiles, DragFinish, DragQueryFileW, FOS_FORCEFILESYSTEM, FOS_OVERWRITEPROMPT,
-    FOS_PICKFOLDERS, FileOpenDialog, FileSaveDialog, HDROP, IFileOpenDialog, IFileSaveDialog,
-    SIGDN_FILESYSPATH,
-};
-use windows::Win32::UI::WindowsAndMessaging::*;
-use windows::core::{HSTRING, PCWSTR, w};
+use platform::{Event, Rect, Window};
 
 use bookmarks::Bookmarks;
 use captions::CaptionStyle;
@@ -99,7 +72,7 @@ use ui::{
     PanelData, PrefsAction, QueueAction, QueueData, QueueItem, Scene, TrackTab, Ui,
 };
 
-/// The window procedure has no user data pointer here, so it reaches shared state through statics.
+/// The window's event handler is a plain function, so it reaches shared state through statics.
 static SHARED: OnceLock<Arc<Shared>> = OnceLock::new();
 /// The open file's length in seconds, as f64 bits, for seek clicks.
 static DURATION: AtomicU64 = AtomicU64::new(0);
@@ -108,10 +81,9 @@ static OPEN: Mutex<Option<PathBuf>> = Mutex::new(None);
 static RESIZED: AtomicBool = AtomicBool::new(false);
 /// Screens changed (HDR mode, brightness, layout) or the window moved: check for HDR again.
 static DISPLAY_CHANGED: AtomicBool = AtomicBool::new(false);
-/// Window style and placement saved while in borderless fullscreen.
-static WINDOWED: Mutex<Option<(isize, WINDOWPLACEMENT)>> = Mutex::new(None);
-/// The full window's placement, saved while it is the mini player.
-static MINI: Mutex<Option<WINDOWPLACEMENT>> = Mutex::new(None);
+/// The full window's restored frame and whether it was zoomed, saved while it is the mini
+/// player.
+static MINI: Mutex<Option<(Rect, bool)>> = Mutex::new(None);
 /// Thumbnail size in pixels: the grid tile at 125% scaling, 16:9.
 const THUMB_SIZE: (u32, u32) = (400, 225);
 /// Pixels across the seek bar preview's still; it shows 200 DIPs wide, so this stays sharp up to
@@ -153,8 +125,8 @@ thread_local! {
     /// Into the mini player (None) or out of it to a page. The render loop does it, since
     /// moving the window sends messages to the window procedure, which borrows `UI`.
     static MINI_REQUEST: std::cell::Cell<Option<Option<Page>>> = const { std::cell::Cell::new(None) };
-    /// Where the mini player last was: its left and bottom edges on screen, in pixels.
-    static MINI_SPOT: std::cell::Cell<Option<(i32, i32)>> = const { std::cell::Cell::new(None) };
+    /// Where the mini player last was: its left and bottom edges on screen, in points.
+    static MINI_SPOT: std::cell::Cell<Option<(f64, f64)>> = const { std::cell::Cell::new(None) };
     /// The mini player's card in DIPs, as the user last sized it (the design's at first).
     static MINI_CARD: std::cell::Cell<(f32, f32)> = const { std::cell::Cell::new((ui::mini::W, ui::mini::H)) };
     /// Whether the mini player window is sized with its queue open.
@@ -173,49 +145,12 @@ const SLEEP_END_OF_FILE: usize = 5;
 const DEFAULT_ZOOM: usize = 1;
 
 fn main() {
-    // Take the current folder out of the DLL search, so a DLL planted beside a video the user
-    // double-clicks (in Downloads, say) can't load into wushang. Ours sit beside the exe.
-    unsafe { _ = windows::Win32::System::LibraryLoader::SetDllDirectoryW(w!("")) };
-    use_parent_console();
     let result = run();
     update::finish();
+    platform::finish();
     if let Err(e) = result {
         eprintln!("wushang: {e}");
         std::process::exit(1);
-    }
-}
-
-/// A GUI program has no console. Started from a terminal, its log goes to that terminal; with
-/// stderr already redirected (a pipe, a file) it stays where it was sent.
-fn use_parent_console() {
-    use windows::Win32::Foundation::GENERIC_WRITE;
-    use windows::Win32::Storage::FileSystem::{
-        CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_WRITE, OPEN_EXISTING,
-    };
-    use windows::Win32::System::Console::{
-        ATTACH_PARENT_PROCESS, AttachConsole, GetStdHandle, STD_ERROR_HANDLE, STD_OUTPUT_HANDLE,
-        SetStdHandle,
-    };
-    unsafe {
-        // windows-rs reports an unset handle as an error carrying a success code.
-        let unset = GetStdHandle(STD_ERROR_HANDLE).map_or(true, |h| h.is_invalid());
-        if !unset || AttachConsole(ATTACH_PARENT_PROCESS).is_err() {
-            return;
-        }
-        // Attaching leaves the standard handles unset; point them at the console.
-        let console = CreateFileW(
-            w!("CONOUT$"),
-            GENERIC_WRITE.0,
-            FILE_SHARE_WRITE,
-            None,
-            OPEN_EXISTING,
-            FILE_ATTRIBUTE_NORMAL,
-            None,
-        );
-        if let Ok(console) = console {
-            _ = SetStdHandle(STD_OUTPUT_HANDLE, console);
-            _ = SetStdHandle(STD_ERROR_HANDLE, console);
-        }
     }
 }
 
@@ -261,8 +196,6 @@ struct App {
     sub_duration: f64,
     /// Playing backwards: the position last stepped back to, and when.
     reverse: Option<(f64, Instant)>,
-    /// The stereo test's sound, kept while Windows plays it.
-    test_tone: Vec<u8>,
     caption: CaptionStyle,
     devices: Vec<String>,
     /// Index into the panel's sleep list, and when a timed one runs out.
@@ -499,7 +432,7 @@ impl App {
         self.play(path, queue)
     }
 
-    /// Starts recording the open file (into Videos\wushang unless Settings says otherwise), or
+    /// Starts recording the open file (into ~/Movies/wushang unless Settings says otherwise), or
     /// stops; the notice says where it went.
     fn toggle_record(&mut self) {
         // A notice about the last recording would otherwise be lost under the new one's.
@@ -513,13 +446,13 @@ impl App {
         }
         let (dir, ext) = PREFS.with_borrow(|p| {
             let key = prefs::RECORD_DIR.get(p.record_dir).map_or("", |c| c.0);
-            let own = &windows::Win32::UI::Shell::FOLDERID_Videos;
+            let own = snapshot::Folder::Videos;
             let ext = prefs::RECORD_FORMAT
                 .get(p.record_format)
                 .map_or("mkv", |c| c.0);
             (snapshot::output_dir(key, own, &session.path), ext)
         });
-        let dir = match dir.map_err(|e| e.message()) {
+        let dir = match dir {
             Ok(dir) => dir,
             Err(e) => {
                 self.notice = Some((format!("Can't record ({e})"), Instant::now()));
@@ -539,7 +472,7 @@ impl App {
         self.notice = Some((format!("Recording to {name}"), Instant::now()));
     }
 
-    /// Converts `path` into Videos\wushang (MP4) or Music\wushang (MP3) in the background.
+    /// Converts `path` into ~/Movies/wushang (MP4) or ~/Music/wushang (MP3) in the background.
     fn convert(&mut self, path: &Path, target: convert::Target) {
         if let Some(job) = &self.converting {
             let name = job.output.file_name().unwrap_or_default().to_string_lossy();
@@ -547,17 +480,12 @@ impl App {
             return;
         }
         let folder = match target {
-            convert::Target::Mp4 => &windows::Win32::UI::Shell::FOLDERID_Videos,
-            convert::Target::Mp3 => &windows::Win32::UI::Shell::FOLDERID_Music,
+            convert::Target::Mp4 => snapshot::Folder::Videos,
+            convert::Target::Mp3 => snapshot::Folder::Music,
         };
         let dir = snapshot::known_folder(folder)
             .map(|d| d.join("wushang"))
-            .map_err(|e| e.message())
-            .and_then(|dir| {
-                std::fs::create_dir_all(&dir)
-                    .map(|()| dir)
-                    .map_err(|e| e.to_string())
-            });
+            .and_then(|dir| std::fs::create_dir_all(&dir).map(|()| dir));
         match dir {
             Ok(dir) => {
                 let stem = snapshot::stem(path, "");
@@ -633,7 +561,8 @@ impl App {
             self.notice = Some(("Streaming stopped".to_owned(), Instant::now()));
             return;
         }
-        // Every network interface, so other devices reach it; Windows may ask to let it through.
+        // Every network interface, so other devices reach it; the macOS firewall may ask to let
+        // it through.
         let port = PREFS.with_borrow(|p| p.stream_port);
         let server = match stream::Server::start(std::net::Ipv4Addr::UNSPECIFIED.into(), port) {
             Ok(server) => server,
@@ -918,13 +847,13 @@ impl App {
     }
 
     /// Applies one change from the popups.
-    fn apply(&mut self, hwnd: HWND, action: PanelAction) {
+    fn apply(&mut self, win: Window, action: PanelAction) {
         let effects = self.audio.effects();
         match action {
             PanelAction::SelectTrack(tab, i) => self.select_track(tab, i),
             PanelAction::SelectExternal(i) => self.show_external(i),
             PanelAction::AddSubtitleFile => {
-                if let Some(path) = pick_subtitle_file(hwnd) {
+                if let Some(path) = pick_subtitle_file(win) {
                     let i = match self.external.iter().position(|(p, _)| *p == path) {
                         Some(i) => i,
                         None => {
@@ -935,9 +864,9 @@ impl App {
                     self.show_external(Some(i));
                 }
             }
-            PanelAction::AddAudioFile => add_audio_file(self, hwnd),
+            PanelAction::AddAudioFile => add_audio_file(self, win),
             PanelAction::SelectDevice(i) => {
-                // The list starts with the system default, which also follows Windows' choice.
+                // The list starts with the system default, which also follows the system's choice.
                 let name = (i > 0).then(|| self.devices.get(i)).flatten();
                 self.audio.switch_to(name.map(String::as_str));
                 // The choice sticks, as Settings' "Output device".
@@ -1001,9 +930,9 @@ impl App {
                 self.caption.size_ratio = CaptionStyle::default().size_ratio * v.clamp(0.5, 2.0)
             }
             PanelAction::SetReverse(on) => self.set_reverse(on),
-            PanelAction::SetVisualizer(i) => self.change_prefs(hwnd, |p| p.visualizer = i),
-            PanelAction::SetSubTimeline(on) => self.change_prefs(hwnd, |p| p.sub_timeline = on),
-            PanelAction::SetHdr(on) => self.change_prefs(hwnd, |p| p.hdr = on),
+            PanelAction::SetVisualizer(i) => self.change_prefs(win, |p| p.visualizer = i),
+            PanelAction::SetSubTimeline(on) => self.change_prefs(win, |p| p.sub_timeline = on),
+            PanelAction::SetHdr(on) => self.change_prefs(win, |p| p.hdr = on),
             PanelAction::SetResolution(i) => {
                 let i = i.or_else(|| ui::panels::best_video(&self.panel_data().video_sizes));
                 if i.is_some() {
@@ -1018,30 +947,30 @@ impl App {
             PanelAction::TestStereo => self.test_stereo(),
             PanelAction::SetSubSpeed(v) => self.sub_speed = f64::from(v.clamp(0.5, 2.0)),
             PanelAction::SetSubDuration(v) => self.sub_duration = f64::from(v.clamp(0.0, 4.0)),
-            PanelAction::SetSubStyles(on) => self.change_prefs(hwnd, |p| p.sub_styles = on),
+            PanelAction::SetSubStyles(on) => self.change_prefs(win, |p| p.sub_styles = on),
             PanelAction::SetSubFont(i) => {
                 if let Some(font) = prefs::FONTS.get(i) {
-                    self.change_prefs(hwnd, |p| p.sub_font = (*font).to_owned());
+                    self.change_prefs(win, |p| p.sub_font = (*font).to_owned());
                 }
             }
             PanelAction::SetSubColor(i) => {
                 if let Some((rgb, _)) = prefs::COLORS.get(i) {
-                    self.change_prefs(hwnd, |p| p.sub_color = *rgb);
+                    self.change_prefs(win, |p| p.sub_color = *rgb);
                 }
             }
             PanelAction::SetOutlineColor(i) => {
                 if let Some((rgb, _)) = prefs::COLORS.get(i) {
-                    self.change_prefs(hwnd, |p| p.outline_color = *rgb);
+                    self.change_prefs(win, |p| p.outline_color = *rgb);
                 }
             }
             PanelAction::SetProfile(i) => {
                 if let Some(name) = self.profiles.names().get(i).cloned()
-                    && let Err(e) = self.switch_profile(hwnd, &name, false)
+                    && let Err(e) = self.switch_profile(win, &name, false)
                 {
                     eprintln!("profiles: cannot switch to {name}: {e}");
                 }
             }
-            PanelAction::EditSubtitle => self.edit_subtitle(hwnd),
+            PanelAction::EditSubtitle => self.edit_subtitle(win),
         }
     }
 
@@ -1090,7 +1019,7 @@ impl App {
             .selected(TrackKind::Audio)
             .and_then(|a| s.tracks(TrackKind::Audio).iter().find(|t| t.stream == a));
         let decoding = match self.current.as_ref().map(|c| c.frame.format()) {
-            Some(ff::format::Pixel::D3D11) => "GPU (D3D11VA)",
+            Some(ff::format::Pixel::VIDEOTOOLBOX) => "GPU (VideoToolbox)",
             Some(_) => "software",
             None => "-",
         };
@@ -1200,7 +1129,7 @@ impl App {
     }
 
     /// Applies one change from the queue panel.
-    fn apply_queue(&mut self, hwnd: HWND, action: QueueAction) {
+    fn apply_queue(&mut self, win: Window, action: QueueAction) {
         match action {
             QueueAction::Play(i) => {
                 if let Some(path) = self.queue.play_at(i) {
@@ -1211,7 +1140,7 @@ impl App {
             QueueAction::PlayNext(i) => self.queue.play_next(i),
             QueueAction::Remove(i) => _ = self.queue.remove(i),
             QueueAction::AddFiles => {
-                let files = pick_media_files(hwnd);
+                let files = pick_media_files(win);
                 self.add_to_queue(files);
             }
             QueueAction::Sort => self.queue.sort_by_name(),
@@ -1243,10 +1172,10 @@ impl App {
 
     /// Settings from the Settings window. What changed takes effect now, except the per-file
     /// defaults (speed, aspect ratio, tracks, decoding, fullscreen), which the next file uses.
-    fn apply_prefs(&mut self, hwnd: HWND, new: Prefs) {
+    fn apply_prefs(&mut self, win: Window, new: Prefs) {
         let old = prefs();
         if new.on_top != old.on_top {
-            set_topmost(hwnd, new.on_top);
+            set_topmost(win, new.on_top);
         }
         UI.with_borrow_mut(|ui| {
             ui.auto_hide = new.auto_hide;
@@ -1277,10 +1206,10 @@ impl App {
     }
 
     /// Applies `change` to the settings, as the Settings window would.
-    fn change_prefs(&mut self, hwnd: HWND, change: impl FnOnce(&mut Prefs)) {
+    fn change_prefs(&mut self, win: Window, change: impl FnOnce(&mut Prefs)) {
         let mut p = prefs();
         change(&mut p);
-        self.apply_prefs(hwnd, p);
+        self.apply_prefs(win, p);
     }
 
     /// Opens the subtitles on screen again, so "Embedded Sub Format" applies to them.
@@ -1345,58 +1274,28 @@ impl App {
     }
 
     /// The stereo "Test": a tone on the left, then the right, as the stereo mode plays them.
-    // ponytail: Windows plays it on the default device at its own volume; mix it into the
+    // ponytail: the system plays it on the default device at its own volume; mix it into the
     // player's output if the chosen device or volume should count.
     fn test_stereo(&mut self) {
-        use windows::Win32::Media::Audio::{PlaySoundW, SND_ASYNC, SND_MEMORY, SND_NODEFAULT};
-        use windows::core::PCWSTR;
-        unsafe {
-            // Stops a test still playing before its sound is freed.
-            _ = PlaySoundW(PCWSTR::null(), None, SND_ASYNC);
-            self.test_tone = dsp::test_tone(self.audio.effects().stereo());
-            let sound = PCWSTR(self.test_tone.as_ptr().cast());
-            _ = PlaySoundW(sound, None, SND_MEMORY | SND_ASYNC | SND_NODEFAULT);
-        }
+        platform::play_sound(dsp::test_tone(self.audio.effects().stereo()));
     }
 
-    /// Opens the chosen subtitle file in the program Windows edits it with, else Notepad.
-    fn edit_subtitle(&self, hwnd: HWND) {
-        use windows::Win32::UI::Shell::ShellExecuteW;
-        let Some((path, _)) = self.external_selected.and_then(|i| self.external.get(i)) else {
-            return;
-        };
-        let file = HSTRING::from(path.as_os_str());
-        unsafe {
-            let done = ShellExecuteW(Some(hwnd), w!("edit"), &file, None, None, SW_SHOWNORMAL);
-            // Above 32 means it started.
-            if done.0 as usize <= 32 {
-                let quoted = HSTRING::from(format!("\"{}\"", path.display()));
-                // By full path: a bare name is looked up in the current folder first, where a
-                // download could have put a notepad.exe of its own.
-                let root = std::env::var_os("SystemRoot").unwrap_or_else(|| r"C:\Windows".into());
-                let notepad =
-                    HSTRING::from(Path::new(&root).join(r"System32\notepad.exe").as_os_str());
-                ShellExecuteW(
-                    Some(hwnd),
-                    w!("open"),
-                    &notepad,
-                    &quoted,
-                    None,
-                    SW_SHOWNORMAL,
-                );
-            }
+    /// Opens the chosen subtitle file in the user's text editor.
+    fn edit_subtitle(&self, _win: Window) {
+        if let Some((path, _)) = self.external_selected.and_then(|i| self.external.get(i)) {
+            platform::edit_text_file(path);
         }
     }
 
     /// Switches to a settings profile, adding it first when `create`, and applies its settings.
-    fn switch_profile(&mut self, hwnd: HWND, name: &str, create: bool) -> std::io::Result<()> {
+    fn switch_profile(&mut self, win: Window, name: &str, create: bool) -> std::io::Result<()> {
         let live = prefs();
         let new = if create {
             self.profiles.create(name, &live)?
         } else {
             self.profiles.switch(name, &live)?
         };
-        self.apply_prefs(hwnd, new);
+        self.apply_prefs(win, new);
         // Saved now, along with profile.txt, rather than a moment later.
         self.prefs_changed = None;
         prefs().save(&Library::default_dir())
@@ -1461,14 +1360,12 @@ fn apply_effects(audio: &audio::Device, old: Option<&Prefs>, new: &Prefs) {
     }
 }
 
-/// "Keep window above other windows".
-fn set_topmost(hwnd: HWND, on: bool) {
-    let after = if on { HWND_TOPMOST } else { HWND_NOTOPMOST };
-    let flags = SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE;
-    unsafe { _ = SetWindowPos(hwnd, Some(after), 0, 0, 0, 0, flags) };
+/// "Keep window above other windows". The mini player stays above them either way.
+fn set_topmost(win: Window, on: bool) {
+    win.set_floating(on || is_mini());
 }
 
-/// The colours `p` asks for; "System" follows Windows' app mode.
+/// The colours `p` asks for; "System" follows the system's light or dark appearance.
 fn theme_of(p: &Prefs) -> ui::theme::Theme {
     ui::theme::Theme {
         light: match p.theme {
@@ -1513,19 +1410,23 @@ fn run() -> Result<(), Box<dyn Error>> {
     if play_and_exit && path.is_none() {
         return Err(USAGE.into());
     }
-    // Off the window's thread; it only writes the registry when the exe has moved.
+    // Off the window's thread.
     thread::spawn(assoc::register);
 
     ff::init()?;
-    // Sets up Winsock and TLS once, instead of on every stream opened.
+    // Sets up TLS once, instead of on every stream opened.
     unsafe { ff::ffi::avformat_network_init() };
     ff::util::log::set_level(ff::util::log::Level::Error);
-    // The folder picker is a COM object.
-    unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED).ok()? };
     let shared = Arc::new(Shared::new());
     _ = SHARED.set(shared.clone());
-    // WASAPI takes seconds to open on some machines, so start now, while the window comes up.
+    // The audio device can take a moment to open, so start now, while the window comes up.
     let audio = audio::Device::open(shared.clone());
+    // A file opened from Finder (Open With, a double-click, a drop on the Dock icon) arrives
+    // as AppKit starts, as a command-line file does on Windows.
+    let opened = platform::init();
+    if path.is_none() {
+        path = opened.into_iter().next();
+    }
     // No settings yet means wushang hasn't run here before: the welcome shows.
     let first_run = !Library::default_dir().join("settings.txt").exists();
     let settings = Prefs::load(&Library::default_dir());
@@ -1548,7 +1449,7 @@ fn run() -> Result<(), Box<dyn Error>> {
     let hw = if software {
         None
     } else {
-        HwDevice::from_d3d11(&device)
+        HwDevice::videotoolbox()
     };
     let mut app = App {
         shared: shared.clone(),
@@ -1576,7 +1477,6 @@ fn run() -> Result<(), Box<dyn Error>> {
         sub_speed: 1.0,
         sub_duration: 0.0,
         reverse: None,
-        test_tone: Vec::new(),
         caption: settings.caption(),
         devices: audio::output_devices(),
         sleep: 0,
@@ -1626,27 +1526,26 @@ fn run() -> Result<(), Box<dyn Error>> {
 
     let mut shown_title = window_title(app.session.as_ref());
     let size = app.session.as_ref().and_then(|s| s.video_size);
-    let hwnd = create_window(&shown_title, size.unwrap_or((1600, 900)))?;
-    let maximized = restore_placement(hwnd, &settings);
+    let win = create_window(&shown_title, size.unwrap_or((1600, 900)));
+    let maximized = restore_placement(win, &settings);
     if settings.on_top {
-        set_topmost(hwnd, true);
+        set_topmost(win, true);
     }
-    let lock = app.hw.as_ref().and_then(|h| DeviceLock::from_hw(h.d3d11()));
-    let mut renderer = Renderer::new(hwnd, client_size(hwnd), device, lock)?;
-    // Show the window the way the launcher asked (a "Run: Minimized" shortcut, or a script that
-    // starts us minimized without focus). The swap chain already exists, so a window that starts
-    // minimized still gets full-size buffers.
-    let show = if maximized && !launched_minimized() {
-        SW_SHOWMAXIMIZED
-    } else {
-        SW_SHOWDEFAULT
-    };
-    unsafe { _ = ShowWindow(hwnd, show) };
-    unsafe { DragAcceptFiles(hwnd, true) };
+    platform::set_handler(on_event);
+    let lock = app.hw.as_ref().and_then(DeviceLock::from_hw);
+    let mut renderer = Renderer::new(win.layer(), win.size_px(), device, lock)?;
+    // Show the window the way the launcher asked: `open -j` starts wushang hidden, and then it
+    // stays out of the way and isn't zoomed. The layer already has its size, so a window that
+    // starts hidden still gets full-size drawables.
+    let hidden = platform::launched_hidden();
+    win.show(!hidden);
+    if maximized && !hidden && !win.is_zoomed() {
+        win.zoom();
+    }
     // libdav1d keeps every core busy in bursts, and at normal priority this render loop then woke
     // up 40 ms late and skipped frames. VLC runs its video output thread above normal for the
-    // same reason. Only this thread is raised; Windows threads don't inherit priority.
-    unsafe { _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL) };
+    // same reason; here the main thread asks for the user-interactive class.
+    platform::raise_thread_priority();
 
     // Started on a file, it plays; the welcome waits for a launch without one.
     if first_run && path.is_none() {
@@ -1674,8 +1573,10 @@ fn run() -> Result<(), Box<dyn Error>> {
 
     let (mut shown, mut dropped) = (0u64, 0u64);
     let mut last_position = 0.0;
-    // Whether Windows is asked to keep the screen on.
+    // Whether the system is asked to keep the screen on.
     let mut awake = false;
+    // Whether the pointer was hidden over the video, so it hides once each time the bars do.
+    let mut pointer_hidden = false;
     // One pass of the render loop; false ends playback (--play-and-exit). See `run_frames`.
     let mut frame = || -> Result<bool, Box<dyn Error>> {
         // Nothing to show in the mini player once playback ends.
@@ -1683,12 +1584,12 @@ fn run() -> Result<(), Box<dyn Error>> {
             MINI_REQUEST.set(Some(Some(Page::Library)));
         }
         match MINI_REQUEST.take() {
-            Some(None) if app.session.is_some() => enter_mini(hwnd),
-            Some(Some(page)) => exit_mini(hwnd, page),
+            Some(None) if app.session.is_some() => enter_mini(win),
+            Some(Some(page)) => exit_mini(win, page),
             _ => {}
         }
         if is_mini() {
-            fit_mini(hwnd, UI.with_borrow(|ui| ui.queue.open));
+            fit_mini(win, UI.with_borrow(|ui| ui.queue.open));
         }
         if let Some(path) = OPEN.lock().unwrap().take() {
             // Dropped on an open playlist, a file joins it; anywhere else it plays.
@@ -1706,14 +1607,14 @@ fn run() -> Result<(), Box<dyn Error>> {
             }
         }
         for action in PANEL_ACTIONS.with_borrow_mut(std::mem::take) {
-            app.apply(hwnd, action);
+            app.apply(win, action);
             app.sync_prefs();
             // Video adjustments change the picture without a new frame.
             UI.with_borrow_mut(|ui| ui.dirty = true);
         }
         for action in PREFS_ACTIONS.with_borrow_mut(std::mem::take) {
             match action {
-                PrefsAction::Changed(p) => app.apply_prefs(hwnd, *p),
+                PrefsAction::Changed(p) => app.apply_prefs(win, *p),
                 PrefsAction::ClearHistory => {
                     app.library.clear_history();
                     app.library_changed = true;
@@ -1735,12 +1636,12 @@ fn run() -> Result<(), Box<dyn Error>> {
             }
         }
         if std::mem::take(&mut app.enter_fullscreen) && !is_fullscreen() {
-            toggle_fullscreen(hwnd);
+            toggle_fullscreen(win);
         }
         for action in ONBOARDING_ACTIONS.with_borrow_mut(std::mem::take) {
             match action {
                 ui::onboarding::OnboardingAction::PickFolder => {
-                    if let Some(dir) = pick_folder(hwnd) {
+                    if let Some(dir) = pick_folder(win) {
                         app.library.add_root(Section::Videos, dir);
                         app.library_changed = true;
                         app.save();
@@ -1754,7 +1655,7 @@ fn run() -> Result<(), Box<dyn Error>> {
             }
         }
         for action in DIALOG_ACTIONS.with_borrow_mut(std::mem::take) {
-            apply_dialog(&mut app, hwnd, action);
+            apply_dialog(&mut app, win, action);
         }
         if WANT_PROPERTIES.take() {
             show_properties(&app);
@@ -1794,7 +1695,7 @@ fn run() -> Result<(), Box<dyn Error>> {
             UI.with_borrow_mut(|ui| ui.dirty = true);
         }
         for action in QUEUE_ACTIONS.with_borrow_mut(std::mem::take) {
-            app.apply_queue(hwnd, action);
+            app.apply_queue(win, action);
             app.sync_prefs();
             UI.with_borrow_mut(|ui| ui.dirty = true);
         }
@@ -1817,13 +1718,13 @@ fn run() -> Result<(), Box<dyn Error>> {
                     ui.relayout = true;
                 }
             });
-            handle(&mut app, hwnd, hit);
+            handle(&mut app, win, hit);
         }
         for (hit, x, y) in MENU_REQUESTS.with_borrow_mut(std::mem::take) {
             open_menu(&mut app, hit, (x, y));
         }
         for action in MENU_ACTIONS.with_borrow_mut(std::mem::take) {
-            menu_action(&mut app, hwnd, action);
+            menu_action(&mut app, win, action);
             app.sync_prefs();
         }
         DURATION.store(
@@ -1922,20 +1823,11 @@ fn run() -> Result<(), Box<dyn Error>> {
                             .is_some_and(|d| matches!(d.dialog, Dialog::Update(_)))
                     }) {
                         update::install_on_exit(msi);
-                        unsafe { _ = DestroyWindow(hwnd) };
+                        destroy(win);
                     }
                 }
-                // The zip selected in Downloads, and wushang's folder beside it to copy into.
-                Ok(update::Saved::Zip(zip)) => {
-                    if let Some(dir) = std::env::current_exe()
-                        .ok()
-                        .and_then(|e| e.parent().map(Path::to_owned))
-                    {
-                        _ = std::process::Command::new("explorer.exe").arg(dir).spawn();
-                    }
-                    menu_action(&mut app, hwnd, MenuAction::ShowInExplorer(zip.clone()));
-                    open_dialog(&app, Dialog::Downloaded(zip));
-                }
+                // The download is selected in Finder already, to drag into Applications.
+                Ok(update::Saved::Zip(zip)) => open_dialog(&app, Dialog::Downloaded(zip)),
                 Err(e) => UI.with_borrow_mut(|ui| ui.dialog_error(e)),
             }
         }
@@ -1977,11 +1869,11 @@ fn run() -> Result<(), Box<dyn Error>> {
 
         let resized = RESIZED.swap(false, Relaxed);
         if resized {
-            let (w, h) = client_size(hwnd);
+            let (w, h) = win.size_px();
             renderer.resize(w, h)?;
         }
         let hdr = PREFS.with_borrow(|p| p.hdr);
-        renderer.update_display(hwnd, hdr, DISPLAY_CHANGED.swap(false, Relaxed));
+        renderer.update_display(&win.ns_window(), hdr, DISPLAY_CHANGED.swap(false, Relaxed));
 
         app.step_reverse();
         app.scrub(UI.with_borrow(Ui::scrubbing));
@@ -1994,12 +1886,7 @@ fn run() -> Result<(), Box<dyn Error>> {
             && app.session.as_ref().is_some_and(|s| s.video_size.is_some());
         if want_awake != awake {
             awake = want_awake;
-            let flags = if awake {
-                ES_CONTINUOUS | ES_DISPLAY_REQUIRED | ES_SYSTEM_REQUIRED
-            } else {
-                ES_CONTINUOUS
-            };
-            unsafe { SetThreadExecutionState(flags) };
+            platform::keep_awake(awake);
         }
         // Without audio (or once its device failed), video starts the system clock from the frame on
         // screen, after opening and after every seek.
@@ -2032,19 +1919,20 @@ fn run() -> Result<(), Box<dyn Error>> {
             })
         });
 
-        // Lay out for the current size, page and bar visibility; a change means a repaint.
-        let dpi = unsafe { GetDpiForWindow(hwnd) }.max(96) as f32;
-        let (w, h) = client_size(hwnd);
-        let (w, h) = (w as f32 * 96.0 / dpi, h as f32 * 96.0 / dpi);
-        let fullscreen = WINDOWED.lock().unwrap().is_some();
+        // Lay out for the current size, page and bar visibility; a change means a repaint. The
+        // layout's DIPs are AppKit's points.
+        let dpi = (96.0 * win.scale()) as f32;
+        let (w, h) = win.size();
+        let (w, h) = (w as f32, h as f32);
+        let fullscreen = win.is_fullscreen();
         let has_video = app.session.as_ref().is_some_and(|s| s.video_size.is_some());
         let card = app.session.is_some();
         let panel_data = app.panel_data();
         let queue_data = UI.with_borrow(|ui| ui.queue.open).then(|| app.queue_data());
-        // The taskbar and Alt+Tab name the file playing.
+        // The Window menu, Mission Control and the Dock name the file playing.
         let title = window_title(app.session.as_ref());
         if title != shown_title {
-            unsafe { _ = SetWindowTextW(hwnd, &HSTRING::from(&title)) };
+            win.set_title(&title);
             shown_title = title;
         }
         let needs_paint = UI.with_borrow_mut(|ui| {
@@ -2256,8 +2144,17 @@ fn run() -> Result<(), Box<dyn Error>> {
                 shown += 1;
             }
         } else {
-            thread::sleep(Duration::from_millis(2));
+            // Nothing to show yet: wait a moment, or until the user does something.
+            platform::wait_for_event(Duration::from_millis(2));
         }
+        // Hide the pointer over the video while the bars are hidden, like VLC.
+        let hide = UI.with_borrow(|ui| {
+            ui.page == Page::Player && !ui.layout.bars && ui.hover == Some(Hit::Video)
+        });
+        if hide && !pointer_hidden {
+            platform::hide_cursor_until_moved();
+        }
+        pointer_hidden = hide;
         // Checked on painting passes too: the visualizer paints every one.
         if !paused && app.session.as_ref().is_some_and(Session::finished) {
             if play_and_exit {
@@ -2271,7 +2168,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                 app.sleep = 0;
                 app.stop();
                 if quit {
-                    unsafe { _ = DestroyWindow(hwnd) };
+                    destroy(win);
                 }
             }
             last_position = 0.0;
@@ -2297,7 +2194,7 @@ fn run() -> Result<(), Box<dyn Error>> {
             eprintln!("settings: cannot save ({e})");
         }
     }
-    unsafe { SetThreadExecutionState(ES_CONTINUOUS) };
+    platform::keep_awake(false);
     drop(app);
     eprintln!("shown {shown} frames, dropped {dropped}");
     rendered
@@ -2318,25 +2215,24 @@ thread_local! {
     static IN_FRAME: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-/// The timer that runs passes while Windows' own move and size loop has the thread.
-const MODAL_TIMER: usize = 1;
 /// Passes in a row that may fail, about two seconds' worth, before wushang gives up. One failed
 /// pass only costs a frame.
 const MAX_FAILED_PASSES: u32 = 120;
 
 /// Runs `frame` until the window closes, `quit` is set or the pass returns false.
 ///
-/// Dragging the window or its edge makes Windows run a message loop of its own until the mouse
-/// lets go, so this loop stops and the video froze. While that loop runs, a timer has the window
-/// procedure run passes instead (`modal_frame`).
+/// Resizing the window, an open menu or a file picker makes AppKit run an event loop of its own
+/// until it is done, so this loop stops and the video would freeze. While that loop runs, a timer
+/// in its run loop modes runs passes instead (`modal_frame`).
 fn run_frames(frame: &mut Frame<'_>, quit: &AtomicBool) -> Result<(), Box<dyn Error>> {
     // The lifetime is erased for the thread-local; the pointer is gone before `frame` is, and
     // every pass goes through it, one at a time.
     let ptr: *mut Frame<'static> = unsafe { std::mem::transmute(frame as *mut Frame<'_>) };
     FRAME.set(Some(ptr));
+    platform::set_modal_tick(modal_frame);
     let mut failed = 0;
     let result = loop {
-        if !pump_messages() || quit.load(Relaxed) {
+        if !platform::pump_messages() || quit.load(Relaxed) {
             break Ok(());
         }
         match call_frame(ptr) {
@@ -2361,12 +2257,13 @@ fn call_frame(ptr: *mut Frame<'static>) -> Result<bool, Box<dyn Error>> {
     if IN_FRAME.replace(true) {
         return Ok(true);
     }
-    let result = unsafe { (*ptr)() };
+    // A pass's drawable and other autoreleased objects go when it ends, not when the app does.
+    let result = platform::autoreleasepool(|_| unsafe { (*ptr)() });
     IN_FRAME.set(false);
     result
 }
 
-/// A pass from the window procedure's timer during a window drag.
+/// A pass from the timer in AppKit's own loops.
 fn modal_frame() {
     if let Some(ptr) = FRAME.get()
         && let Err(e) = call_frame(ptr)
@@ -2405,18 +2302,18 @@ fn save_tags(tracks: &HashMap<PathBuf, (tags::Stamp, Track)>) {
 }
 
 /// A click that needs the library or opens files.
-fn handle(app: &mut App, hwnd: HWND, hit: Hit) {
+fn handle(app: &mut App, win: Window, hit: Hit) {
     let go = |place: Place| UI.with_borrow_mut(|ui| ui.browse.go(place));
     match hit {
         Hit::Nav(section) => go(section.place()),
         Hit::AddItem => {
             let section = UI.with_borrow(|ui| ui.browse.place.section());
-            add_folder(app, hwnd, section);
+            add_folder(app, win, section);
         }
         Hit::AddHere => match UI.with_borrow(|ui| ui.browse.place.clone()) {
             Place::Playlists => create_playlist(app),
-            Place::Playlist(name) => add_files_to_playlist(app, hwnd, &name),
-            place => add_folder(app, hwnd, place.section()),
+            Place::Playlist(name) => add_files_to_playlist(app, win, &name),
+            place => add_folder(app, win, place.section()),
         },
         Hit::Back => UI.with_borrow_mut(|ui| ui.browse.back()),
         Hit::Forward => UI.with_borrow_mut(|ui| ui.browse.forward()),
@@ -2463,7 +2360,7 @@ fn handle(app: &mut App, hwnd: HWND, hit: Hit) {
                     }
                 }
                 Entry::Action { action, .. } => match action {
-                    library::Action::AddFolder(section) => add_folder(app, hwnd, section),
+                    library::Action::AddFolder(section) => add_folder(app, win, section),
                     library::Action::CreatePlaylist => create_playlist(app),
                     library::Action::AddNetworkStream => {
                         open_dialog(app, Dialog::Address(NetKind::Stream));
@@ -2475,7 +2372,7 @@ fn handle(app: &mut App, hwnd: HWND, hit: Hit) {
             }
         }
         Hit::Card => UI.with_borrow_mut(|ui| ui.show(Page::Player)),
-        Hit::Tool(item) => use_tool(app, hwnd, item),
+        Hit::Tool(item) => use_tool(app, win, item),
         Hit::MiniExpand if is_mini() => MINI_REQUEST.set(Some(Some(Page::Player))),
         Hit::MiniExpand => UI.with_borrow_mut(|ui| ui.show(Page::Player)),
         Hit::MiniClose => {
@@ -2598,11 +2495,11 @@ fn open_menu(app: &mut App, hit: Hit, at: (f32, f32)) {
 }
 
 /// Carries out a menu choice.
-fn menu_action(app: &mut App, hwnd: HWND, action: MenuAction) {
+fn menu_action(app: &mut App, win: Window, action: MenuAction) {
     let show_player = || UI.with_borrow_mut(|ui| ui.show(Page::Player));
     match action {
         MenuAction::OpenFiles => {
-            let files = pick_media_files(hwnd);
+            let files = pick_media_files(win);
             if let Some(first) = files.first().cloned()
                 && app.play(&first, files)
             {
@@ -2610,7 +2507,7 @@ fn menu_action(app: &mut App, hwnd: HWND, action: MenuAction) {
             }
         }
         MenuAction::OpenFolder => {
-            if let Some(dir) = pick_folder(hwnd) {
+            if let Some(dir) = pick_folder(win) {
                 let queue = app.library.media_in(&Place::Folder(Section::Videos, dir));
                 if let Some(first) = queue.first().cloned()
                     && app.play(&first, queue)
@@ -2649,11 +2546,11 @@ fn menu_action(app: &mut App, hwnd: HWND, action: MenuAction) {
             }
         }
         MenuAction::Preferences(category) => open_preferences(app, category),
-        MenuAction::Quit => unsafe { _ = DestroyWindow(hwnd) },
+        MenuAction::Quit => destroy(win),
         MenuAction::TogglePause => app.shared.toggle_pause(),
         MenuAction::Stop => app.stop(),
-        MenuAction::Previous => handle(app, hwnd, Hit::Previous),
-        MenuAction::Next => handle(app, hwnd, Hit::Next),
+        MenuAction::Previous => handle(app, win, Hit::Previous),
+        MenuAction::Next => handle(app, win, Hit::Next),
         MenuAction::HideUi => UI.with_borrow_mut(Ui::hide_bars),
         MenuAction::MiniPlayer if is_mini() => MINI_REQUEST.set(Some(Some(Page::Player))),
         MenuAction::MiniPlayer => MINI_REQUEST.set(Some(None)),
@@ -2667,7 +2564,7 @@ fn menu_action(app: &mut App, hwnd: HWND, action: MenuAction) {
             });
         }
         MenuAction::Profile(name) => {
-            if let Err(e) = app.switch_profile(hwnd, &name, false) {
+            if let Err(e) = app.switch_profile(win, &name, false) {
                 eprintln!("profiles: cannot switch to {name} ({e})");
             }
         }
@@ -2710,14 +2607,14 @@ fn menu_action(app: &mut App, hwnd: HWND, action: MenuAction) {
             }
         }
         MenuAction::OpenDisc(folder) => {
-            let Some(folder) = folder.or_else(|| pick_folder(hwnd)) else {
+            let Some(folder) = folder.or_else(|| pick_folder(win)) else {
                 return;
             };
             open_disc(app, &folder);
         }
         MenuAction::OpenDiscImage => {
             let images = [("Blu-ray images", "*.iso".to_owned())];
-            if let Some(image) = pick_files(hwnd, &images, false).pop() {
+            if let Some(image) = pick_files(win, &images, false).pop() {
                 open_disc(app, &image);
             }
         }
@@ -2728,9 +2625,9 @@ fn menu_action(app: &mut App, hwnd: HWND, action: MenuAction) {
                 show_player();
             }
         }
-        MenuAction::Panel(a) => app.apply(hwnd, a),
+        MenuAction::Panel(a) => app.apply(win, a),
         MenuAction::Queue(a) => {
-            app.apply_queue(hwnd, a);
+            app.apply_queue(win, a);
             UI.with_borrow_mut(|ui| ui.dirty = true);
         }
         // Files join the queue, or play when nothing is open.
@@ -2751,28 +2648,14 @@ fn menu_action(app: &mut App, hwnd: HWND, action: MenuAction) {
             }
             UI.with_borrow_mut(|ui| ui.browse.stale = true);
         }
-        MenuAction::ShowInExplorer(path) => {
-            use std::os::windows::process::CommandExt;
-            // explorer.exe wants the quotes inside its one argument, so it goes in raw. No real
-            // file name holds a quote, and one from a feed's address could end the argument and
-            // add others, so such a path never gets here.
-            let select = format!("/select,\"{}\"", path.display());
-            if path.to_string_lossy().contains('"') {
-                eprintln!("explorer: not a file");
-            } else if let Err(e) = std::process::Command::new("explorer.exe")
-                .raw_arg(select)
-                .spawn()
-            {
-                eprintln!("explorer: {e}");
-            }
-        }
+        MenuAction::ShowInExplorer(path) => platform::reveal_in_finder(&path),
         MenuAction::GoToSource(path) => {
             if let Some(dir) = path.parent() {
                 let place = Place::Folder(section_of(&path), dir.to_owned());
                 UI.with_borrow_mut(|ui| ui.browse.go(place));
             }
         }
-        MenuAction::AddSubtitleTo(path) => add_subtitle_to(app, hwnd, &path),
+        MenuAction::AddSubtitleTo(path) => add_subtitle_to(app, win, &path),
         MenuAction::AddAudioTo(path) => {
             if app.session.as_ref().is_none_or(|s| s.path != path) {
                 let place = UI.with_borrow(|ui| ui.browse.place.clone());
@@ -2785,7 +2668,7 @@ fn menu_action(app: &mut App, hwnd: HWND, action: MenuAction) {
                 }
                 show_player();
             }
-            add_audio_file(app, hwnd);
+            add_audio_file(app, win);
         }
         MenuAction::ForgetAddress(kind, url) => {
             app.library.remove_address(kind, &url);
@@ -2797,14 +2680,14 @@ fn menu_action(app: &mut App, hwnd: HWND, action: MenuAction) {
                 ui.browse.stale = true;
             });
         }
-        MenuAction::AddFolder(section) => add_folder(app, hwnd, section),
+        MenuAction::AddFolder(section) => add_folder(app, win, section),
         MenuAction::Resync => {
             app.library.forget_media_folders();
             UI.with_borrow_mut(|ui| ui.browse.stale = true);
         }
         MenuAction::PlayPlaylist(name) => play_playlist(app, &name, false),
         MenuAction::ShufflePlaylist(name) => play_playlist(app, &name, true),
-        MenuAction::ExportPlaylist(name) => export_playlist(app, hwnd, &name),
+        MenuAction::ExportPlaylist(name) => export_playlist(app, win, &name),
         MenuAction::Sort(mode) => UI.with_borrow_mut(|ui| {
             ui.browse.set_sort(mode);
             ui.browse.scroll = 0.0;
@@ -2865,13 +2748,13 @@ fn toggle_favorite(app: &mut App, path: &Path) {
 }
 
 /// Picks an audio file and plays its sound with the open file, as a track of its own.
-fn add_audio_file(app: &mut App, hwnd: HWND) {
+fn add_audio_file(app: &mut App, win: Window) {
     let filters = [
         ("Audio files", file_spec(library::AUDIO_EXTS)),
         ("Video files", file_spec(library::VIDEO_EXTS)),
         ("All files", "*.*".to_owned()),
     ];
-    let Some(path) = pick_files(hwnd, &filters, false).pop() else {
+    let Some(path) = pick_files(win, &filters, false).pop() else {
         return;
     };
     let Some(session) = app.session.as_mut() else {
@@ -2888,8 +2771,8 @@ fn add_audio_file(app: &mut App, hwnd: HWND) {
 }
 
 /// Picks a subtitle file for `path` and shows it: on the open file, or on `path` once it plays.
-fn add_subtitle_to(app: &mut App, hwnd: HWND, path: &Path) {
-    let Some(subs) = pick_subtitle_file(hwnd) else {
+fn add_subtitle_to(app: &mut App, win: Window, path: &Path) {
+    let Some(subs) = pick_subtitle_file(win) else {
         return;
     };
     let open = app.session.as_ref().is_some_and(|s| s.path == path);
@@ -2944,8 +2827,8 @@ fn shuffle_in_place<T>(items: &mut [T]) {
 }
 
 /// Writes a playlist to an M3U file the user picks, with absolute paths so it works anywhere.
-fn export_playlist(app: &App, hwnd: HWND, name: &str) {
-    let Some(file) = pick_save_file(hwnd, &format!("{name}.m3u")) else {
+fn export_playlist(app: &App, win: Window, name: &str) {
+    let Some(file) = pick_save_file(win, &format!("{name}.m3u")) else {
         return;
     };
     let mut text = String::from("#EXTM3U\n");
@@ -2958,12 +2841,12 @@ fn export_playlist(app: &App, hwnd: HWND, name: &str) {
     }
 }
 
-fn add_folder(app: &mut App, hwnd: HWND, section: Section) {
+fn add_folder(app: &mut App, win: Window, section: Section) {
     let section = match section {
         Section::Music => Section::Music,
         _ => Section::Videos,
     };
-    if let Some(dir) = pick_folder(hwnd) {
+    if let Some(dir) = pick_folder(win) {
         app.library.add_root(section, dir);
         app.library_changed = true;
         app.save();
@@ -2990,7 +2873,7 @@ fn open_dialog(app: &App, dialog: Dialog) {
 }
 
 /// Does what the open dialog asked for.
-fn apply_dialog(app: &mut App, hwnd: HWND, action: DialogAction) {
+fn apply_dialog(app: &mut App, win: Window, action: DialogAction) {
     // Library errors in words for the dialog's error line.
     let explain = |e: std::io::Error| match e.kind() {
         std::io::ErrorKind::AlreadyExists => "A playlist with this name already exists.".to_owned(),
@@ -3031,7 +2914,7 @@ fn apply_dialog(app: &mut App, hwnd: HWND, action: DialogAction) {
                 ui.browse.stale = true;
             });
         }
-        DialogAction::CreateProfile(name) => match app.switch_profile(hwnd, &name, true) {
+        DialogAction::CreateProfile(name) => match app.switch_profile(win, &name, true) {
             Ok(()) => UI.with_borrow_mut(Ui::close_dialog),
             Err(e) => {
                 let message = match e.kind() {
@@ -3042,7 +2925,7 @@ fn apply_dialog(app: &mut App, hwnd: HWND, action: DialogAction) {
             }
         },
         DialogAction::PickFiles => {
-            let files = pick_media_files(hwnd);
+            let files = pick_media_files(win);
             UI.with_borrow_mut(|ui| ui.dialog_add_files(files));
         }
         DialogAction::PickThumbnail => {
@@ -3050,7 +2933,7 @@ fn apply_dialog(app: &mut App, hwnd: HWND, action: DialogAction) {
                 "Images",
                 "*.png;*.jpg;*.jpeg;*.bmp;*.gif;*.webp;*.tif;*.tiff".to_owned(),
             )];
-            if let Some(image) = pick_files(hwnd, &images, false).pop() {
+            if let Some(image) = pick_files(win, &images, false).pop() {
                 UI.with_borrow_mut(|ui| ui.dialog_set_thumbnail(Some(image)));
             }
         }
@@ -3101,19 +2984,7 @@ fn apply_dialog(app: &mut App, hwnd: HWND, action: DialogAction) {
                 ui.browse.stale = true;
             });
         }
-        DialogAction::OpenLink(url) => {
-            use windows::Win32::UI::Shell::ShellExecuteW;
-            unsafe {
-                ShellExecuteW(
-                    Some(hwnd),
-                    w!("open"),
-                    &HSTRING::from(url),
-                    None,
-                    None,
-                    SW_SHOWNORMAL,
-                )
-            };
-        }
+        DialogAction::OpenLink(url) => platform::open_with_default_app(Path::new(&url)),
     }
     UI.with_borrow_mut(|ui| ui.dirty = true);
 }
@@ -3135,8 +3006,8 @@ fn show_properties(app: &App) {
 }
 
 /// The header's "+" on a playlist page: picks files and appends them.
-fn add_files_to_playlist(app: &mut App, hwnd: HWND, name: &str) {
-    for file in pick_media_files(hwnd) {
+fn add_files_to_playlist(app: &mut App, win: Window, name: &str) {
+    for file in pick_media_files(win) {
         if let Err(e) = app.library.add_to_playlist(name, &file) {
             eprintln!("library: cannot add {file:?} to {name}: {e}");
         }
@@ -3153,7 +3024,7 @@ fn file_spec(exts: &[&str]) -> String {
 }
 
 /// The system file picker for video and audio files, several at once.
-fn pick_media_files(hwnd: HWND) -> Vec<PathBuf> {
+fn pick_media_files(win: Window) -> Vec<PathBuf> {
     let (video, audio) = (
         file_spec(library::VIDEO_EXTS),
         file_spec(library::AUDIO_EXTS),
@@ -3164,55 +3035,13 @@ fn pick_media_files(hwnd: HWND) -> Vec<PathBuf> {
         ("Audio files", audio),
         ("All files", "*.*".to_owned()),
     ];
-    pick_files(hwnd, &filters, true)
+    pick_files(win, &filters, true)
 }
 
 /// The system file picker with (name, "*.a;*.b") filters; empty when cancelled. Modal, like
 /// the folder picker.
-fn pick_files(hwnd: HWND, filters: &[(&str, String)], multiple: bool) -> Vec<PathBuf> {
-    use windows::Win32::UI::Shell::Common::COMDLG_FILTERSPEC;
-    use windows::Win32::UI::Shell::FOS_ALLOWMULTISELECT;
-    // The filter strings must outlive the dialog.
-    let strings: Vec<(HSTRING, HSTRING)> = filters
-        .iter()
-        .map(|(name, spec)| (HSTRING::from(*name), HSTRING::from(spec.as_str())))
-        .collect();
-    let specs: Vec<COMDLG_FILTERSPEC> = strings
-        .iter()
-        .map(|(name, spec)| COMDLG_FILTERSPEC {
-            pszName: windows::core::PCWSTR(name.as_ptr()),
-            pszSpec: windows::core::PCWSTR(spec.as_ptr()),
-        })
-        .collect();
-    let picked = || -> Option<Vec<PathBuf>> {
-        unsafe {
-            let dialog: IFileOpenDialog =
-                CoCreateInstance(&FileOpenDialog, None, CLSCTX_INPROC_SERVER).ok()?;
-            dialog.SetFileTypes(&specs).ok()?;
-            let mut options = dialog.GetOptions().ok()? | FOS_FORCEFILESYSTEM;
-            if multiple {
-                options |= FOS_ALLOWMULTISELECT;
-            }
-            dialog.SetOptions(options).ok()?;
-            dialog.Show(Some(hwnd)).ok()?; // fails when cancelled
-            let items = dialog.GetResults().ok()?;
-            let mut paths = Vec::new();
-            for i in 0..items.GetCount().ok()? {
-                let Ok(name) = items
-                    .GetItemAt(i)
-                    .and_then(|item| item.GetDisplayName(SIGDN_FILESYSPATH))
-                else {
-                    continue;
-                };
-                if let Ok(path) = name.to_string() {
-                    paths.push(PathBuf::from(path));
-                }
-                CoTaskMemFree(Some(name.0 as _));
-            }
-            Some(paths)
-        }
-    };
-    picked().unwrap_or_default()
+fn pick_files(_win: Window, filters: &[(&str, String)], multiple: bool) -> Vec<PathBuf> {
+    platform::pick_files(filters, multiple)
 }
 
 /// "16:9" or "2.39:1" as a whole-number ratio; None for "Default".
@@ -3223,89 +3052,29 @@ fn ratio(label: Option<&str>) -> Option<(u32, u32)> {
 }
 
 /// The system file picker, for loading a subtitle file by hand.
-fn pick_subtitle_file(hwnd: HWND) -> Option<PathBuf> {
-    use windows::Win32::UI::Shell::Common::COMDLG_FILTERSPEC;
+fn pick_subtitle_file(win: Window) -> Option<PathBuf> {
     let filters = [
-        COMDLG_FILTERSPEC {
-            pszName: w!("Subtitles"),
-            pszSpec: w!("*.srt;*.ass;*.ssa;*.vtt;*.sub;*.idx;*.smi;*.sami;*.sup"),
-        },
-        COMDLG_FILTERSPEC {
-            pszName: w!("All files"),
-            pszSpec: w!("*.*"),
-        },
+        (
+            "Subtitles",
+            "*.srt;*.ass;*.ssa;*.vtt;*.sub;*.idx;*.smi;*.sami;*.sup".to_owned(),
+        ),
+        ("All files", "*.*".to_owned()),
     ];
-    unsafe {
-        let dialog: IFileOpenDialog =
-            CoCreateInstance(&FileOpenDialog, None, CLSCTX_INPROC_SERVER).ok()?;
-        dialog.SetFileTypes(&filters).ok()?;
-        dialog
-            .SetOptions(dialog.GetOptions().ok()? | FOS_FORCEFILESYSTEM)
-            .ok()?;
-        dialog.Show(Some(hwnd)).ok()?; // fails when cancelled
-        let name = dialog
-            .GetResult()
-            .ok()?
-            .GetDisplayName(SIGDN_FILESYSPATH)
-            .ok()?;
-        let path = name.to_string().ok().map(PathBuf::from);
-        CoTaskMemFree(Some(name.0 as _));
-        path
-    }
+    pick_files(win, &filters, false).pop()
 }
 
-/// The system Save As dialog for an M3U file, starting at `name`.
-fn pick_save_file(hwnd: HWND, name: &str) -> Option<PathBuf> {
-    use windows::Win32::UI::Shell::Common::COMDLG_FILTERSPEC;
-    let filters = [COMDLG_FILTERSPEC {
-        pszName: w!("M3U playlist"),
-        pszSpec: w!("*.m3u"),
-    }];
-    unsafe {
-        let dialog: IFileSaveDialog =
-            CoCreateInstance(&FileSaveDialog, None, CLSCTX_INPROC_SERVER).ok()?;
-        dialog.SetFileTypes(&filters).ok()?;
-        dialog.SetDefaultExtension(w!("m3u")).ok()?;
-        dialog.SetFileName(&HSTRING::from(name)).ok()?;
-        dialog
-            .SetOptions(dialog.GetOptions().ok()? | FOS_OVERWRITEPROMPT | FOS_FORCEFILESYSTEM)
-            .ok()?;
-        dialog.Show(Some(hwnd)).ok()?; // fails when cancelled
-        let name = dialog
-            .GetResult()
-            .ok()?
-            .GetDisplayName(SIGDN_FILESYSPATH)
-            .ok()?;
-        let path = name.to_string().ok().map(PathBuf::from);
-        CoTaskMemFree(Some(name.0 as _));
-        path
-    }
+/// The system Save dialog for an M3U file, starting at `name`.
+fn pick_save_file(_win: Window, name: &str) -> Option<PathBuf> {
+    platform::pick_save_file(name, ("M3U playlist", "*.m3u"))
 }
 
 /// The system folder picker. Modal: the window keeps repainting, playback keeps going.
-fn pick_folder(hwnd: HWND) -> Option<PathBuf> {
-    unsafe {
-        let dialog: IFileOpenDialog =
-            CoCreateInstance(&FileOpenDialog, None, CLSCTX_INPROC_SERVER).ok()?;
-        dialog
-            .SetOptions(dialog.GetOptions().ok()? | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM)
-            .ok()?;
-        dialog.Show(Some(hwnd)).ok()?; // fails when cancelled
-        let name = dialog
-            .GetResult()
-            .ok()?
-            .GetDisplayName(SIGDN_FILESYSPATH)
-            .ok()?;
-        let path = name.to_string().ok().map(PathBuf::from);
-        CoTaskMemFree(Some(name.0 as _));
-        path
-    }
+fn pick_folder(_win: Window) -> Option<PathBuf> {
+    platform::pick_folder()
 }
 
-/// Creates the window hidden; `run` shows it once the renderer is ready. The window draws its own
-/// title bar, so the system frame is removed in WM_NCCALCSIZE while DWM keeps the shadow,
-/// rounded corners, snapping and minimize/maximize animations.
-/// The window's own title, for the taskbar and Alt+Tab: the file playing, then the app.
+/// The window's own title, for the Window menu, Mission Control and the Dock: the file playing,
+/// then the app.
 fn window_title(session: Option<&Session>) -> String {
     match session {
         // A stream's own name: its address could carry a user name and password.
@@ -3318,337 +3087,162 @@ fn window_title(session: Option<&Session>) -> String {
     }
 }
 
-fn create_window(title: &str, (video_w, video_h): (u32, u32)) -> windows::core::Result<HWND> {
-    unsafe {
-        // Without this Windows bitmap-scales the window on high-DPI screens and blurs everything.
-        _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
-        let instance = GetModuleHandleW(None)?;
-        let class = WNDCLASSEXW {
-            cbSize: size_of::<WNDCLASSEXW>() as u32,
-            style: CS_DBLCLKS,
-            lpfnWndProc: Some(wndproc),
-            hInstance: instance.into(),
-            hCursor: LoadCursorW(None, IDC_ARROW)?,
-            // The taskbar and Alt+Tab icon: group 1 from build.rs, at the screen's size.
-            hIcon: LoadIconW(Some(instance.into()), PCWSTR(1 as _)).unwrap_or_default(),
-            hbrBackground: HBRUSH(GetStockObject(BLACK_BRUSH).0),
-            lpszClassName: w!("wushang"),
-            ..Default::default()
-        };
-        RegisterClassExW(&class);
-
-        // Open with the video at its own size, shrunk to fit 80% of the screen, plus the bars.
-        let scale = GetDpiForSystem() as f64 / 96.0;
-        let screen_w = f64::from(GetSystemMetrics(SM_CXSCREEN)) * 0.8;
-        let screen_h = f64::from(GetSystemMetrics(SM_CYSCREEN)) * 0.8;
-        let (chrome_w, chrome_h) = (20.0 * scale, 95.0 * scale);
-        let fit = ((screen_w - chrome_w) / f64::from(video_w))
-            .min((screen_h - chrome_h) / f64::from(video_h))
-            .min(1.0);
-        let width =
-            ((f64::from(video_w) * fit + chrome_w) as i32).max((MIN_SIZE.0 * scale as f32) as i32);
-        let height =
-            ((f64::from(video_h) * fit + chrome_h) as i32).max((MIN_SIZE.1 * scale as f32) as i32);
-        let hwnd = CreateWindowExW(
-            WINDOW_EX_STYLE::default(),
-            w!("wushang"),
-            &HSTRING::from(title),
-            WS_OVERLAPPEDWINDOW,
-            CW_USEDEFAULT,
-            CW_USEDEFAULT,
-            width,
-            height,
-            None,
-            None,
-            Some(instance.into()),
-            None,
-        )?;
-        let margins = MARGINS {
-            cxLeftWidth: 0,
-            cxRightWidth: 0,
-            cyTopHeight: 1,
-            cyBottomHeight: 0,
-        };
-        _ = DwmExtendFrameIntoClientArea(hwnd, &margins);
-        set_corners(hwnd, DWMWCP_ROUND);
-        // Re-run WM_NCCALCSIZE now that the window procedure removes the frame.
-        _ = SetWindowPos(
-            hwnd,
-            None,
-            0,
-            0,
-            0,
-            0,
-            // NOACTIVATE: activating here would steal focus from a minimized, unfocused launch.
-            SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
-        );
-        Ok(hwnd)
-    }
+/// Creates the window hidden; `run` shows it once the renderer is ready. The window draws its own
+/// title bar; AppKit keeps the shadow, rounded corners, resizing, fullscreen and the
+/// minimize animation.
+fn create_window(title: &str, (video_w, video_h): (u32, u32)) -> Window {
+    // Open with the video at its own size in pixels, shrunk to fit 80% of the screen, plus the
+    // bars.
+    let (screen_w, screen_h, scale) = platform::main_screen();
+    let (screen_w, screen_h) = (screen_w * scale * 0.8, screen_h * scale * 0.8);
+    let (chrome_w, chrome_h) = (20.0 * scale, 95.0 * scale);
+    let fit = ((screen_w - chrome_w) / f64::from(video_w))
+        .min((screen_h - chrome_h) / f64::from(video_h))
+        .min(1.0);
+    let width = ((f64::from(video_w) * fit + chrome_w) / scale).max(f64::from(MIN_SIZE.0));
+    let height = ((f64::from(video_h) * fit + chrome_h) / scale).max(f64::from(MIN_SIZE.1));
+    let min = (f64::from(MIN_SIZE.0), f64::from(MIN_SIZE.1));
+    platform::create_window(title, (width.round(), height.round()), min)
 }
 
 /// Puts the window where it was when wushang last closed, if Settings remember it and that spot
-/// is still on a screen. Returns whether it was maximized.
-fn restore_placement(hwnd: HWND, p: &Prefs) -> bool {
+/// is still on a screen. Returns whether it was zoomed.
+fn restore_placement(win: Window, p: &Prefs) -> bool {
     let Some(([x, y, w, h], maximized)) = p.window.filter(|_| p.remember_window) else {
         return false;
     };
-    let rect = RECT {
-        left: x,
-        top: y,
-        right: x + w,
-        bottom: y + h,
+    let rect = Rect {
+        x: f64::from(x),
+        y: f64::from(y),
+        w: f64::from(w).max(f64::from(MIN_SIZE.0)),
+        h: f64::from(h).max(f64::from(MIN_SIZE.1)),
     };
-    if unsafe { MonitorFromRect(&rect, MONITOR_DEFAULTTONULL) }.is_invalid() {
+    if !Window::on_a_screen(rect) {
         return false;
     }
-    let placement = WINDOWPLACEMENT {
-        length: size_of::<WINDOWPLACEMENT>() as u32,
-        showCmd: SW_HIDE.0 as u32,
-        rcNormalPosition: rect,
-        ..Default::default()
-    };
-    unsafe { _ = SetWindowPlacement(hwnd, &placement) };
+    win.set_frame(rect);
     maximized
 }
 
-/// Keeps the window's restored rect and maximized state for next time, as it closes.
-fn remember_placement(hwnd: HWND) {
-    // In fullscreen or the mini player, the placement to come back to is the one saved on the
-    // way in.
-    let saved = WINDOWED.lock().unwrap().as_ref().map(|(_, p)| *p);
-    let saved = saved.or(*MINI.lock().unwrap());
-    let placement = saved.or_else(|| {
-        let mut p = WINDOWPLACEMENT {
-            length: size_of::<WINDOWPLACEMENT>() as u32,
-            ..Default::default()
-        };
-        unsafe { GetWindowPlacement(hwnd, &mut p) }.ok().map(|()| p)
-    });
-    if let Some(p) = placement {
-        let r = p.rcNormalPosition;
-        let maximized = p.showCmd == SW_SHOWMAXIMIZED.0 as u32
-            || (p.showCmd == SW_SHOWMINIMIZED.0 as u32 && p.flags.contains(WPF_RESTORETOMAXIMIZED));
-        let rect = [r.left, r.top, r.right - r.left, r.bottom - r.top];
-        PREFS.with_borrow_mut(|prefs| prefs.window = Some((rect, maximized)));
-    }
-}
-
-/// Whether the launcher asked for a minimized window (a "Run: Minimized" shortcut, or a script
-/// that starts us without focus).
-fn launched_minimized() -> bool {
-    let mut info = STARTUPINFOW {
-        cb: size_of::<STARTUPINFOW>() as u32,
-        ..Default::default()
-    };
-    unsafe { GetStartupInfoW(&mut info) };
-    let minimized = [SW_MINIMIZE, SW_SHOWMINIMIZED, SW_SHOWMINNOACTIVE];
-    info.dwFlags.contains(STARTF_USESHOWWINDOW)
-        && minimized.iter().any(|s| s.0 as u16 == info.wShowWindow)
-}
-
-/// Handles pending window messages. Returns false once the window is gone.
-fn pump_messages() -> bool {
-    let mut msg = MSG::default();
-    unsafe {
-        while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
-            if msg.message == WM_QUIT {
-                return false;
-            }
-            _ = TranslateMessage(&msg);
-            DispatchMessageW(&msg);
-        }
-    }
-    true
-}
-
-fn client_size(hwnd: HWND) -> (u32, u32) {
-    let mut r = RECT::default();
-    unsafe { _ = GetClientRect(hwnd, &mut r) };
-    ((r.right - r.left) as u32, (r.bottom - r.top) as u32)
-}
-
-/// Client-area pixels to the layout's DIPs.
-fn to_dips(hwnd: HWND, x: i32, y: i32) -> (f32, f32) {
-    let scale = 96.0 / unsafe { GetDpiForWindow(hwnd) }.max(96) as f32;
-    (x as f32 * scale, y as f32 * scale)
-}
-
-fn mouse_position(lparam: LPARAM) -> (i32, i32) {
-    (
-        i32::from(lparam.0 as u16 as i16),
-        i32::from((lparam.0 >> 16) as u16 as i16),
-    )
+/// Keeps the window's restored frame (in points, from the main screen's top left) and zoomed
+/// state for next time, as it closes.
+fn remember_placement(win: Window) {
+    // In the mini player, the placement to come back to is the one saved on the way in; in
+    // fullscreen, the window's own from before.
+    let saved = *MINI.lock().unwrap();
+    let (r, maximized) = saved.unwrap_or_else(|| win.placement());
+    let rect = [r.x, r.y, r.w, r.h].map(|v| v.round() as i32);
+    PREFS.with_borrow_mut(|prefs| prefs.window = Some((rect, maximized)));
 }
 
 fn is_fullscreen() -> bool {
-    WINDOWED.lock().unwrap().is_some()
+    Window.is_fullscreen()
 }
 
-/// Thickness of the frame Windows hangs off-screen around a maximized window.
-fn frame_thickness(hwnd: HWND) -> i32 {
-    unsafe {
-        let dpi = GetDpiForWindow(hwnd);
-        GetSystemMetricsForDpi(SM_CXFRAME, dpi) + GetSystemMetricsForDpi(SM_CXPADDEDBORDER, dpi)
+/// Closes the window and ends the render loop, as DestroyWindow and WM_DESTROY did.
+fn destroy(win: Window) {
+    remember_placement(win);
+    if let Some(shared) = SHARED.get() {
+        shared.quit.store(true, Relaxed);
     }
+    win.close();
 }
 
-fn track_leave(hwnd: HWND, nonclient: bool) {
-    let flags = if nonclient {
-        TME_LEAVE | TME_NONCLIENT
-    } else {
-        TME_LEAVE
+/// The pointer's shape over the open dialog: an I-beam on its field, a hand on links.
+fn set_pointer() {
+    let cursor = match UI.with_borrow(Ui::dialog_cursor) {
+        Some(c) if c == IDC_IBEAM => platform::Cursor::IBeam,
+        Some(c) if c == IDC_HAND => platform::Cursor::Hand,
+        _ => platform::Cursor::Arrow,
     };
-    let mut track = TRACKMOUSEEVENT {
-        cbSize: size_of::<TRACKMOUSEEVENT>() as u32,
-        dwFlags: flags,
-        hwndTrack: hwnd,
-        dwHoverTime: 0,
-    };
-    unsafe { _ = TrackMouseEvent(&mut track) };
+    platform::set_cursor(cursor);
 }
 
-unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+/// What the window tells wushang: the window procedure, as it was on Windows.
+fn on_event(event: Event) {
     let Some(shared) = SHARED.get() else {
-        return unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) };
+        return;
     };
-    match msg {
-        WM_NCCALCSIZE if wparam.0 != 0 => {
-            // The client area covers the whole window. Maximized windows hang their frame off the
-            // monitor, so pull the client back in by that much.
-            if unsafe { IsZoomed(hwnd) }.as_bool() && !is_fullscreen() {
-                let params = unsafe { &mut *(lparam.0 as *mut NCCALCSIZE_PARAMS) };
-                let inset = frame_thickness(hwnd);
-                let r = &mut params.rgrc[0];
-                (r.left, r.top, r.right, r.bottom) = (
-                    r.left + inset,
-                    r.top + inset,
-                    r.right - inset,
-                    r.bottom - inset,
-                );
-            }
-            return LRESULT(0);
-        }
-        WM_NCHITTEST => return LRESULT(nc_hit_test(hwnd, lparam) as isize),
-        // Double-clicking the mini player's body would maximize it.
-        WM_NCLBUTTONDBLCLK if is_mini() => return LRESULT(0),
-        WM_GETMINMAXINFO => {
-            let info = unsafe { &mut *(lparam.0 as *mut MINMAXINFO) };
-            let scale = unsafe { GetDpiForWindow(hwnd) }.max(96) as f32 / 96.0;
-            // Narrower than this and the control bar's seek bar has no room left.
-            let min = if is_mini() {
-                let queue = if MINI_QUEUE.get() {
-                    ui::mini::QUEUE_H
-                } else {
-                    0.0
-                };
-                (ui::mini::W, ui::mini::H + queue)
-            } else {
-                MIN_SIZE
-            };
-            info.ptMinTrackSize.x = (min.0 * scale) as i32;
-            info.ptMinTrackSize.y = (min.1 * scale) as i32;
-        }
-        WM_DPICHANGED => {
-            let r = unsafe { &*(lparam.0 as *const RECT) };
-            unsafe {
-                _ = SetWindowPos(
-                    hwnd,
-                    None,
-                    r.left,
-                    r.top,
-                    r.right - r.left,
-                    r.bottom - r.top,
-                    SWP_NOZORDER | SWP_NOACTIVATE,
-                )
-            };
-        }
-        WM_SIZE => {
+    let win = Window;
+    match event {
+        Event::Resized => {
             RESIZED.store(true, Relaxed);
             // The mini player keeps the size it is dragged to, queue apart.
             if is_mini() {
-                let scale = unsafe { GetDpiForWindow(hwnd) }.max(96) as f32 / 96.0;
-                let (w, h) = client_size(hwnd);
+                let (w, h) = win.size();
                 let queue = if MINI_QUEUE.get() {
                     ui::mini::QUEUE_H
                 } else {
                     0.0
                 };
                 MINI_CARD.set((
-                    (w as f32 / scale).max(ui::mini::W),
-                    (h as f32 / scale - queue).max(ui::mini::H),
+                    (w as f32).max(ui::mini::W),
+                    (h as f32 - queue).max(ui::mini::H),
                 ));
             }
         }
-        // The render loop can't run while Windows moves or sizes the window; a timer stands in.
-        WM_ENTERSIZEMOVE => unsafe { _ = SetTimer(Some(hwnd), MODAL_TIMER, 1, None) },
-        WM_EXITSIZEMOVE => {
-            unsafe { _ = KillTimer(Some(hwnd), MODAL_TIMER) };
-            DISPLAY_CHANGED.store(true, Relaxed);
-        }
-        WM_DISPLAYCHANGE => DISPLAY_CHANGED.store(true, Relaxed),
-        WM_TIMER if wparam.0 == MODAL_TIMER => modal_frame(),
-        // Windows switched between light and dark apps.
-        WM_SETTINGCHANGE => {
+        Event::DisplayChanged => DISPLAY_CHANGED.store(true, Relaxed),
+        // The system switched between light and dark.
+        Event::AppearanceChanged => {
             DISPLAY_CHANGED.store(true, Relaxed);
             if prefs().theme == 2 {
                 ui::theme::set(theme_of(&prefs()));
                 UI.with_borrow_mut(|ui| ui.dirty = true);
             }
         }
-        WM_MOUSEMOVE | WM_NCMOUSEMOVE => {
-            let (mut x, mut y) = mouse_position(lparam);
-            if msg == WM_NCMOUSEMOVE {
-                // Non-client messages carry screen coordinates.
-                let mut p = windows::Win32::Foundation::POINT { x, y };
-                unsafe { _ = ScreenToClient(hwnd, &mut p) };
-                (x, y) = (p.x, p.y);
-            }
-            track_leave(hwnd, msg == WM_NCMOUSEMOVE);
-            let (x, y) = to_dips(hwnd, x, y);
+        Event::MouseMove { x, y } => {
             let action = UI.with_borrow_mut(|ui| ui.on_move(x, y));
-            act(hwnd, shared, action);
+            act(win, shared, action);
+            set_pointer();
         }
-        WM_MOUSELEAVE | WM_NCMOUSELEAVE => UI.with_borrow_mut(Ui::on_leave),
-        WM_LBUTTONDOWN | WM_LBUTTONDBLCLK => {
-            let (x, y) = mouse_position(lparam);
-            let (x, y) = to_dips(hwnd, x, y);
-            let on_video = UI.with_borrow(|ui| ui.layout.hit(x, y)) == Some(Hit::Video);
+        Event::MouseLeave => UI.with_borrow_mut(Ui::on_leave),
+        Event::MouseDown { x, y, clicks } => {
+            let hit = UI.with_borrow(|ui| ui.layout.hit(x, y));
+            // The design's title bar moves the window, and a double-click zooms it, except the
+            // mini player's, which would grow to fill the screen.
+            if hit == Some(Hit::Caption) && !is_fullscreen() {
+                if clicks % 2 == 0 {
+                    if !is_mini() {
+                        win.title_double_click();
+                    }
+                } else {
+                    win.drag();
+                }
+                return;
+            }
+            let on_video = hit == Some(Hit::Video);
             let (click, double) = PREFS.with_borrow(|p| (p.click, p.double_click));
-            if msg == WM_LBUTTONDBLCLK && on_video && double == 0 {
+            if clicks % 2 == 0 && on_video && double == 0 {
                 // The first click of the two paused or played; put that back.
                 if click == 1 {
                     shared.toggle_pause();
                 }
-                toggle_fullscreen(hwnd);
+                toggle_fullscreen(win);
             } else {
-                unsafe { SetCapture(hwnd) };
                 let action = UI.with_borrow_mut(|ui| ui.on_down(x, y));
-                act(hwnd, shared, action);
+                act(win, shared, action);
             }
         }
-        WM_LBUTTONUP => {
-            unsafe { _ = ReleaseCapture() };
-            let (x, y) = mouse_position(lparam);
-            let (x, y) = to_dips(hwnd, x, y);
+        Event::MouseUp { x, y } => {
             let action = UI.with_borrow_mut(|ui| ui.on_up(x, y));
-            act(hwnd, shared, action);
+            act(win, shared, action);
         }
-        WM_RBUTTONUP => {
-            let (x, y) = mouse_position(lparam);
-            let (x, y) = to_dips(hwnd, x, y);
+        Event::RightUp { x, y } => {
             let action = UI.with_borrow_mut(|ui| ui.on_right(x, y));
-            act(hwnd, shared, action);
+            act(win, shared, action);
         }
-        WM_MOUSEWHEEL => {
-            let notches = f32::from((wparam.0 >> 16) as u16 as i16) / WHEEL_DELTA as f32;
-            // The wheel scrolls the popups, the library and the sidebar panel, and sets the volume.
-            // Its position comes in screen coordinates.
-            let (sx, sy) = mouse_position(lparam);
-            let mut p = windows::Win32::Foundation::POINT { x: sx, y: sy };
-            unsafe { _ = ScreenToClient(hwnd, &mut p) };
-            let (x, y) = to_dips(hwnd, p.x, p.y);
+        // The wheel scrolls the popups, the library and the sidebar panel, and sets the volume.
+        Event::Wheel {
+            x,
+            y,
+            notches,
+            steps,
+            physical,
+        } => {
             if UI.with_borrow(|ui| ui.dialog.is_some()) {
-                UI.with_borrow_mut(|ui| ui.scroll_dialog(notches));
+                if steps != 0.0 {
+                    UI.with_borrow_mut(|ui| ui.scroll_dialog(steps));
+                }
             } else if UI.with_borrow(|ui| ui.preferences.is_some()) {
                 UI.with_borrow_mut(|ui| ui.scroll_preferences(x, y, notches));
             } else if UI.with_borrow(|ui| ui.menu.is_open()) {
@@ -3660,14 +3254,14 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 UI.with_borrow_mut(|ui| ui.scroll_panel(x, y, -60.0 * notches));
             } else if UI.with_borrow(|ui| ui.page == Page::Library || ui.over_overlay()) {
                 UI.with_borrow_mut(|ui| ui.scroll(-120.0 * notches));
-            } else {
+            } else if physical != 0.0 {
                 // Over the video: volume, seeking or nothing, per Settings.
                 let (wheel, reverse, skip) =
                     PREFS.with_borrow(|p| (p.wheel, p.reverse_wheel, p.skip[1]));
-                let notches = if reverse { -notches } else { notches };
+                let notches = if reverse { -physical } else { physical };
                 match wheel {
                     0 => act(
-                        hwnd,
+                        win,
                         shared,
                         Some(Action::SetVolume(shared.volume() + 0.05 * notches)),
                     ),
@@ -3676,54 +3270,29 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 }
             }
         }
-        WM_DROPFILES => {
-            let drop = HDROP(wparam.0 as _);
-            let mut name = [0u16; 32_768];
+        Event::Drop(files) => {
             // The New Playlist dialog takes every dropped file into its list.
             if UI.with_borrow(Ui::dialog_takes_files) {
-                let count = unsafe { DragQueryFileW(drop, u32::MAX, None) };
-                let files = (0..count)
-                    .filter_map(|i| {
-                        let len = unsafe { DragQueryFileW(drop, i, Some(&mut name)) } as usize;
-                        (len > 0).then(|| PathBuf::from(String::from_utf16_lossy(&name[..len])))
-                    })
-                    .collect();
-                unsafe { DragFinish(drop) };
                 UI.with_borrow_mut(|ui| {
                     ui.dialog_add_files(files);
                     ui.dirty = true;
                 });
-                return LRESULT(0);
-            }
-            let len = unsafe { DragQueryFileW(drop, 0, Some(&mut name)) } as usize;
-            unsafe { DragFinish(drop) };
-            if len > 0 {
-                *OPEN.lock().unwrap() = Some(PathBuf::from(String::from_utf16_lossy(&name[..len])));
+            } else if let Some(first) = files.into_iter().next() {
+                *OPEN.lock().unwrap() = Some(first);
             }
         }
-        WM_SETCURSOR => {
-            // Hide the pointer over the video while the bars are hidden, like VLC.
-            let over_client = (lparam.0 & 0xFFFF) as u32 == HTCLIENT;
-            let hidden = UI.with_borrow(|ui| {
-                ui.page == Page::Player && !ui.layout.bars && ui.hover == Some(Hit::Video)
-            });
-            if over_client && hidden {
-                unsafe { SetCursor(None) };
-                return LRESULT(1);
+        // Opened from Finder or the Dock while running: it plays, as a dropped file does.
+        Event::Open(paths) => {
+            if let Some(first) = paths.into_iter().next() {
+                *OPEN.lock().unwrap() = Some(first);
             }
-            if over_client && let Some(cursor) = UI.with_borrow(Ui::dialog_cursor) {
-                unsafe { SetCursor(LoadCursorW(None, cursor).ok()) };
-                return LRESULT(1);
-            }
-            return unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) };
         }
-        WM_CHAR => {
-            // Typing goes to the library's search box while it has focus.
-            let c = wparam.0 as u32;
+        Event::Char(c) => {
             // An open dialog takes typing before the search box, then the Settings window.
             if UI.with_borrow_mut(|ui| ui.dialog_char(c) || ui.preferences_char(c)) {
-                return LRESULT(0);
+                return;
             }
+            // Typing goes to the library's search box while it has focus.
             UI.with_borrow_mut(|ui| {
                 let b = &mut ui.browse;
                 if !b.searching {
@@ -3739,74 +3308,70 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 ui.relayout = true;
             });
         }
-        WM_KEYDOWN => {
-            on_key(hwnd, shared, VIRTUAL_KEY(wparam.0 as u16));
+        Event::Key {
+            key,
+            shift,
+            ctrl,
+            alt,
+        } => {
+            let typing = UI.with_borrow(|ui| ui.dialog.is_some() || ui.preferences.is_some());
+            if alt {
+                // Option + Left/Right is Alt's very short skip; in a text field it moves by
+                // words and Option + Backspace deletes one, as on macOS. Other Option keys type
+                // characters, as Alt keys on Windows did nothing here.
+                let word = matches!(key, VK_LEFT | VK_RIGHT | VK_BACK | VK_DELETE);
+                if typing && word {
+                    on_key(win, shared, key, shift, true);
+                } else if matches!(key, VK_LEFT | VK_RIGHT)
+                    && !typing
+                    && !UI.with_borrow(|ui| ui.menu.is_open())
+                {
+                    let skip = f64::from(PREFS.with_borrow(|p| p.skip[0]));
+                    shared.seek_by(if key == VK_LEFT { -skip } else { skip });
+                } else {
+                    return;
+                }
+            } else if typing && ctrl && matches!(key, VK_LEFT | VK_RIGHT | VK_BACK) {
+                // Command + Left/Right go to the field's start and end, and Command +
+                // Backspace deletes back to the start, as on macOS.
+                if key == VK_BACK {
+                    on_key(win, shared, VK_HOME, true, false);
+                    on_key(win, shared, VK_BACK, false, false);
+                } else {
+                    let to = if key == VK_LEFT { VK_HOME } else { VK_END };
+                    on_key(win, shared, to, shift, false);
+                }
+            } else {
+                on_key(win, shared, key, shift, ctrl);
+            }
             UI.with_borrow_mut(|ui| {
                 ui.wake();
                 ui.dirty = true;
             });
         }
-        // Alt + Left/Right is the very short skip; other Alt keys (Alt+F4, the window menu)
-        // stay Windows'.
-        WM_SYSKEYDOWN
-            if matches!(VIRTUAL_KEY(wparam.0 as u16), VK_LEFT | VK_RIGHT)
-                && UI.with_borrow(|ui| {
-                    ui.dialog.is_none() && ui.preferences.is_none() && !ui.menu.is_open()
-                }) =>
-        {
-            let skip = f64::from(PREFS.with_borrow(|p| p.skip[0]));
-            let back = VIRTUAL_KEY(wparam.0 as u16) == VK_LEFT;
-            shared.seek_by(if back { -skip } else { skip });
-            UI.with_borrow_mut(|ui| {
-                ui.wake();
-                ui.dirty = true;
-            });
+        Event::Menu(command) => {
+            use platform::Command as C;
+            let action = match command {
+                C::About => MenuAction::ShowAbout,
+                C::Settings => MenuAction::Preferences(Category::Playback),
+                C::Quit => MenuAction::Quit,
+                C::Open => MenuAction::OpenFiles,
+                C::OpenFolder => MenuAction::OpenFolder,
+                C::OpenNetwork => MenuAction::OpenNetwork,
+                C::PlayPause => MenuAction::TogglePause,
+                C::MiniPlayer => MenuAction::MiniPlayer,
+                C::Minimize => {
+                    win.minimize();
+                    return;
+                }
+            };
+            act(win, shared, Some(Action::Menu(action)));
         }
-        // The swap chain covers the whole client area; erasing first only causes flicker.
-        WM_ERASEBKGND => return LRESULT(1),
-        WM_DESTROY => {
-            remember_placement(hwnd);
-            shared.quit.store(true, Relaxed);
-            unsafe { PostQuitMessage(0) };
-        }
-        _ => return unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
-    }
-    LRESULT(0)
-}
-
-/// Resize edges, the draggable title bar, and everything else as client area.
-fn nc_hit_test(hwnd: HWND, lparam: LPARAM) -> u32 {
-    let (sx, sy) = mouse_position(lparam);
-    let mut p = windows::Win32::Foundation::POINT { x: sx, y: sy };
-    unsafe { _ = ScreenToClient(hwnd, &mut p) };
-    let (w, h) = client_size(hwnd);
-    let (w, h) = (w as i32, h as i32);
-    let resizable = !is_fullscreen() && !unsafe { IsZoomed(hwnd) }.as_bool();
-    if resizable {
-        let edge = (6.0 * unsafe { GetDpiForWindow(hwnd) }.max(96) as f32 / 96.0) as i32;
-        let (left, right, top, bottom) = (p.x < edge, p.x >= w - edge, p.y < edge, p.y >= h - edge);
-        match (left, right, top, bottom) {
-            (true, _, true, _) => return HTTOPLEFT,
-            (_, true, true, _) => return HTTOPRIGHT,
-            (true, _, _, true) => return HTBOTTOMLEFT,
-            (_, true, _, true) => return HTBOTTOMRIGHT,
-            (true, ..) => return HTLEFT,
-            (_, true, ..) => return HTRIGHT,
-            (_, _, true, _) => return HTTOP,
-            (.., true) => return HTBOTTOM,
-            _ => {}
-        }
-    }
-    let (x, y) = to_dips(hwnd, p.x, p.y);
-    let hit = UI.with_borrow(|ui| ui.layout.hit(x, y));
-    if hit == Some(Hit::Caption) && !is_fullscreen() {
-        HTCAPTION
-    } else {
-        HTCLIENT
+        Event::Close => destroy(win),
     }
 }
 
-fn act(hwnd: HWND, shared: &Shared, action: Option<Action>) {
+fn act(win: Window, shared: &Shared, action: Option<Action>) {
     let Some(action) = action else { return };
     UI.with_borrow_mut(|ui| {
         ui.dirty = true;
@@ -3822,13 +3387,10 @@ fn act(hwnd: HWND, shared: &Shared, action: Option<Action>) {
         Action::Click(Hit::Play) => shared.toggle_pause(),
         Action::Click(Hit::Speaker) => shared.toggle_mute(),
         Action::Click(Hit::Duration) => PREFS.with_borrow_mut(|p| p.time_left = !p.time_left),
-        Action::Click(Hit::Minimize) => unsafe { _ = ShowWindow(hwnd, SW_MINIMIZE) },
-        Action::Click(Hit::Maximize) => {
-            let zoomed = unsafe { IsZoomed(hwnd) }.as_bool();
-            unsafe { _ = ShowWindow(hwnd, if zoomed { SW_RESTORE } else { SW_MAXIMIZE }) };
-        }
-        Action::Click(Hit::Fullscreen) => toggle_fullscreen(hwnd),
-        Action::Click(Hit::Close) => unsafe { _ = DestroyWindow(hwnd) },
+        Action::Click(Hit::Minimize) => win.minimize(),
+        Action::Click(Hit::Maximize) => win.zoom(),
+        Action::Click(Hit::Fullscreen) => toggle_fullscreen(win),
+        Action::Click(Hit::Close) => destroy(win),
         Action::Click(Hit::Search) => UI.with_borrow_mut(|ui| {
             // The panel has no search field; its magnifier opens the library's.
             ui.overlay = false;
@@ -3906,7 +3468,7 @@ fn act(hwnd: HWND, shared: &Shared, action: Option<Action>) {
 }
 
 /// A click on one of the bar items Customize Player adds.
-fn use_tool(app: &mut App, hwnd: HWND, item: ui::ToolItem) {
+fn use_tool(app: &mut App, win: Window, item: ui::ToolItem) {
     use ui::ToolItem as T;
     let queue = |a| QUEUE_ACTIONS.with_borrow_mut(|q| q.push(a));
     let queue_tab = |tab| {
@@ -3946,7 +3508,7 @@ fn use_tool(app: &mut App, hwnd: HWND, item: ui::ToolItem) {
             ui.queue.open = false;
             ui.relayout = true;
         }),
-        T::Quit => unsafe { _ = DestroyWindow(hwnd) },
+        T::Quit => destroy(win),
         T::Preferences => open_preferences(app, Category::Playback),
         T::Home => UI.with_borrow_mut(|ui| ui.show(Page::Library)),
         T::Properties => WANT_PROPERTIES.set(true),
@@ -4004,18 +3566,10 @@ fn open_disc(app: &mut App, path: &Path) {
     }
 }
 
-/// Lists the capture devices into `devices` in the background; DirectShow takes a moment.
+/// Lists the capture devices into `devices` in the background; it takes a moment.
 fn refresh_devices(devices: &Arc<Mutex<Vec<capture::Device>>>) {
     let devices = devices.clone();
-    thread::spawn(move || {
-        unsafe {
-            _ = windows::Win32::System::Com::CoInitializeEx(
-                None,
-                windows::Win32::System::Com::COINIT_MULTITHREADED,
-            )
-        };
-        *devices.lock().unwrap() = capture::devices();
-    });
+    thread::spawn(move || *devices.lock().unwrap() = capture::devices());
 }
 
 /// Fetches the podcast feed or radio directory the library page shows, and takes in what
@@ -4066,7 +3620,7 @@ fn take_snapshot(app: &App, renderer: &mut render::Renderer) {
             let stem = snapshot::stem(&session.path, &session.title);
             let (dir, jpeg) = PREFS.with_borrow(|p| {
                 let key = prefs::SNAP_DIR.get(p.snap_dir).map_or("", |c| c.0);
-                let own = &windows::Win32::UI::Shell::FOLDERID_Pictures;
+                let own = snapshot::Folder::Pictures;
                 (
                     snapshot::output_dir(key, own, &session.path),
                     p.snap_format == 1,
@@ -4076,12 +3630,7 @@ fn take_snapshot(app: &App, renderer: &mut render::Renderer) {
                 Ok(dir) => {
                     snapshot::save(picture, dir, &stem, seconds, jpeg, app.notices.0.clone())
                 }
-                Err(e) => {
-                    _ = app
-                        .notices
-                        .0
-                        .send(format!("Can't save the snapshot ({})", e.message()))
-                }
+                Err(e) => _ = app.notices.0.send(format!("Can't save the snapshot ({e})")),
             }
         }
         Err(e) => _ = app.notices.0.send(format!("Can't take a snapshot ({e})")),
@@ -4096,9 +3645,8 @@ fn videos_folder(library: &Library) -> String {
         .map_or_else(|| "No folder yet".to_owned(), |p| p.display().to_string())
 }
 
-fn on_key(hwnd: HWND, shared: &Shared, key: VIRTUAL_KEY) {
-    let shift = unsafe { GetKeyState(i32::from(VK_SHIFT.0)) } < 0;
-    let ctrl = unsafe { GetKeyState(i32::from(VK_CONTROL.0)) } < 0;
+/// A key down, with Shift and Ctrl (Command, or Control) as held when it was pressed.
+fn on_key(win: Window, shared: &Shared, key: VIRTUAL_KEY, shift: bool, ctrl: bool) {
     let (skip, volume_step) = PREFS.with_borrow(|p| (p.skip, p.volume_step));
     let step = f64::from(match (ctrl, shift) {
         (true, _) => skip[3],
@@ -4110,17 +3658,17 @@ fn on_key(hwnd: HWND, shared: &Shared, key: VIRTUAL_KEY) {
     // An open dialog takes every key, then the Settings window.
     if UI.with_borrow(|ui| ui.dialog.is_some()) {
         let action = UI.with_borrow_mut(|ui| ui.dialog_key(key, shift, ctrl));
-        act(hwnd, shared, action);
+        act(win, shared, action);
         return;
     }
     if UI.with_borrow(|ui| ui.customize.is_some()) {
         let action = UI.with_borrow_mut(|ui| ui.customize_key(key));
-        act(hwnd, shared, action);
+        act(win, shared, action);
         return;
     }
     if UI.with_borrow(|ui| ui.onboarding.is_some()) {
         let action = UI.with_borrow_mut(|ui| ui.onboarding_key(key));
-        act(hwnd, shared, action);
+        act(win, shared, action);
         return;
     }
     if UI.with_borrow(|ui| ui.preferences.is_some()) {
@@ -4141,7 +3689,7 @@ fn on_key(hwnd: HWND, shared: &Shared, key: VIRTUAL_KEY) {
         };
         if let Some(key) = key {
             let action = UI.with_borrow_mut(|ui| ui.menu_key(key));
-            act(hwnd, shared, action);
+            act(win, shared, action);
         }
         return;
     }
@@ -4160,7 +3708,7 @@ fn on_key(hwnd: HWND, shared: &Shared, key: VIRTUAL_KEY) {
         return;
     }
     // The menus' shortcuts.
-    let menu = |action| act(hwnd, shared, Some(Action::Menu(action)));
+    let menu = |action| act(win, shared, Some(Action::Menu(action)));
     let shortcut = match key {
         VK_O if ctrl => Some(MenuAction::OpenFiles),
         VK_R if ctrl => Some(MenuAction::ConvertOpen),
@@ -4192,19 +3740,19 @@ fn on_key(hwnd: HWND, shared: &Shared, key: VIRTUAL_KEY) {
         VK_DOWN => shared.set_volume(shared.volume() - volume_step),
         VK_M => shared.toggle_mute(),
         VK_F if page == Page::Mini => {}
-        VK_F => toggle_fullscreen(hwnd),
+        VK_F => toggle_fullscreen(win),
         VK_ESCAPE if UI.with_borrow_mut(Ui::close_panel) => {}
         VK_ESCAPE if UI.with_borrow(|ui| ui.overlay && ui.page == Page::Player) => {
             UI.with_borrow_mut(|ui| ui.overlay = false)
         }
-        VK_ESCAPE if is_fullscreen() => toggle_fullscreen(hwnd),
+        VK_ESCAPE if is_fullscreen() => toggle_fullscreen(win),
         VK_ESCAPE if page == Page::Mini => MINI_REQUEST.set(Some(Some(Page::Player))),
         // Esc leaves the player for the library, which keeps playing in the mini player.
         VK_ESCAPE => UI.with_borrow_mut(|ui| ui.show(Page::Library)),
-        VK_Q => unsafe { _ = DestroyWindow(hwnd) },
+        VK_Q => destroy(win),
         VK_F1 => UI.with_borrow_mut(|ui| ui.open_dialog(Dialog::Shortcuts)),
         // VLC's "Media Information": the file playing, else the file under the pointer.
-        VK_I if unsafe { GetKeyState(i32::from(VK_CONTROL.0)) } < 0 => WANT_PROPERTIES.set(true),
+        VK_I if ctrl => WANT_PROPERTIES.set(true),
         _ => {}
     }
 }
@@ -4213,149 +3761,90 @@ fn is_mini() -> bool {
     MINI.lock().unwrap().is_some()
 }
 
-/// The mini player's size in pixels: the card as last sized, and its queue when that's open.
-fn mini_size(hwnd: HWND, queue: bool) -> (i32, i32) {
-    let scale = unsafe { GetDpiForWindow(hwnd) }.max(96) as f32 / 96.0;
+/// The mini player's size in points: the card as last sized, and its queue when that's open.
+fn mini_size(queue: bool) -> (f64, f64) {
     let (w, h) = MINI_CARD.get();
     let h = h + if queue { ui::mini::QUEUE_H } else { 0.0 };
-    ((w * scale).round() as i32, (h * scale).round() as i32)
+    (f64::from(w), f64::from(h))
+}
+
+/// The mini player's smallest size: the design's card, and its queue when that's open.
+fn mini_min_size(win: Window, queue: bool) {
+    let queue = if queue { ui::mini::QUEUE_H } else { 0.0 };
+    win.set_min_size(f64::from(ui::mini::W), f64::from(ui::mini::H + queue));
 }
 
 /// Shrinks the window to the mini player, above other windows: where it last was, or at the
-/// bottom right of its monitor's work area.
-fn enter_mini(hwnd: HWND) {
+/// bottom right of its screen's work area.
+fn enter_mini(win: Window) {
     if is_mini() {
         return;
     }
-    if is_fullscreen() {
-        toggle_fullscreen(hwnd);
+    // Native fullscreen animates out first; the request waits for it to finish.
+    if win.fullscreen() != platform::Fullscreen::Off {
+        toggle_fullscreen(win);
+        MINI_REQUEST.set(Some(None));
+        return;
     }
-    let mut placement = WINDOWPLACEMENT {
-        length: size_of::<WINDOWPLACEMENT>() as u32,
-        ..Default::default()
-    };
-    let mut monitor = MONITORINFO {
-        cbSize: size_of::<MONITORINFO>() as u32,
-        ..Default::default()
-    };
-    unsafe {
-        if GetWindowPlacement(hwnd, &mut placement).is_err()
-            || !GetMonitorInfoW(
-                MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST),
-                &mut monitor,
-            )
-            .as_bool()
-        {
-            return;
-        }
-        *MINI.lock().unwrap() = Some(placement);
-        if IsZoomed(hwnd).as_bool() {
-            _ = ShowWindow(hwnd, SW_RESTORE);
-        }
-    }
+    *MINI.lock().unwrap() = Some(win.placement());
     UI.with_borrow_mut(|ui| {
         ui.overlay = false;
         ui.show(Page::Mini);
     });
     MINI_QUEUE.set(false);
-    let (w, h) = mini_size(hwnd, false);
-    let work = monitor.rcWork;
-    let margin = 16 * w / 391;
+    let (w, h) = mini_size(false);
+    let work = win.work_area();
+    let margin = 16.0 * w / 391.0;
     let (l, b) = MINI_SPOT
         .get()
-        .unwrap_or((work.right - margin - w, work.bottom - margin));
-    let flags = SWP_NOOWNERZORDER | SWP_FRAMECHANGED;
-    unsafe { _ = SetWindowPos(hwnd, Some(HWND_TOPMOST), l, b - h, w, h, flags) };
+        .unwrap_or((work.right() - margin - w, work.bottom() - margin));
+    mini_min_size(win, false);
+    win.set_frame(Rect {
+        x: l,
+        y: b - h,
+        w,
+        h,
+    });
+    win.set_floating(true);
 }
 
 /// Back to the full window, where it was, on `page`.
-fn exit_mini(hwnd: HWND, page: Page) {
-    let Some(placement) = MINI.lock().unwrap().take() else {
+fn exit_mini(win: Window, page: Page) {
+    let Some((frame, zoomed)) = MINI.lock().unwrap().take() else {
         return;
     };
-    let mut r = RECT::default();
-    if unsafe { GetWindowRect(hwnd, &mut r) }.is_ok() {
-        MINI_SPOT.set(Some((r.left, r.bottom)));
-    }
+    let r = win.frame();
+    MINI_SPOT.set(Some((r.x, r.bottom())));
     UI.with_borrow_mut(|ui| ui.show(page));
-    unsafe { _ = SetWindowPlacement(hwnd, &placement) };
-    set_topmost(hwnd, prefs().on_top);
+    win.set_min_size(f64::from(MIN_SIZE.0), f64::from(MIN_SIZE.1));
+    win.set_frame(frame);
+    if zoomed && !win.is_zoomed() {
+        win.zoom();
+    }
+    set_topmost(win, prefs().on_top);
 }
 
 /// Grows the mini player up for its queue and back, keeping its bottom edge. Otherwise its
 /// size is the user's.
-fn fit_mini(hwnd: HWND, queue: bool) {
+fn fit_mini(win: Window, queue: bool) {
     if MINI_QUEUE.replace(queue) == queue {
         return;
     }
-    let (w, h) = mini_size(hwnd, queue);
-    let mut r = RECT::default();
-    if unsafe { GetWindowRect(hwnd, &mut r) }.is_err() || r.bottom - r.top == h {
+    mini_min_size(win, queue);
+    let (w, h) = mini_size(queue);
+    let r = win.frame();
+    if (r.h - h).abs() < 0.5 {
         return;
     }
-    let flags = SWP_NOZORDER | SWP_NOACTIVATE;
-    unsafe { _ = SetWindowPos(hwnd, None, r.left, r.bottom - h, w, h, flags) };
+    win.set_frame(Rect {
+        x: r.x,
+        y: r.bottom() - h,
+        w,
+        h,
+    });
 }
 
-fn set_corners(hwnd: HWND, corners: DWM_WINDOW_CORNER_PREFERENCE) {
-    unsafe {
-        _ = DwmSetWindowAttribute(
-            hwnd,
-            DWMWA_WINDOW_CORNER_PREFERENCE,
-            (&raw const corners).cast(),
-            4,
-        );
-    }
-}
-
-/// Borderless fullscreen on the window's monitor, and back.
-fn toggle_fullscreen(hwnd: HWND) {
-    let mut windowed = WINDOWED.lock().unwrap();
-    unsafe {
-        match windowed.take() {
-            None => {
-                let style = GetWindowLongPtrW(hwnd, GWL_STYLE);
-                let mut placement = WINDOWPLACEMENT {
-                    length: size_of::<WINDOWPLACEMENT>() as u32,
-                    ..Default::default()
-                };
-                let mut monitor = MONITORINFO {
-                    cbSize: size_of::<MONITORINFO>() as u32,
-                    ..Default::default()
-                };
-                let monitor_found = GetMonitorInfoW(
-                    MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST),
-                    &mut monitor,
-                );
-                if GetWindowPlacement(hwnd, &mut placement).is_ok() && monitor_found.as_bool() {
-                    // Set before resizing: WM_NCCALCSIZE checks it to skip the maximized inset.
-                    *windowed = Some((style, placement));
-                    drop(windowed);
-                    SetWindowLongPtrW(hwnd, GWL_STYLE, style & !(WS_OVERLAPPEDWINDOW.0 as isize));
-                    // Square corners, so the video reaches the screen's corners.
-                    set_corners(hwnd, DWMWCP_DONOTROUND);
-                    let r = monitor.rcMonitor;
-                    let flags = SWP_NOOWNERZORDER | SWP_FRAMECHANGED;
-                    _ = SetWindowPos(
-                        hwnd,
-                        Some(HWND_TOP),
-                        r.left,
-                        r.top,
-                        r.right - r.left,
-                        r.bottom - r.top,
-                        flags,
-                    );
-                }
-            }
-            Some((style, placement)) => {
-                drop(windowed);
-                SetWindowLongPtrW(hwnd, GWL_STYLE, style);
-                set_corners(hwnd, DWMWCP_ROUND);
-                _ = SetWindowPlacement(hwnd, &placement);
-                let flags =
-                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_FRAMECHANGED;
-                _ = SetWindowPos(hwnd, None, 0, 0, 0, 0, flags);
-            }
-        }
-    }
+/// Native fullscreen on the window's screen, and back.
+fn toggle_fullscreen(win: Window) {
+    win.toggle_fullscreen();
 }

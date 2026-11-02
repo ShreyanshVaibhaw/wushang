@@ -1,4 +1,4 @@
-//! Audio decode thread, resampling to the device format, effects, and the WASAPI callback that
+//! Audio decode thread, resampling to the device format, effects, and the Core Audio callback that
 //! drives the clock.
 
 use std::collections::VecDeque;
@@ -15,7 +15,8 @@ use crate::player::{Msg, POLL, PacketQueue, Shared};
 
 /// Seconds of output kept ahead of the device. Effect changes are heard after at most this long.
 const BUFFER_SECONDS: f64 = 0.3;
-/// WASAPI shared mode's mix format: interleaved f32.
+/// What the stream is fed: interleaved f32, Core Audio's own mixing format; its output unit
+/// converts to whatever the hardware runs at.
 const DEVICE_FORMAT: ff::format::Sample = ff::format::Sample::F32(ff::format::sample::Type::Packed);
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -143,9 +144,9 @@ enum Output {
     },
 }
 
-/// The audio device, opened once for the whole run and shared by every file played. Opening
-/// WASAPI can take seconds (1.7 s in `IAudioClient::Initialize` on the test laptop), so it opens on
-/// a background thread at startup, and switching files only clears the ring.
+/// The audio device, opened once for the whole run and shared by every file played. Opening a
+/// device can take a while (a Bluetooth headset wakes up first), so it opens on a background
+/// thread at startup, and switching files only clears the ring.
 pub struct Device {
     shared: Arc<Shared>,
     effects: Arc<Effects>,
@@ -255,16 +256,9 @@ impl Device {
                 .find(|d| device_name(d).as_deref() == Some(name)),
         }
         .ok_or("no such audio output device")?;
-        let supported = device.default_output_config()?;
-        // ponytail: WASAPI shared mode mixes in f32 on every device seen so far; convert if one differs.
-        if supported.sample_format() != cpal::SampleFormat::F32 {
-            return Err(format!(
-                "unsupported device sample format {:?}",
-                supported.sample_format()
-            )
-            .into());
-        }
-        let config = supported.config();
+        // The device's own rate and channels; the samples go in as f32 whatever it runs at, as
+        // Core Audio converts.
+        let config = device.default_output_config()?.config();
         let format = Format {
             rate: config.sample_rate,
             channels: usize::from(config.channels),
@@ -330,11 +324,26 @@ impl Device {
                 }
                 feed.space.notify_one();
             },
-            |e| eprintln!("audio: {e}"),
+            {
+                let me = self.me.clone();
+                move |e: cpal::Error| match e.kind() {
+                    // The default device changed and the stream followed it by itself.
+                    cpal::ErrorKind::DeviceChanged => {}
+                    // The device went away (unplugged, AirPods back in their case). Without sound
+                    // the clock stops, and the picture with it, so carry on on the default device.
+                    cpal::ErrorKind::DeviceNotAvailable => {
+                        eprintln!("audio: {e}; moving to the default device");
+                        if let Some(device) = me.upgrade() {
+                            device.reopen(None);
+                        }
+                    }
+                    _ => eprintln!("audio: {e}"),
+                }
+            },
             None,
         )?;
         eprintln!(
-            "audio: WASAPI shared mode on {}, {} Hz, {} channels",
+            "audio: Core Audio on {}, {} Hz, {} channels",
             device_name(&device).unwrap_or_default(),
             format.rate,
             format.channels

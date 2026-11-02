@@ -134,9 +134,10 @@ pub fn open_input(
 }
 
 /// Opens a local file. The `file:` prefix keeps FFmpeg from reading the path as another of its
-/// protocols (`concat:`, `data:`), and the formats that open more connections (HLS and SDP
-/// playlists, RTSP) are left out, so a playlist posing as a video can't make wushang reach a
-/// server, a Windows share (and its sign-in) included.
+/// protocols (`concat:`, `data:`), and the formats that open more connections or other files
+/// (HLS and SDP playlists, RTSP, RTP, concat scripts) are left out, as are capture devices and
+/// filter graphs, so a playlist posing as a video can't make wushang reach a server or read
+/// anything but itself.
 pub fn open_file(path: &Path) -> Result<ff::format::context::Input, String> {
     // ffmpeg-next panics on a path that isn't valid Unicode.
     let Some(p) = path.to_str() else {
@@ -148,7 +149,8 @@ pub fn open_file(path: &Path) -> Result<ff::format::context::Input, String> {
         .map_err(|e| format!("cannot open {path:?}: {e}"))
 }
 
-/// Every demuxer this FFmpeg has except hls, sdp and rtsp, comma-separated.
+/// Every demuxer this FFmpeg has except those `open_file` leaves out, comma-separated. The
+/// Windows build's slim FFmpeg has none of the others; Homebrew's has them all.
 fn local_formats() -> &'static str {
     static FORMATS: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     FORMATS.get_or_init(|| {
@@ -160,7 +162,16 @@ fn local_formats() -> &'static str {
                 break;
             }
             let name = unsafe { CStr::from_ptr((*format).name) }.to_string_lossy();
-            if !["hls", "sdp", "rtsp"].contains(&&*name) {
+            let opens_more = [
+                "hls",
+                "sdp",
+                "rtsp",
+                "rtp",
+                "concat",
+                "avfoundation",
+                "lavfi",
+            ];
+            if !opens_more.contains(&&*name) {
                 names.push(name.into_owned());
             }
         }
@@ -981,7 +992,7 @@ mod tests {
     use std::time::{Duration, Instant};
 
     /// A downloaded HLS playlist pulling its segment from elsewhere: plain FFmpeg follows it
-    /// (here to a local file; in an attack to a \\server\share, which signs the user in there),
+    /// (here to a local file; in an attack to a server, which learns the file was opened),
     /// `open_file` won't. FFmpeg itself only takes HLS from .m3u8, .m3u and .hls names.
     #[test]
     fn a_downloaded_playlist_opens_nothing_else() {

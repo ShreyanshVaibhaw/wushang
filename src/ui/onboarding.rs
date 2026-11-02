@@ -6,10 +6,6 @@
 //! Sizes are DIPs from the 1088x756 frames; on a small window it scales down. The design's text
 //! says VLC and lists VLC's keys; this says wushang and lists wushang's.
 
-use windows::Win32::UI::Input::KeyboardAndMouse::*;
-use windows::core::Interface;
-use windows_numerics::Vector2;
-
 use super::*;
 use crate::prefs::Prefs;
 
@@ -53,16 +49,16 @@ const KEYS: [(&str, &[&str], bool); 12] = [
     ("Previous / Next Item", &["P", "N"], true),
     ("Stop", &["S"], false),
     ("Mute", &["M"], false),
-    ("Settings", &["CTRL", "P"], false),
+    ("Settings", &["\u{2318}", "P"], false),
     ("Toggle Fullscreen", &["F"], false),
     (
         "Increase / Decrease Volume",
         &["\u{2191}", "\u{2193}"],
         true,
     ),
-    ("Mini Player", &["CTRL", "M"], false),
-    ("Hide Controls", &["CTRL", "\\"], false),
-    ("Media Information", &["CTRL", "I"], false),
+    ("Mini Player", &["\u{2318}", "M"], false),
+    ("Hide Controls", &["\u{2318}", "\\"], false),
+    ("Media Information", &["\u{2318}", "I"], false),
     ("Quit", &["Q"], false),
 ];
 const KEY_H: f32 = 40.0;

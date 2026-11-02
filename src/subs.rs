@@ -1022,7 +1022,7 @@ mod tests {
                 "Subs/Show S01E01/2_English.srt",
             ]
         );
-        assert!(find_external(Path::new("C:/nonexistent/clip.mp4")).is_empty());
+        assert!(find_external(Path::new("/nonexistent/clip.mp4")).is_empty());
     }
 
     /// Waits until `cues` holds `n` cues, as a decoder thread fills them.

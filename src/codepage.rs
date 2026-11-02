@@ -1,25 +1,55 @@
 //! Guessing the code page of subtitle text that isn't UTF-8, and converting it. libavcodec only
 //! takes UTF-8, and old .srt files come in whatever the author's Windows used: 1252 in Western
-//! Europe, 1251 for Cyrillic, Shift-JIS in Japan and so on.
+//! Europe, 1251 for Cyrillic, Shift-JIS in Japan and so on. Code pages keep their Windows
+//! numbers; encoding_rs does the decoding, with the WHATWG versions of each (the same tables, and
+//! for 936, 949 and 950 their supersets GB18030, UHC and Big5-HKSCS).
 //!
 //! A language tag (from "movie.ru.srt") settles it when it names one. Otherwise every candidate
 //! decodes the text and the most plausible result wins: words in one script, Latin words with
 //! some plain ASCII in them, and for the CJK code pages strict decoding into CJK characters.
 
 const UTF8: u32 = 65001;
-const MB_ERR_INVALID_CHARS: u32 = 0x8;
 
-#[link(name = "kernel32")]
-unsafe extern "system" {
-    fn MultiByteToWideChar(
-        code_page: u32,
-        flags: u32,
-        src: *const u8,
-        src_len: i32,
-        dst: *mut u16,
-        dst_len: i32,
-    ) -> i32;
-    fn GetACP() -> u32;
+/// The encoding behind a Windows code page number, None for one wushang doesn't know.
+fn encoding(cp: u32) -> Option<&'static encoding_rs::Encoding> {
+    use encoding_rs::*;
+    Some(match cp {
+        UTF8 => UTF_8,
+        874 => WINDOWS_874,
+        932 => SHIFT_JIS,
+        936 => GBK,
+        949 => EUC_KR,
+        950 => BIG5,
+        1250 => WINDOWS_1250,
+        1251 => WINDOWS_1251,
+        1252 => WINDOWS_1252,
+        1253 => WINDOWS_1253,
+        1254 => WINDOWS_1254,
+        1255 => WINDOWS_1255,
+        1256 => WINDOWS_1256,
+        1257 => WINDOWS_1257,
+        1258 => WINDOWS_1258,
+        _ => return None,
+    })
+}
+
+/// The code page Windows would use for the user's first preferred language, what GetACP gives
+/// there: 1252 for English, 1251 for Russian and so on.
+fn system_code_page() -> u32 {
+    static CP: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *CP.get_or_init(|| {
+        let languages = objc2_foundation::NSLocale::preferredLanguages();
+        let first = languages.iter().next().map(|l| l.to_string());
+        // "en-IN", "zh-Hant-TW": the language comes first; traditional Chinese has a script.
+        let tag = first.as_deref().unwrap_or("en");
+        let language = tag.split(['-', '_']).next().unwrap_or("en");
+        let language = if language == "zh" && tag.contains("Hant") {
+            "cht"
+        } else {
+            language
+        };
+        for_language(language).unwrap_or(1252)
+    })
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -63,7 +93,7 @@ pub fn detect(text: &[u8], language: Option<&str>) -> u32 {
         return cp;
     }
     // The system's own code page goes first, so it wins ties.
-    let system = unsafe { GetACP() };
+    let system = system_code_page();
     let mut order: Vec<(u32, Script)> = CANDIDATES.to_vec();
     order.sort_by_key(|&(cp, _)| cp != system);
     let score = |cp: u32, script: Script| {
@@ -89,19 +119,13 @@ pub fn detect(text: &[u8], language: Option<&str>) -> u32 {
 
 /// `text` in code page `cp` as a string; with `strict`, None when it isn't valid in it.
 pub fn decode(text: &[u8], cp: u32, strict: bool) -> Option<String> {
-    if text.is_empty() {
-        return Some(String::new());
-    }
-    let flags = if strict { MB_ERR_INVALID_CHARS } else { 0 };
-    let len = i32::try_from(text.len()).ok()?;
-    unsafe {
-        let n = MultiByteToWideChar(cp, flags, text.as_ptr(), len, std::ptr::null_mut(), 0);
-        if n <= 0 {
-            return None;
-        }
-        let mut wide = vec![0u16; n as usize];
-        MultiByteToWideChar(cp, flags, text.as_ptr(), len, wide.as_mut_ptr(), n);
-        Some(String::from_utf16_lossy(&wide))
+    let encoding = encoding(cp)?;
+    if strict {
+        encoding
+            .decode_without_bom_handling_and_without_replacement(text)
+            .map(|s| s.into_owned())
+    } else {
+        Some(encoding.decode_without_bom_handling(text).0.into_owned())
     }
 }
 
@@ -253,31 +277,11 @@ pub fn language_of(path: &std::path::Path) -> Option<String> {
 mod tests {
     use super::*;
 
-    #[link(name = "kernel32")]
-    unsafe extern "system" {
-        fn WideCharToMultiByte(
-            code_page: u32,
-            flags: u32,
-            src: *const u16,
-            src_len: i32,
-            dst: *mut u8,
-            dst_len: i32,
-            default: *const u8,
-            used_default: *mut i32,
-        ) -> i32;
-    }
-
     /// `text` in code page `cp`, the way an old subtitle file would have it.
     fn encode(text: &str, cp: u32) -> Vec<u8> {
-        let wide: Vec<u16> = text.encode_utf16().collect();
-        let (src, len) = (wide.as_ptr(), wide.len() as i32);
-        let (none, unused) = (std::ptr::null(), std::ptr::null_mut());
-        unsafe {
-            let n = WideCharToMultiByte(cp, 0, src, len, std::ptr::null_mut(), 0, none, unused);
-            let mut out = vec![0u8; n as usize];
-            WideCharToMultiByte(cp, 0, src, len, out.as_mut_ptr(), n, none, unused);
-            out
-        }
+        let (bytes, _, unmappable) = encoding(cp).unwrap().encode(text);
+        assert!(!unmappable, "{text} has no code page {cp} form");
+        bytes.into_owned()
     }
 
     #[test]
@@ -312,8 +316,19 @@ mod tests {
         // Bytes valid in 1250 and 1252 alike; the tag picks.
         let bytes = encode("Šťastný nový rok", 1250);
         assert_eq!(detect(&bytes, Some("cze")), 1250);
-        let path = std::path::Path::new(r"C:\Movies\Film.2020.ru.srt");
+        let path = std::path::Path::new("/Users/me/Movies/Film.2020.ru.srt");
         assert_eq!(language_of(path).as_deref(), Some("ru"));
         assert_eq!(language_of(std::path::Path::new("Film.2020.srt")), None);
+    }
+
+    #[test]
+    fn the_system_code_page_follows_the_preferred_language() {
+        assert!(encoding(system_code_page()).is_some());
+        assert_eq!(decode(b"caf\xe9", 1252, true).as_deref(), Some("café"));
+        assert_eq!(decode(b"\x82\xa0", 932, true).as_deref(), Some("あ"));
+        // A lone lead byte isn't Shift-JIS; loosely it decodes with a replacement.
+        assert_eq!(decode(b"a\x82", 932, true), None);
+        assert_eq!(decode(b"a\x82", 932, false).as_deref(), Some("a\u{fffd}"));
+        assert_eq!(decode(b"x", 12345, false), None);
     }
 }

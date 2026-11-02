@@ -117,7 +117,7 @@ mod tests {
 
     #[test]
     fn describes_the_test_clip() {
-        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(r"testdata\test_tracks.mkv");
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/test_tracks.mkv");
         ff::init().unwrap();
         let d = details(&path).expect("test_tracks.mkv opens");
         assert!(d.container.contains("Matroska"), "{}", d.container);

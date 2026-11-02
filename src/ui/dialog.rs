@@ -11,19 +11,6 @@ use std::path::{Path, PathBuf};
 
 use super::*;
 use crate::net::NetKind;
-use windows::Win32::Foundation::{GENERIC_READ, GlobalFree, HANDLE, HGLOBAL};
-use windows::Win32::Graphics::Imaging::*;
-use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance};
-use windows::Win32::System::DataExchange::{
-    CloseClipboard, EmptyClipboard, GetClipboardData, OpenClipboard, SetClipboardData,
-};
-use windows::Win32::System::Memory::{
-    GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock,
-};
-use windows::Win32::UI::Input::KeyboardAndMouse::*;
-use windows::Win32::UI::WindowsAndMessaging::{IDC_HAND, IDC_IBEAM};
-use windows::core::{HSTRING, Interface, PCWSTR};
-use windows_numerics::Vector2;
 
 /// What main.rs can open.
 #[derive(Clone, Debug, PartialEq)]
@@ -120,7 +107,6 @@ const BLINK_MS: u128 = 530;
 const MAX_IMAGE: u32 = 512;
 const FIGMA_URL: &str = "https://www.figma.com/community/file/1691465999134370980/vlc-redesign";
 const CC_BY_URL: &str = "https://creativecommons.org/licenses/by/4.0/";
-const CF_UNICODETEXT: u32 = 13;
 
 // Sampled from the "new playlist" frame.
 const BG_DIALOG: u32 = 0x191919;
@@ -142,10 +128,7 @@ const FG_BUTTON_OFF: u32 = 0x606060;
 const SHORTCUTS: [(&str, &str); 24] = [
     ("Space", "Play or pause"),
     ("Left / Right", "Skip back or forward (Settings > Controls)"),
-    (
-        "Alt / Shift / Ctrl + arrows",
-        "Very short, medium or long skip",
-    ),
+    ("⌥ / ⇧ / ⌘ + arrows", "Very short, medium or long skip"),
     ("Up / Down", "Volume up or down"),
     ("Mouse wheel", "Volume in the player, scroll in the library"),
     ("M", "Mute"),
@@ -156,23 +139,23 @@ const SHORTCUTS: [(&str, &str); 24] = [
     ),
     ("Backspace", "Back, in the library"),
     ("S / P / N", "Stop, previous file, next file"),
-    ("Shift + S", "Snapshot, saved in Pictures\\wushang"),
-    ("R", "Record, saved in Videos\\wushang; R again stops"),
-    ("Ctrl + O", "Open files"),
-    ("Ctrl + F", "Open a folder"),
-    ("Ctrl + N", "Open a network stream"),
+    ("⇧S", "Snapshot, saved in Pictures/wushang"),
+    ("R", "Record, saved in Movies/wushang; R again stops"),
+    ("⌘O", "Open files"),
+    ("⌘F", "Open a folder"),
+    ("⌘N", "Open a network stream"),
     (
-        "Ctrl + R",
-        "Convert the open file to MP4, saved in Videos\\wushang",
+        "⌘R",
+        "Convert the open file to MP4, saved in Movies/wushang",
     ),
-    ("Ctrl + P", "Settings"),
-    ("Ctrl + M", "Mini player, and back"),
-    ("Ctrl + I", "Properties of the file playing or pointed at"),
-    ("Ctrl + \\", "Hide the controls until the mouse moves"),
+    ("⌘P", "Settings"),
+    ("⌘M", "Mini player, and back"),
+    ("⌘I", "Properties of the file playing or pointed at"),
+    ("⌘\\", "Hide the controls until the mouse moves"),
     ("Right-click", "Player and library menus"),
     ("F1", "Keyboard shortcuts"),
-    ("Shift + F1", "About wushang"),
-    ("Q, Ctrl + Q", "Quit"),
+    ("⇧F1", "About wushang"),
+    ("Q, ⌘Q", "Quit"),
 ];
 
 /// A single-line text field's text, caret and selection. Positions are byte offsets on char
@@ -537,11 +520,10 @@ fn properties(path: &Path) -> Vec<(String, String)> {
     );
     match std::fs::metadata(path) {
         Ok(m) => {
-            use std::os::windows::fs::MetadataExt;
             row("Size", size_text(m.len()));
             row(
                 "Modified",
-                local_time(m.last_write_time()).unwrap_or_default(),
+                m.modified().ok().and_then(local_time).unwrap_or_default(),
             );
         }
         Err(e) => row("Size", format!("Can't read the file ({e})")),
@@ -615,78 +597,26 @@ fn duration_text(seconds: f64) -> String {
     }
 }
 
-/// A FILETIME as local "2026-10-25 21:20".
-fn local_time(filetime: u64) -> Option<String> {
-    use windows::Win32::Foundation::{FILETIME, SYSTEMTIME};
-    use windows::Win32::System::Time::{FileTimeToSystemTime, SystemTimeToTzSpecificLocalTime};
-    let ft = FILETIME {
-        dwLowDateTime: filetime as u32,
-        dwHighDateTime: (filetime >> 32) as u32,
-    };
-    let (mut utc, mut t) = (SYSTEMTIME::default(), SYSTEMTIME::default());
-    unsafe {
-        FileTimeToSystemTime(&ft, &mut utc).ok()?;
-        SystemTimeToTzSpecificLocalTime(None, &utc, &mut t).ok()?;
+/// A file time as local "2026-10-25 21:20".
+fn local_time(time: std::time::SystemTime) -> Option<String> {
+    let secs = time.duration_since(std::time::UNIX_EPOCH).ok()?.as_secs();
+    let t = libc::time_t::try_from(secs).ok()?;
+    // SAFETY: localtime_r only writes the tm it is given.
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    if unsafe { libc::localtime_r(&t, &mut tm) }.is_null() {
+        return None;
     }
     Some(format!(
         "{:04}-{:02}-{:02} {:02}:{:02}",
-        t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute
+        tm.tm_year + 1900,
+        tm.tm_mon + 1,
+        tm.tm_mday,
+        tm.tm_hour,
+        tm.tm_min
     ))
 }
 
-/// The clipboard's text, if it holds any.
-fn clipboard_text() -> Option<String> {
-    unsafe {
-        OpenClipboard(Some(GetActiveWindow())).ok()?;
-        let text = (|| {
-            let h = HGLOBAL(GetClipboardData(CF_UNICODETEXT).ok()?.0);
-            let p = GlobalLock(h) as *const u16;
-            if p.is_null() {
-                return None;
-            }
-            // Any program can put text there without the closing zero, so the scan stops at the
-            // end of the block either way.
-            let size = GlobalSize(h) / 2;
-            let all = std::slice::from_raw_parts(p, size);
-            let len = all.iter().position(|&c| c == 0).unwrap_or(size);
-            let s = String::from_utf16_lossy(&all[..len]);
-            _ = GlobalUnlock(h);
-            Some(s)
-        })();
-        _ = CloseClipboard();
-        text
-    }
-}
-
-/// Puts `text` on the clipboard. The window must own the clipboard for SetClipboardData to
-/// work, so this runs on the UI thread, where the window is active.
-fn set_clipboard_text(text: &str) -> bool {
-    let utf16: Vec<u16> = text.encode_utf16().chain([0]).collect();
-    unsafe {
-        if OpenClipboard(Some(GetActiveWindow())).is_err() {
-            return false;
-        }
-        let done = (|| -> Result<()> {
-            EmptyClipboard()?;
-            let h = GlobalAlloc(GMEM_MOVEABLE, utf16.len() * 2)?;
-            let p = GlobalLock(h) as *mut u16;
-            if p.is_null() {
-                _ = GlobalFree(Some(h));
-                return Err(Error::from(E_FAIL));
-            }
-            std::ptr::copy_nonoverlapping(utf16.as_ptr(), p, utf16.len());
-            _ = GlobalUnlock(h);
-            // The clipboard owns the memory from here on, unless it refuses it.
-            if let Err(e) = SetClipboardData(CF_UNICODETEXT, Some(HANDLE(h.0))) {
-                _ = GlobalFree(Some(h));
-                return Err(e);
-            }
-            Ok(())
-        })();
-        _ = CloseClipboard();
-        done.is_ok()
-    }
-}
+use crate::platform::{clipboard_text, set_clipboard_text};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Style {
@@ -958,7 +888,7 @@ impl Painter {
                     w - PAD,
                 );
                 b.text(
-                    "wushang's folder. Explorer has both open.",
+                    "wushang's folder. Finder has both open.",
                     Style::Help,
                     PAD,
                     139.0,
@@ -1166,7 +1096,7 @@ fn about_parts(b: &mut Builder) -> f32 {
         w - PAD,
     );
     b.text(
-        "A small Windows video player in Rust: FFmpeg, Direct3D 11 and WASAPI.",
+        "A small macOS video player in Rust: FFmpeg, Metal and Core Audio.",
         Style::Value,
         PAD,
         146.0,
@@ -1342,7 +1272,7 @@ impl Ui {
         if target != Target::Field {
             return None;
         }
-        let shift = unsafe { GetKeyState(i32::from(VK_SHIFT.0)) } < 0;
+        let shift = crate::platform::keys::shift_down();
         let g = self.layout.dialog.as_ref()?;
         let i = g.caret_at(x);
         let d = self.dialog.as_mut()?;
@@ -1459,7 +1389,6 @@ pub(super) struct Resources {
     name: IDWriteTextFormat,
     small: IDWriteTextFormat,
     plus: Svg,
-    wic: Option<IWICImagingFactory>,
     /// Pictures by file; None means it didn't decode.
     images: HashMap<PathBuf, Option<ID2D1Bitmap1>>,
 }
@@ -1517,65 +1446,68 @@ impl Resources {
             name: format(22.0, DWRITE_FONT_WEIGHT_SEMI_BOLD, lead)?,
             small: format(12.0, regular, lead)?,
             plus: svg(ctx, include_bytes!("../../assets/icons/nav_add.svg"))?,
-            wic: None,
             images: HashMap::new(),
         })
     }
 
-    /// The picture at `path`, decoded once with WIC and kept.
+    /// The picture at `path`, decoded once and kept.
     fn image(&mut self, ctx: &ID2D1DeviceContext5, path: &Path) -> Option<ID2D1Bitmap1> {
         if let Some(known) = self.images.get(path) {
             return known.clone();
         }
-        if self.wic.is_none() {
-            self.wic =
-                unsafe { CoCreateInstance(&CLSID_WICImagingFactory, None, CLSCTX_INPROC_SERVER) }
-                    .ok();
-        }
-        let bitmap = self
-            .wic
-            .as_ref()
-            .and_then(|wic| decode(ctx, wic, path).ok());
+        let bitmap = decode(ctx, path);
         self.images.insert(path.to_owned(), bitmap.clone());
         bitmap
     }
 }
 
-/// Decodes a PNG, JPEG or any format WIC knows into a bitmap no larger than `MAX_IMAGE`.
-fn decode(
-    ctx: &ID2D1DeviceContext5,
-    wic: &IWICImagingFactory,
-    path: &Path,
-) -> Result<ID2D1Bitmap1> {
-    unsafe {
-        let decoder = wic.CreateDecoderFromFilename(
-            &HSTRING::from(path),
-            None,
-            GENERIC_READ,
-            WICDecodeMetadataCacheOnDemand,
-        )?;
-        let frame = decoder.GetFrame(0)?;
-        let (mut w, mut h) = (0, 0);
-        frame.GetSize(&mut w, &mut h)?;
-        let mut source: IWICBitmapSource = frame.cast()?;
-        if w.max(h) > MAX_IMAGE {
-            let s = MAX_IMAGE as f32 / w.max(h) as f32;
-            let scaler = wic.CreateBitmapScaler()?;
-            let size = |v: u32| ((v as f32 * s).round() as u32).max(1);
-            scaler.Initialize(&source, size(w), size(h), WICBitmapInterpolationModeFant)?;
-            source = scaler.cast()?;
-        }
-        let converter = wic.CreateFormatConverter()?;
-        converter.Initialize(
-            &source,
-            &GUID_WICPixelFormat32bppPBGRA,
-            WICBitmapDitherTypeNone,
-            None,
-            0.0,
-            WICBitmapPaletteTypeMedianCut,
-        )?;
-        ctx.CreateBitmapFromWicBitmap(&converter, None)
+/// Decodes a PNG, JPEG or any format the image crate knows into a bitmap no larger than
+/// `MAX_IMAGE`.
+fn decode(ctx: &ID2D1DeviceContext5, path: &Path) -> Option<ID2D1Bitmap1> {
+    let mut picture = image::ImageReader::open(path)
+        .ok()?
+        .with_guessed_format()
+        .ok()?
+        .decode()
+        .ok()?;
+    let (w, h) = (picture.width(), picture.height());
+    if w.max(h) > MAX_IMAGE {
+        let s = MAX_IMAGE as f32 / w.max(h) as f32;
+        let size = |v: u32| ((v as f32 * s).round() as u32).max(1);
+        picture = picture.resize_exact(size(w), size(h), image::imageops::FilterType::Lanczos3);
     }
+    let rgba = picture.to_rgba8();
+    let (w, h) = rgba.dimensions();
+    // Premultiplied BGRA, as WIC's 32bppPBGRA gave it.
+    let bgra: Vec<u8> = rgba
+        .pixels()
+        .flat_map(|p| {
+            let [r, g, b, a] = p.0;
+            let pm = |c: u8| ((u16::from(c) * u16::from(a) + 127) / 255) as u8;
+            [pm(b), pm(g), pm(r), a]
+        })
+        .collect();
+    let props = D2D1_BITMAP_PROPERTIES {
+        pixelFormat: D2D1_PIXEL_FORMAT {
+            format: DXGI_FORMAT_B8G8R8A8_UNORM,
+            alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED,
+        },
+        dpiX: 96.0,
+        dpiY: 96.0,
+    };
+    let rt: &ID2D1RenderTarget = ctx;
+    unsafe {
+        rt.CreateBitmap(
+            D2D_SIZE_U {
+                width: w,
+                height: h,
+            },
+            Some(bgra.as_ptr().cast()),
+            w * 4,
+            &props,
+        )
+    }
+    .ok()
 }
 
 /// a then b, for D2D's row-vector transforms.

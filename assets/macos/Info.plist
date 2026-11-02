@@ -1,0 +1,95 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- wushang.app's Info.plist. scripts/bundle-macos.sh fills in @VERSION@ from Cargo.toml. -->
+<plist version="1.0">
+<dict>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>en</string>
+	<key>CFBundleDisplayName</key>
+	<string>wushang</string>
+	<key>CFBundleName</key>
+	<string>wushang</string>
+	<key>CFBundleExecutable</key>
+	<string>wushang</string>
+	<key>CFBundleIdentifier</key>
+	<string>com.shreyanshvaibhaw.wushang</string>
+	<key>CFBundleIconFile</key>
+	<string>wushang</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>@VERSION@</string>
+	<key>CFBundleVersion</key>
+	<string>@VERSION@</string>
+	<key>LSApplicationCategoryType</key>
+	<string>public.app-category.entertainment</string>
+	<key>LSMinimumSystemVersion</key>
+	<string>13.0</string>
+	<key>NSHighResolutionCapable</key>
+	<true/>
+	<key>NSSupportsAutomaticGraphicsSwitching</key>
+	<true/>
+	<key>NSHumanReadableCopyright</key>
+	<string>Copyright (c) 2026 Shreyansh Vaibhaw</string>
+	<key>NSCameraUsageDescription</key>
+	<string>wushang plays the cameras and capture cards you open with Open Capture Device.</string>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>wushang plays the microphones you open with Open Capture Device.</string>
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>wushang streams what it plays to other devices on your network, and plays streams from them.</string>
+	<key>CFBundleDocumentTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleTypeName</key>
+			<string>Video file</string>
+			<key>CFBundleTypeRole</key>
+			<string>Viewer</string>
+			<key>LSHandlerRank</key>
+			<string>Alternate</string>
+			<key>CFBundleTypeExtensions</key>
+			<array>
+				<string>mp4</string>
+				<string>m4v</string>
+				<string>mkv</string>
+				<string>webm</string>
+				<string>avi</string>
+				<string>mov</string>
+				<string>wmv</string>
+				<string>flv</string>
+				<string>ts</string>
+				<string>m2ts</string>
+				<string>mts</string>
+				<string>mpg</string>
+				<string>mpeg</string>
+				<string>ogv</string>
+				<string>3gp</string>
+			</array>
+		</dict>
+		<dict>
+			<key>CFBundleTypeName</key>
+			<string>Audio file</string>
+			<key>CFBundleTypeRole</key>
+			<string>Viewer</string>
+			<key>LSHandlerRank</key>
+			<string>Alternate</string>
+			<key>CFBundleTypeExtensions</key>
+			<array>
+				<string>mp3</string>
+				<string>m4a</string>
+				<string>aac</string>
+				<string>flac</string>
+				<string>wav</string>
+				<string>ogg</string>
+				<string>opus</string>
+				<string>wma</string>
+				<string>alac</string>
+				<string>aiff</string>
+				<string>ape</string>
+				<string>mka</string>
+			</array>
+		</dict>
+	</array>
+</dict>
+</plist>

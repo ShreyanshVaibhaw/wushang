@@ -1,133 +1,63 @@
-//! Whether the window's screen is in HDR mode, how bright it gets, and how bright Windows shows
-//! SDR content on it (Settings > Display > HDR > SDR content brightness).
+//! Whether the window's screen can show EDR (light above SDR white), and how much: macOS reports
+//! it as headroom, how many times SDR white the brightest pixel can be right now. It moves with
+//! the brightness setting and grows once a layer asks for EDR, so it is read on every pass.
 
-use windows::Win32::Devices::Display::*;
-use windows::Win32::Graphics::Dxgi::Common::DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020;
-use windows::Win32::Graphics::Dxgi::*;
-use windows::Win32::Graphics::Gdi::HMONITOR;
-use windows::core::Interface;
+use objc2_app_kit::{NSScreen, NSWindow};
 
-/// Peak used when a screen doesn't report one, as many TVs don't.
-const UNKNOWN_PEAK: f32 = 1000.0;
-/// SDR white when Windows won't say: HDR's reference white (BT.2408).
-const UNKNOWN_WHITE: f32 = 203.0;
+/// SDR white in nits when nothing says better: HDR's reference white (BT.2408), so HDR10's
+/// diffuse white shows at the white of the rest of the screen.
+const UNKNOWN_WHITE: f32 = crate::tonemap::HDR_WHITE;
+/// SDR white in the reference presets of Apple's XDR screens (such as "HDR Video (P3-ST 2084)").
+const REFERENCE_WHITE: f32 = 100.0;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Screen {
-    /// The brightest the screen gets, in nits.
+    /// The brightest the screen gets now, in nits.
     pub peak: f32,
-    /// Where Windows puts SDR white, in nits.
+    /// Where SDR white is, in nits; an EDR layer's 1.0.
     pub white: f32,
 }
 
-/// The screen showing `monitor`, when it is in HDR mode. A new factory each time: an old one
-/// keeps reporting the colour space the screen had when it was made.
-pub fn screen(monitor: HMONITOR) -> Option<Screen> {
-    unsafe {
-        let factory: IDXGIFactory1 = CreateDXGIFactory1().ok()?;
-        for adapter in (0..).map_while(|i| factory.EnumAdapters1(i).ok()) {
-            for output in (0..).map_while(|i| adapter.EnumOutputs(i).ok()) {
-                let Ok(desc) = output.cast::<IDXGIOutput6>().and_then(|o| o.GetDesc1()) else {
-                    continue;
-                };
-                if desc.Monitor != monitor {
-                    continue;
-                }
-                if desc.ColorSpace != DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020 {
-                    return None;
-                }
-                let peak = Some(desc.MaxLuminance).filter(|&n| n > 0.0);
-                return Some(Screen {
-                    peak: peak.unwrap_or(UNKNOWN_PEAK),
-                    white: sdr_white(&desc.DeviceName).unwrap_or(UNKNOWN_WHITE),
-                });
-            }
-        }
-        None
-    }
+/// The EDR screen the window is on, or None for an SDR screen.
+pub fn screen(window: &NSWindow) -> Option<Screen> {
+    let screen = window.screen()?;
+    describe(&screen)
 }
 
-/// The SDR white level of the display behind GDI name `device` (like `\\.\DISPLAY1`), in nits.
-fn sdr_white(device: &[u16; 32]) -> Option<f32> {
-    unsafe {
-        let (mut path_count, mut mode_count) = (0, 0);
-        GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &mut path_count, &mut mode_count)
-            .ok()
-            .ok()?;
-        let mut paths = vec![DISPLAYCONFIG_PATH_INFO::default(); path_count as usize];
-        let mut modes = vec![DISPLAYCONFIG_MODE_INFO::default(); mode_count as usize];
-        QueryDisplayConfig(
-            QDC_ONLY_ACTIVE_PATHS,
-            &mut path_count,
-            paths.as_mut_ptr(),
-            &mut mode_count,
-            modes.as_mut_ptr(),
-            None,
-        )
-        .ok()
-        .ok()?;
-        let header = |kind, size: usize, adapter, id| DISPLAYCONFIG_DEVICE_INFO_HEADER {
-            r#type: kind,
-            size: size as u32,
-            adapterId: adapter,
-            id,
-        };
-        for path in &paths[..path_count as usize] {
-            let mut source = DISPLAYCONFIG_SOURCE_DEVICE_NAME {
-                header: header(
-                    DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME,
-                    size_of::<DISPLAYCONFIG_SOURCE_DEVICE_NAME>(),
-                    path.sourceInfo.adapterId,
-                    path.sourceInfo.id,
-                ),
-                ..Default::default()
-            };
-            if DisplayConfigGetDeviceInfo(&mut source.header) != 0
-                || source.viewGdiDeviceName != *device
-            {
-                continue;
-            }
-            let mut white = DISPLAYCONFIG_SDR_WHITE_LEVEL {
-                header: header(
-                    DISPLAYCONFIG_DEVICE_INFO_GET_SDR_WHITE_LEVEL,
-                    size_of::<DISPLAYCONFIG_SDR_WHITE_LEVEL>(),
-                    path.targetInfo.adapterId,
-                    path.targetInfo.id,
-                ),
-                SDRWhiteLevel: 0,
-            };
-            if DisplayConfigGetDeviceInfo(&mut white.header) != 0 || white.SDRWhiteLevel == 0 {
-                return None;
-            }
-            // Thousandths of scRGB's 80 nits.
-            return Some(white.SDRWhiteLevel as f32 / 1000.0 * 80.0);
-        }
-        None
+fn describe(screen: &NSScreen) -> Option<Screen> {
+    if screen.maximumPotentialExtendedDynamicRangeColorComponentValue() <= 1.0 {
+        return None;
     }
+    // A reference preset fixes SDR white and the peak, so PQ shows at its own nits.
+    let reference = screen.maximumReferenceExtendedDynamicRangeColorComponentValue() as f32;
+    if reference > 1.0 {
+        return Some(Screen {
+            peak: REFERENCE_WHITE * reference,
+            white: REFERENCE_WHITE,
+        });
+    }
+    let headroom = screen.maximumExtendedDynamicRangeColorComponentValue() as f32;
+    Some(Screen {
+        peak: UNKNOWN_WHITE * headroom.max(1.0),
+        white: UNKNOWN_WHITE,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use windows::Win32::Foundation::POINT;
-    use windows::Win32::Graphics::Gdi::{MONITOR_DEFAULTTOPRIMARY, MonitorFromPoint};
 
-    /// The primary screen is found, and so is its display for the SDR white query (80 nits on
-    /// an SDR screen).
+    /// Every screen reads, with a peak no dimmer than its white. Needs the main thread, which
+    /// `cargo test -- --test-threads=1` runs tests on.
     #[test]
-    fn finds_the_primary_screen() {
-        let monitor = unsafe { MonitorFromPoint(POINT::default(), MONITOR_DEFAULTTOPRIMARY) };
-        if let Some(s) = screen(monitor) {
-            assert!(s.peak > 0.0 && s.white > 0.0);
-        }
-        let mut info = windows::Win32::Graphics::Gdi::MONITORINFOEXW::default();
-        info.monitorInfo.cbSize = size_of_val(&info) as u32;
-        unsafe {
-            windows::Win32::Graphics::Gdi::GetMonitorInfoW(monitor, &mut info.monitorInfo)
-                .ok()
-                .unwrap()
+    fn reads_every_screen() {
+        let Some(mtm) = objc2::MainThreadMarker::new() else {
+            return;
         };
-        let white = sdr_white(&info.szDevice);
-        assert!(white.is_some_and(|w| w >= 80.0), "{white:?}");
+        for screen in NSScreen::screens(mtm) {
+            if let Some(s) = describe(&screen) {
+                assert!(s.peak >= s.white && s.white > 0.0, "{s:?}");
+            }
+        }
     }
 }

@@ -143,13 +143,13 @@ mod tests {
     #[test]
     fn parse_skips_bad_lines() {
         let text = "# wushang bookmarks v1\n\
-                    C:\\v\\a.mp4\t75.5\tIntro\n\
+                    /v/a.mp4\t75.5\tIntro\n\
                     not a bookmark\n\
-                    C:\\v\\a.mp4\tsoon\tBad time\n\
-                    C:\\v\\a.mp4\t-3\tNegative\n\
+                    /v/a.mp4\tsoon\tBad time\n\
+                    /v/a.mp4\t-3\tNegative\n\
                     \t10\tNo path\n\
-                    C:\\v\\a.mp4\t12\tEarlier\r\n\
-                    C:\\v\\b.mkv\t1\tName\twith a tab\n";
+                    /v/a.mp4\t12\tEarlier\r\n\
+                    /v/b.mkv\t1\tName\twith a tab\n";
         let items = parse(text);
         let summary: Vec<(&str, f64, &str)> = items
             .iter()
@@ -158,9 +158,9 @@ mod tests {
         assert_eq!(
             summary,
             [
-                (r"C:\v\b.mkv", 1.0, "Name\twith a tab"),
-                (r"C:\v\a.mp4", 12.0, "Earlier"),
-                (r"C:\v\a.mp4", 75.5, "Intro"),
+                ("/v/b.mkv", 1.0, "Name\twith a tab"),
+                ("/v/a.mp4", 12.0, "Earlier"),
+                ("/v/a.mp4", 75.5, "Intro"),
             ]
         );
     }
@@ -169,7 +169,7 @@ mod tests {
     fn add_remove_save_and_load() {
         let dir = temp_dir("roundtrip");
         let mut b = Bookmarks::load(&dir);
-        let (a, other) = (Path::new(r"C:\v\a.mp4"), Path::new(r"C:\v\b.mkv"));
+        let (a, other) = (Path::new("/v/a.mp4"), Path::new("/v/b.mkv"));
         assert!(b.for_file(a).is_empty());
         assert_eq!(b.add(a, 754.0), 0);
         assert_eq!(b.add(other, 5.0), 0);

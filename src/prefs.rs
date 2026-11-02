@@ -65,15 +65,16 @@ pub const NET_TIMEOUT: Choices = &[
     ("30", "30 seconds"),
     ("60", "1 minute"),
 ];
-/// Where snapshots go: Pictures\wushang, the desktop, or the folder of the file they come from.
+/// Where snapshots go: Pictures/wushang, the desktop, or the folder of the file they come from.
 pub const SNAP_DIR: Choices = &[
-    ("pictures", "Pictures\\wushang"),
+    ("pictures", "Pictures/wushang"),
     ("desktop", "Desktop"),
     ("beside", "Next to the file"),
 ];
-/// Where recordings go, the same way.
+/// Where recordings go, the same way: Movies/wushang (the key keeps its Windows name, so a
+/// settings file means the same on both).
 pub const RECORD_DIR: Choices = &[
-    ("videos", "Videos\\wushang"),
+    ("videos", "Movies/wushang"),
     ("desktop", "Desktop"),
     ("beside", "Next to the file"),
 ];
@@ -87,16 +88,17 @@ pub const STREAM_PORT: Choices = &[
     ("8554", "8554"),
     ("9000", "9000"),
 ];
-/// Subtitle fonts to pick from; Inter comes with wushang, the rest with Windows.
+/// Subtitle fonts to pick from; Inter comes with wushang, the rest with macOS. Helvetica Neue and
+/// Menlo stand where the Windows build has Segoe UI and Consolas.
 pub const FONTS: [&str; 8] = [
     "Inter",
-    "Segoe UI",
+    "Helvetica Neue",
     "Arial",
     "Verdana",
     "Tahoma",
     "Georgia",
     "Times New Roman",
-    "Consolas",
+    "Menlo",
 ];
 /// The audio visualizers, drawn in place of the cover while audio plays.
 pub const VISUALIZERS: [&str; 3] = ["Disabled", "Spectrum", "Oscilloscope"];

@@ -6,7 +6,6 @@ use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::fs;
 use std::io;
-use std::os::windows::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 use crate::library::Track;
@@ -14,15 +13,19 @@ use crate::library::Track;
 const FILE: &str = "tags.txt";
 const HEADER: &str = "# wushang tags v1";
 
-/// A file's size and modification time (in FILETIME units): when either changes, its tags may
-/// have too.
+/// A file's size and modification time (in nanoseconds since 1970): when either changes, its
+/// tags may have too.
 pub type Stamp = (u64, u64);
 
 /// The stamp of the file at `path`, None when it can't be read.
 pub fn stamp(path: &Path) -> Option<Stamp> {
-    fs::metadata(path)
-        .ok()
-        .map(|m| (m.len(), m.last_write_time()))
+    let m = fs::metadata(path).ok()?;
+    let since = m
+        .modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?;
+    Some((m.len(), u64::try_from(since.as_nanos()).ok()?))
 }
 
 /// The saved tags by path; a missing or unreadable file is an empty index.
@@ -79,7 +82,7 @@ mod tests {
     #[test]
     fn saves_and_loads_tags() {
         let dir = std::env::temp_dir().join(format!("wushang-tags-{}", std::process::id()));
-        let song = PathBuf::from(r"E:\Music\Album\01 Song.mp3");
+        let song = PathBuf::from("/Volumes/E/Music/Album/01 Song.mp3");
         let track = Track {
             path: song.clone(),
             title: Some("A\tB".into()),
@@ -92,7 +95,7 @@ mod tests {
         save(&dir, &tracks).unwrap();
         // A broken line is skipped, not the whole file.
         let file = dir.join(FILE);
-        let text = fs::read_to_string(&file).unwrap() + "C:\\half\t12\n";
+        let text = fs::read_to_string(&file).unwrap() + "/half\t12\n";
         fs::write(&file, text).unwrap();
 
         let loaded = load(&dir);
@@ -102,6 +105,15 @@ mod tests {
         assert_eq!(t.title.as_deref(), Some("A B"));
         assert_eq!((t.album.as_deref(), t.duration), (None, 201.5));
         fs::remove_dir_all(dir).unwrap();
-        assert!(load(Path::new(r"Z:\nowhere")).is_empty());
+        assert!(super::stamp(Path::new("/Volumes/Z/nowhere")).is_none());
+        assert!(
+            super::stamp(
+                Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("Cargo.toml")
+                    .as_path()
+            )
+            .is_some_and(|(size, time)| size > 0 && time > 1_600_000_000_000_000_000)
+        );
+        assert!(load(Path::new("/Volumes/Z/nowhere")).is_empty());
     }
 }
