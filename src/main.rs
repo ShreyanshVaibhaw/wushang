@@ -852,19 +852,8 @@ impl App {
         match action {
             PanelAction::SelectTrack(tab, i) => self.select_track(tab, i),
             PanelAction::SelectExternal(i) => self.show_external(i),
-            PanelAction::AddSubtitleFile => {
-                if let Some(path) = pick_subtitle_file(win) {
-                    let i = match self.external.iter().position(|(p, _)| *p == path) {
-                        Some(i) => i,
-                        None => {
-                            self.external.push((path, None));
-                            self.external.len() - 1
-                        }
-                    };
-                    self.show_external(Some(i));
-                }
-            }
-            PanelAction::AddAudioFile => add_audio_file(self, win),
+            PanelAction::AddSubtitleFile => pick_subtitle_file(Picked::SubtitleFile),
+            PanelAction::AddAudioFile => pick_audio_file(),
             PanelAction::SelectDevice(i) => {
                 // The list starts with the system default, which also follows the system's choice.
                 let name = (i > 0).then(|| self.devices.get(i)).flatten();
@@ -1129,7 +1118,7 @@ impl App {
     }
 
     /// Applies one change from the queue panel.
-    fn apply_queue(&mut self, win: Window, action: QueueAction) {
+    fn apply_queue(&mut self, action: QueueAction) {
         match action {
             QueueAction::Play(i) => {
                 if let Some(path) = self.queue.play_at(i) {
@@ -1139,10 +1128,7 @@ impl App {
             QueueAction::Move(from, to) => self.queue.move_item(from, to),
             QueueAction::PlayNext(i) => self.queue.play_next(i),
             QueueAction::Remove(i) => _ = self.queue.remove(i),
-            QueueAction::AddFiles => {
-                let files = pick_media_files(win);
-                self.add_to_queue(files);
-            }
+            QueueAction::AddFiles => pick_media_files(Picked::QueueFiles),
             QueueAction::Sort => self.queue.sort_by_name(),
             QueueAction::CycleRepeat => self.queue.cycle_repeat(),
             QueueAction::ToggleShuffle => self.queue.toggle_shuffle(),
@@ -1606,6 +1592,11 @@ fn run() -> Result<(), Box<dyn Error>> {
                 UI.with_borrow_mut(|ui| ui.show(Page::Player));
             }
         }
+        // What the last file picker was opened for.
+        for (then, paths) in PICKED.with_borrow_mut(std::mem::take) {
+            use_picked(&mut app, then, paths);
+            app.sync_prefs();
+        }
         for action in PANEL_ACTIONS.with_borrow_mut(std::mem::take) {
             app.apply(win, action);
             app.sync_prefs();
@@ -1641,16 +1632,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         for action in ONBOARDING_ACTIONS.with_borrow_mut(std::mem::take) {
             match action {
                 ui::onboarding::OnboardingAction::PickFolder => {
-                    if let Some(dir) = pick_folder(win) {
-                        app.library.add_root(Section::Videos, dir);
-                        app.library_changed = true;
-                        app.save();
-                        let folder = videos_folder(&app.library);
-                        UI.with_borrow_mut(|ui| {
-                            ui.browse.stale = true;
-                            ui.onboarding_folder(folder);
-                        });
-                    }
+                    pick_folder(Picked::OnboardingFolder)
                 }
             }
         }
@@ -1695,7 +1677,7 @@ fn run() -> Result<(), Box<dyn Error>> {
             UI.with_borrow_mut(|ui| ui.dirty = true);
         }
         for action in QUEUE_ACTIONS.with_borrow_mut(std::mem::take) {
-            app.apply_queue(win, action);
+            app.apply_queue(action);
             app.sync_prefs();
             UI.with_borrow_mut(|ui| ui.dirty = true);
         }
@@ -2235,7 +2217,10 @@ fn run_frames(frame: &mut Frame<'_>, quit: &AtomicBool) -> Result<(), Box<dyn Er
         if !platform::pump_messages() || quit.load(Relaxed) {
             break Ok(());
         }
-        match call_frame(ptr) {
+        let pass = call_frame(ptr);
+        // Between passes, so modal_frame can run them while the picker is open.
+        run_picker();
+        match pass {
             Ok(true) => failed = 0,
             Ok(false) => break Ok(()),
             Err(e) => {
@@ -2308,12 +2293,12 @@ fn handle(app: &mut App, win: Window, hit: Hit) {
         Hit::Nav(section) => go(section.place()),
         Hit::AddItem => {
             let section = UI.with_borrow(|ui| ui.browse.place.section());
-            add_folder(app, win, section);
+            add_folder(section);
         }
         Hit::AddHere => match UI.with_borrow(|ui| ui.browse.place.clone()) {
             Place::Playlists => create_playlist(app),
-            Place::Playlist(name) => add_files_to_playlist(app, win, &name),
-            place => add_folder(app, win, place.section()),
+            Place::Playlist(name) => pick_media_files(Picked::PlaylistFiles(name)),
+            place => add_folder(place.section()),
         },
         Hit::Back => UI.with_borrow_mut(|ui| ui.browse.back()),
         Hit::Forward => UI.with_borrow_mut(|ui| ui.browse.forward()),
@@ -2360,7 +2345,7 @@ fn handle(app: &mut App, win: Window, hit: Hit) {
                     }
                 }
                 Entry::Action { action, .. } => match action {
-                    library::Action::AddFolder(section) => add_folder(app, win, section),
+                    library::Action::AddFolder(section) => add_folder(section),
                     library::Action::CreatePlaylist => create_playlist(app),
                     library::Action::AddNetworkStream => {
                         open_dialog(app, Dialog::Address(NetKind::Stream));
@@ -2498,24 +2483,8 @@ fn open_menu(app: &mut App, hit: Hit, at: (f32, f32)) {
 fn menu_action(app: &mut App, win: Window, action: MenuAction) {
     let show_player = || UI.with_borrow_mut(|ui| ui.show(Page::Player));
     match action {
-        MenuAction::OpenFiles => {
-            let files = pick_media_files(win);
-            if let Some(first) = files.first().cloned()
-                && app.play(&first, files)
-            {
-                show_player();
-            }
-        }
-        MenuAction::OpenFolder => {
-            if let Some(dir) = pick_folder(win) {
-                let queue = app.library.media_in(&Place::Folder(Section::Videos, dir));
-                if let Some(first) = queue.first().cloned()
-                    && app.play(&first, queue)
-                {
-                    show_player();
-                }
-            }
-        }
+        MenuAction::OpenFiles => pick_media_files(Picked::OpenFiles),
+        MenuAction::OpenFolder => pick_folder(Picked::OpenFolder),
         MenuAction::PlayRecent(path) => {
             if app.play_file(&path) {
                 show_player();
@@ -2606,17 +2575,11 @@ fn menu_action(app: &mut App, win: Window, action: MenuAction) {
                 job.cancel();
             }
         }
-        MenuAction::OpenDisc(folder) => {
-            let Some(folder) = folder.or_else(|| pick_folder(win)) else {
-                return;
-            };
-            open_disc(app, &folder);
-        }
+        MenuAction::OpenDisc(Some(folder)) => open_disc(app, &folder),
+        MenuAction::OpenDisc(None) => pick_folder(Picked::Disc),
         MenuAction::OpenDiscImage => {
-            let images = [("Blu-ray images", "*.iso".to_owned())];
-            if let Some(image) = pick_files(win, &images, false).pop() {
-                open_disc(app, &image);
-            }
+            let images = vec![("Blu-ray images", "*.iso".to_owned())];
+            pick(Picker::Files(images, false), Picked::Disc);
         }
         MenuAction::OpenCapture(address, name) => {
             let path = PathBuf::from(address);
@@ -2627,7 +2590,7 @@ fn menu_action(app: &mut App, win: Window, action: MenuAction) {
         }
         MenuAction::Panel(a) => app.apply(win, a),
         MenuAction::Queue(a) => {
-            app.apply_queue(win, a);
+            app.apply_queue(a);
             UI.with_borrow_mut(|ui| ui.dirty = true);
         }
         // Files join the queue, or play when nothing is open.
@@ -2655,7 +2618,7 @@ fn menu_action(app: &mut App, win: Window, action: MenuAction) {
                 UI.with_borrow_mut(|ui| ui.browse.go(place));
             }
         }
-        MenuAction::AddSubtitleTo(path) => add_subtitle_to(app, win, &path),
+        MenuAction::AddSubtitleTo(path) => pick_subtitle_file(Picked::SubtitleFor(path)),
         MenuAction::AddAudioTo(path) => {
             if app.session.as_ref().is_none_or(|s| s.path != path) {
                 let place = UI.with_borrow(|ui| ui.browse.place.clone());
@@ -2668,7 +2631,7 @@ fn menu_action(app: &mut App, win: Window, action: MenuAction) {
                 }
                 show_player();
             }
-            add_audio_file(app, win);
+            pick_audio_file();
         }
         MenuAction::ForgetAddress(kind, url) => {
             app.library.remove_address(kind, &url);
@@ -2680,14 +2643,17 @@ fn menu_action(app: &mut App, win: Window, action: MenuAction) {
                 ui.browse.stale = true;
             });
         }
-        MenuAction::AddFolder(section) => add_folder(app, win, section),
+        MenuAction::AddFolder(section) => add_folder(section),
         MenuAction::Resync => {
             app.library.forget_media_folders();
             UI.with_borrow_mut(|ui| ui.browse.stale = true);
         }
         MenuAction::PlayPlaylist(name) => play_playlist(app, &name, false),
         MenuAction::ShufflePlaylist(name) => play_playlist(app, &name, true),
-        MenuAction::ExportPlaylist(name) => export_playlist(app, win, &name),
+        MenuAction::ExportPlaylist(name) => {
+            let file = format!("{name}.m3u");
+            pick(Picker::Save(file), Picked::ExportPlaylist(name));
+        }
         MenuAction::Sort(mode) => UI.with_borrow_mut(|ui| {
             ui.browse.set_sort(mode);
             ui.browse.scroll = 0.0;
@@ -2747,20 +2713,22 @@ fn toggle_favorite(app: &mut App, path: &Path) {
     UI.with_borrow_mut(|ui| ui.browse.stale = true);
 }
 
-/// Picks an audio file and plays its sound with the open file, as a track of its own.
-fn add_audio_file(app: &mut App, win: Window) {
-    let filters = [
+/// Picks an audio file to play with the open file, as a track of its own.
+fn pick_audio_file() {
+    let filters = vec![
         ("Audio files", file_spec(library::AUDIO_EXTS)),
         ("Video files", file_spec(library::VIDEO_EXTS)),
         ("All files", "*.*".to_owned()),
     ];
-    let Some(path) = pick_files(win, &filters, false).pop() else {
-        return;
-    };
+    pick(Picker::Files(filters, false), Picked::AudioFile);
+}
+
+/// Plays the sound of the audio file at `path` with the open file, as a track of its own.
+fn add_audio_track(app: &mut App, path: &Path) {
     let Some(session) = app.session.as_mut() else {
         return;
     };
-    match session.add_audio_file(&path) {
+    match session.add_audio_file(path) {
         Ok(stream) => {
             let audio = session.tracks(TrackKind::Audio);
             let i = audio.iter().position(|t| t.stream == stream);
@@ -2770,11 +2738,9 @@ fn add_audio_file(app: &mut App, win: Window) {
     }
 }
 
-/// Picks a subtitle file for `path` and shows it: on the open file, or on `path` once it plays.
-fn add_subtitle_to(app: &mut App, win: Window, path: &Path) {
-    let Some(subs) = pick_subtitle_file(win) else {
-        return;
-    };
+/// Shows the subtitle file `subs` picked for `path`: on the open file, or on `path` once it
+/// plays.
+fn add_subtitle_to(app: &mut App, path: &Path, subs: PathBuf) {
     let open = app.session.as_ref().is_some_and(|s| s.path == path);
     if !open {
         let place = UI.with_borrow(|ui| ui.browse.place.clone());
@@ -2826,32 +2792,25 @@ fn shuffle_in_place<T>(items: &mut [T]) {
     }
 }
 
-/// Writes a playlist to an M3U file the user picks, with absolute paths so it works anywhere.
-fn export_playlist(app: &App, win: Window, name: &str) {
-    let Some(file) = pick_save_file(win, &format!("{name}.m3u")) else {
-        return;
-    };
+/// Writes a playlist to the M3U file the user picked, with absolute paths so it works anywhere.
+fn export_playlist(app: &App, name: &str, file: &Path) {
     let mut text = String::from("#EXTM3U\n");
     for item in app.library.playlist_items(name) {
         text.push_str(&item.to_string_lossy());
         text.push('\n');
     }
-    if let Err(e) = std::fs::write(&file, text) {
+    if let Err(e) = std::fs::write(file, text) {
         eprintln!("playlist: cannot export to {}: {e}", file.display());
     }
 }
 
-fn add_folder(app: &mut App, win: Window, section: Section) {
+/// Picks a folder for the library's Videos, or its Music for `Section::Music`.
+fn add_folder(section: Section) {
     let section = match section {
         Section::Music => Section::Music,
         _ => Section::Videos,
     };
-    if let Some(dir) = pick_folder(win) {
-        app.library.add_root(section, dir);
-        app.library_changed = true;
-        app.save();
-        UI.with_borrow_mut(|ui| ui.browse.stale = true);
-    }
+    pick_folder(Picked::Folder(section));
 }
 
 /// Opens the New Playlist dialog.
@@ -2924,18 +2883,13 @@ fn apply_dialog(app: &mut App, win: Window, action: DialogAction) {
                 UI.with_borrow_mut(|ui| ui.dialog_error(message));
             }
         },
-        DialogAction::PickFiles => {
-            let files = pick_media_files(win);
-            UI.with_borrow_mut(|ui| ui.dialog_add_files(files));
-        }
+        DialogAction::PickFiles => pick_media_files(Picked::DialogFiles),
         DialogAction::PickThumbnail => {
-            let images = [(
+            let images = vec![(
                 "Images",
                 "*.png;*.jpg;*.jpeg;*.bmp;*.gif;*.webp;*.tif;*.tiff".to_owned(),
             )];
-            if let Some(image) = pick_files(win, &images, false).pop() {
-                UI.with_borrow_mut(|ui| ui.dialog_set_thumbnail(Some(image)));
-            }
+            pick(Picker::Files(images, false), Picked::Thumbnail);
         }
         DialogAction::CreatePlaylist {
             name,
@@ -3005,16 +2959,6 @@ fn show_properties(app: &App) {
     }
 }
 
-/// The header's "+" on a playlist page: picks files and appends them.
-fn add_files_to_playlist(app: &mut App, win: Window, name: &str) {
-    for file in pick_media_files(win) {
-        if let Err(e) = app.library.add_to_playlist(name, &file) {
-            eprintln!("library: cannot add {file:?} to {name}: {e}");
-        }
-    }
-    UI.with_borrow_mut(|ui| ui.browse.stale = true);
-}
-
 /// "*.a;*.b" for a file picker filter.
 fn file_spec(exts: &[&str]) -> String {
     exts.iter()
@@ -3024,24 +2968,18 @@ fn file_spec(exts: &[&str]) -> String {
 }
 
 /// The system file picker for video and audio files, several at once.
-fn pick_media_files(win: Window) -> Vec<PathBuf> {
+fn pick_media_files(then: Picked) {
     let (video, audio) = (
         file_spec(library::VIDEO_EXTS),
         file_spec(library::AUDIO_EXTS),
     );
-    let filters = [
+    let filters = vec![
         ("Media files", format!("{video};{audio}")),
         ("Video files", video),
         ("Audio files", audio),
         ("All files", "*.*".to_owned()),
     ];
-    pick_files(win, &filters, true)
-}
-
-/// The system file picker with (name, "*.a;*.b") filters; empty when cancelled. Modal, like
-/// the folder picker.
-fn pick_files(_win: Window, filters: &[(&str, String)], multiple: bool) -> Vec<PathBuf> {
-    platform::pick_files(filters, multiple)
+    pick(Picker::Files(filters, true), then);
 }
 
 /// "16:9" or "2.39:1" as a whole-number ratio; None for "Default".
@@ -3052,25 +2990,158 @@ fn ratio(label: Option<&str>) -> Option<(u32, u32)> {
 }
 
 /// The system file picker, for loading a subtitle file by hand.
-fn pick_subtitle_file(win: Window) -> Option<PathBuf> {
-    let filters = [
+fn pick_subtitle_file(then: Picked) {
+    let filters = vec![
         (
             "Subtitles",
             "*.srt;*.ass;*.ssa;*.vtt;*.sub;*.idx;*.smi;*.sami;*.sup".to_owned(),
         ),
         ("All files", "*.*".to_owned()),
     ];
-    pick_files(win, &filters, false).pop()
+    pick(Picker::Files(filters, false), then);
 }
 
-/// The system Save dialog for an M3U file, starting at `name`.
-fn pick_save_file(_win: Window, name: &str) -> Option<PathBuf> {
-    platform::pick_save_file(name, ("M3U playlist", "*.m3u"))
+/// The system folder picker.
+fn pick_folder(then: Picked) {
+    pick(Picker::Folder, then);
 }
 
-/// The system folder picker. Modal: the window keeps repainting, playback keeps going.
-fn pick_folder(_win: Window) -> Option<PathBuf> {
-    platform::pick_folder()
+/// A system file picker to show: files with (name, "*.a;*.b") filters, one or several, a
+/// folder, or the Save dialog for an M3U file named so at first.
+enum Picker {
+    Files(Vec<(&'static str, String)>, bool),
+    Folder,
+    Save(String),
+}
+
+/// What the files picked are for. Pickers are modal, and one run inside a pass would hold the
+/// render loop up until it closed, so a pass only asks for one (`pick`); `run_frames` shows it
+/// between passes, while `modal_frame` keeps the video and the interface going, and the next
+/// pass does this with the answer (`use_picked`).
+enum Picked {
+    /// Shown on the open file.
+    SubtitleFile,
+    /// Played as the open file's audio track.
+    AudioFile,
+    /// Shown on this file, played first if it isn't open.
+    SubtitleFor(PathBuf),
+    QueueFiles,
+    OpenFiles,
+    OpenFolder,
+    /// A DVD or Blu-ray folder or image.
+    Disc,
+    /// The welcome's media folder.
+    OnboardingFolder,
+    /// For the New Playlist dialog's list.
+    DialogFiles,
+    /// The playlist dialog's picture.
+    Thumbnail,
+    /// A library folder for the section.
+    Folder(Section),
+    /// Appended to the playlist.
+    PlaylistFiles(String),
+    /// Where the playlist is exported to.
+    ExportPlaylist(String),
+}
+
+thread_local! {
+    /// The picker a pass asked for; the first one asked wins.
+    static PICK: RefCell<Option<(Picker, Picked)>> = const { RefCell::new(None) };
+    /// Pickers' answers, for the next pass. Cancelled ones leave nothing.
+    static PICKED: RefCell<Vec<(Picked, Vec<PathBuf>)>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Asks for `picker`, to do `then` with its answer.
+fn pick(picker: Picker, then: Picked) {
+    PICK.with_borrow_mut(|p| {
+        if p.is_none() {
+            *p = Some((picker, then));
+        }
+    });
+}
+
+/// Shows the picker the last pass asked for, if any. Modal: AppKit runs its own loop until it
+/// closes, and the modal timer runs passes meanwhile.
+fn run_picker() {
+    let Some((picker, then)) = PICK.take() else {
+        return;
+    };
+    let paths = match picker {
+        Picker::Files(filters, multiple) => platform::pick_files(&filters, multiple),
+        Picker::Folder => platform::pick_folder().into_iter().collect(),
+        Picker::Save(name) => platform::pick_save_file(&name, ("M3U playlist", "*.m3u"))
+            .into_iter()
+            .collect(),
+    };
+    if !paths.is_empty() {
+        PICKED.with_borrow_mut(|p| p.push((then, paths)));
+    }
+}
+
+/// Does what the files were picked for; `paths` holds at least one.
+fn use_picked(app: &mut App, then: Picked, mut paths: Vec<PathBuf>) {
+    let show_player = || UI.with_borrow_mut(|ui| ui.show(Page::Player));
+    let first = paths[0].clone();
+    match then {
+        Picked::SubtitleFile => {
+            let i = match app.external.iter().position(|(p, _)| *p == first) {
+                Some(i) => i,
+                None => {
+                    app.external.push((first, None));
+                    app.external.len() - 1
+                }
+            };
+            app.show_external(Some(i));
+        }
+        Picked::AudioFile => add_audio_track(app, &first),
+        Picked::SubtitleFor(media) => add_subtitle_to(app, &media, first),
+        Picked::QueueFiles => app.add_to_queue(paths),
+        Picked::OpenFiles => {
+            if app.play(&first, paths) {
+                show_player();
+            }
+        }
+        Picked::OpenFolder => {
+            let queue = app.library.media_in(&Place::Folder(Section::Videos, first));
+            if let Some(first) = queue.first().cloned()
+                && app.play(&first, queue)
+            {
+                show_player();
+            }
+        }
+        Picked::Disc => open_disc(app, &first),
+        Picked::OnboardingFolder => {
+            app.library.add_root(Section::Videos, first);
+            app.library_changed = true;
+            app.save();
+            let folder = videos_folder(&app.library);
+            UI.with_borrow_mut(|ui| {
+                ui.browse.stale = true;
+                ui.onboarding_folder(folder);
+            });
+        }
+        Picked::DialogFiles => UI.with_borrow_mut(|ui| ui.dialog_add_files(paths)),
+        Picked::Thumbnail => {
+            let image = paths.pop();
+            UI.with_borrow_mut(|ui| ui.dialog_set_thumbnail(image));
+        }
+        Picked::Folder(section) => {
+            app.library.add_root(section, first);
+            app.library_changed = true;
+            app.save();
+            UI.with_borrow_mut(|ui| ui.browse.stale = true);
+        }
+        Picked::PlaylistFiles(name) => {
+            for file in paths {
+                if let Err(e) = app.library.add_to_playlist(&name, &file) {
+                    eprintln!("library: cannot add {file:?} to {name}: {e}");
+                }
+            }
+            UI.with_borrow_mut(|ui| ui.browse.stale = true);
+        }
+        Picked::ExportPlaylist(name) => export_playlist(app, &name, &first),
+    }
+    UI.with_borrow_mut(|ui| ui.dirty = true);
 }
 
 /// The window's own title, for the Window menu, Mission Control and the Dock: the file playing,
