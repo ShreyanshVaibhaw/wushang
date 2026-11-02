@@ -142,6 +142,8 @@ pub fn create_window(title: &str, size: (f64, f64), min: (f64, f64)) -> Window {
     Window
 }
 
+/// For the debug builds' scripted input.
+#[cfg(debug_assertions)]
 pub(super) fn ns() -> Retained<NSWindow> {
     window()
 }
