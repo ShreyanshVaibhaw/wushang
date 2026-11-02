@@ -2,46 +2,51 @@
 
 # wushang
 
-A small Windows video player in Rust, built with the same pipeline as VLC but without its plugin system.
-FFmpeg demuxes and decodes, the GPU decodes and presents through Direct3D 11, and WASAPI plays the audio.
+A small macOS video player in Rust, built with the same pipeline as VLC but without its plugin system.
+FFmpeg demuxes and decodes, VideoToolbox decodes on the GPU, Metal presents, and Core Audio plays the sound.
 The interface follows Juxtopposed's VLC redesign (see Credits).
+This is the macOS port of the Windows player; "Differences from the Windows version" near the end lists what behaves differently here.
 
 ## Download
 
-Get `wushang-<version>-windows-x64.msi` from the [latest release](https://github.com/ShreyanshVaibhaw/wushang/releases/latest) and open it.
-It installs wushang for your account, with no admin rights, in `%LOCALAPPDATA%\Programs\wushang`, adds it to the Start menu, and starts it.
-Settings > Apps > Installed apps uninstalls it.
-It needs Windows 10 or 11 on x64, and nothing else installed.
+Get `wushang-<version>-macos-arm64.dmg` from the [latest release](https://github.com/ShreyanshVaibhaw/wushang/releases/latest), open it, and drag wushang into Applications.
+It needs a Mac with Apple Silicon and macOS 13 or later, and nothing else installed: FFmpeg and libass come inside the app.
+To remove it, drag wushang from Applications to the Trash; the library and settings stay in `~/Library/Application Support/wushang` until you delete that folder.
 
-To run it without installing, get `wushang-<version>-windows-x64.zip` instead, unzip it into a folder of your own, and run `wushang.exe`.
+The same app comes as `wushang-<version>-macos-arm64.zip`; unzip it and move `wushang.app` wherever you keep apps.
 
-Once it has run, it is listed in Explorer's "Open with" for video and audio files and in Settings > Apps > Default apps, where you can make it your default player.
-A copy from the zip that you move should be run once from its new place.
+The app is signed ad hoc, not notarized by Apple, so macOS won't open it the first time with a double-click.
+Right-click it in Finder, choose Open, then Open again in the dialog.
+Where macOS offers no Open there (macOS 15 and later), double-click it once, then click Open Anyway in System Settings > Privacy & Security.
+After that it opens like any other app.
+
+Once it has run, Finder lists it in "Open With" for video and audio files.
+To make it the default player for a type, select a file of that type in Finder, choose File > Get Info, pick wushang under "Open with", and click Change All.
+It never takes a type over by itself.
+A copy you move should be opened once from its new place, so Finder knows where it is.
 
 ### Updates
 
 When wushang starts, it asks GitHub for the latest release, and when that one is newer it offers it in a window once nothing is playing.
-For a copy the installer put in, Install downloads the new installer; wushang closes, Windows Installer updates it with a progress bar, and the new version opens.
-For a copy from the zip, Download saves the new zip to your Downloads folder and opens it in Explorer next to wushang's folder; close wushang and copy the files in the zip over the ones in its folder.
-Either way the library, settings and history stay as they were.
-wushang never replaces its own files, because antivirus programs take a running app that swaps in a downloaded exe for malware.
+Download saves the new `.dmg` (or the `.zip` when a release has no disk image) to `~/Downloads` and shows it selected in Finder.
+Quit wushang, open the disk image, and drag wushang into Applications over the old copy.
+The library, settings and history stay as they were.
+wushang never replaces its own files: an app that rewrites itself is what malware does, and on macOS it would also break the app's signature.
 Later closes the window, and wushang asks again next time it starts.
 Settings > General > "Check for updates when wushang starts" turns the check off.
 
 ## Run from source
 
 ```bash
-cargo run --release -- path\to\video.mp4
+brew install rust ffmpeg libass pkgconf
+cargo run --release -- path/to/video.mp4
 ```
 
-To install it for your account (no admin rights), build it, then run [scripts/install.ps1](scripts/install.ps1).
-It copies `wushang.exe` and the DLLs it loads to `%LOCALAPPDATA%\Programs\wushang` and adds a Start menu shortcut.
-Run it again after a new build to update the installed copy.
+(See Build requirements for what that needs and for building the app itself.)
+A bare exe from `cargo run` has no Info.plist, so it isn't offered in Finder's "Open With"; the app from [scripts/bundle-macos.sh](scripts/bundle-macos.sh) is.
 
-To make a release, raise `version` in [Cargo.toml](Cargo.toml) and run [scripts/package.ps1](scripts/package.ps1), which builds and writes `wushang-<version>-windows-x64.zip` and `.msi` to the build folder.
-The installer is [installer/wushang.wxs](installer/wushang.wxs), built with WiX 6 (`dotnet tool install --global wix --version 6.0.2`).
-It builds with your user folder cut out of the source paths the exe embeds, so neither file carries your Windows user name.
-Attach both to a GitHub release tagged `v<version>`; the updater only takes files named that way.
+To make a release, raise `version` in [Cargo.toml](Cargo.toml), build the app as described under "Building the app", and attach `wushang-<version>-macos-arm64.dmg` and `.zip` to a GitHub release tagged `v<version>`.
+The updater only takes files named that way from this repository's releases.
 
 Without a file, wushang opens on the library.
 The first time it does (no `settings.txt` yet), the design's welcome shows over it in three steps.
@@ -55,7 +60,7 @@ The third lists the basic keyboard shortcuts; Finish, or Esc at any step, closes
 
 The library page follows the redesign's library frames.
 The sidebar has Home, Videos, Music, Network, Playlists and Recent, plus "Add item", which adds a folder through the system folder picker.
-On first run Videos and Music start with your Windows Videos and Music folders.
+On first run Videos and Music start with your `~/Movies` and `~/Music` folders.
 Folders open in place, with back and forward arrows and a breadcrumb that shortens to "..." when the window is narrow.
 The header shows the item count, the sort menu (unwatched or watched first, newest or oldest, title, artist or album; the orange dot means it isn't title A-Z), grid or list view, and a search box that filters the page as you type.
 Thumbnails come from a frame at 10% of each video, and audio files show their embedded cover.
@@ -63,6 +68,7 @@ A bar under a thumbnail shows how much of it you watched, and finished files are
 Music also has Songs, Albums, Artists and Genres, built from the files' tags.
 The tags are kept in `tags.txt` next to the library state, so these fill in at once on the next start; only new or changed files are read again.
 Home collects Continue Watching, Listen Again, and your most visited folders, playlists and artists.
+Dot files and files with Finder's hidden flag stay out of the lists unless Settings > Library shows hidden files.
 
 Clicking a file plays it, resuming where you left it.
 At the end it moves on to the next file of the page it came from, as VLC's playlist does.
@@ -70,13 +76,13 @@ Esc or the folder name in the player's title bar goes back to the library, and t
 
 In the player, the sidebar button opens the design's overlay panel over the video: a rail of section icons and a compact list of the same library, with history, breadcrumb and sort.
 Clicking a file there plays it with the panel still open; a click on the video or Esc closes it, and the arrow button at its top right opens the full library page.
-Dropping a file on the window plays it, or adds it to the playlist on screen.
+Dropping a file on the window or on wushang's Dock icon plays it, or adds it to the playlist on screen.
 "Create playlist" and the header's + open the New Playlist dialog from the design: a name, an optional thumbnail picture, and files picked or dropped on the window.
 On a playlist's page the header's + adds files to it.
 Playlists are standard M3U files.
 
-Right-click a file, folder or playlist (on the library page or in the player's sidebar panel) for the design's context menus:
-- files: play, mark as watched, favourite, add to the queue or a playlist, show in File Explorer, go to its folder, add a subtitle file, properties, and remove from the playlist when on a playlist's page;
+Right-click (or Control-click) a file, folder or playlist, on the library page or in the player's sidebar panel, for the design's context menus:
+- files: play, mark as watched, favourite, add to the queue or a playlist, show in Finder, go to its folder, add a subtitle file, properties, and remove from the playlist when on a playlist's page;
 - folders: add files or a folder, rescan, info, and the subtitle and audio languages its files start with;
 - playlists: play, shuffle, favourite, export as M3U, add to the queue, rename (Properties & Metadata), delete, and the same track languages.
 
@@ -84,20 +90,27 @@ A folder's or playlist's track languages go over Settings' for its files: "Japan
 A folder's choice covers the folders inside it, the nearest choice wins, and a playlist's applies to files no chosen folder holds.
 Favourites appear first on Home.
 
-Library state (folders, recent files and positions, visit and play counts) lives in `%APPDATA%\wushang`, or in the folder named by the `WUSHANG_HOME` environment variable, which never seeds your own folders and suits tests.
+Library state (folders, recent files and positions, visit and play counts) lives in `~/Library/Application Support/wushang`, or in the folder named by the `WUSHANG_HOME` environment variable, which never seeds your own folders and suits tests.
 
 ### Player
 
-The player has the redesign's own title bar and control bar.
+The player has the redesign's own title bar and control bar; macOS's own title bar and window buttons are hidden.
 Click play/pause, previous (restart, or the previous file within the first 3 seconds), next, the seek bar, the volume wedge (up to 200%, like VLC) and the speaker (mute).
 Hovering over the seek bar shows a preview above it, as on YouTube: the frame at that point (its nearest keyframe, decoded in software on a thread of its own) and the time.
 Dragging the seek bar pauses and shows the video under the pointer as it moves, then plays on from the drop if it was playing.
 While the pointer moves it jumps to keyframes, the next jump waiting for the last one's frame, so the picture keeps up; where the pointer rests, an exact seek shows the frame under it.
-The title bar has minimize, maximize, fullscreen and close, and dragging it moves the window.
+The title bar has minimize, maximize (macOS's zoom), fullscreen and close, and dragging it moves the window.
+A double-click on it zooms, minimizes or does nothing, as System Settings > Desktop & Dock says for every window.
 While playing, the bars hide after 3 seconds without mouse movement and the video fills the window inside a 10 px rounded frame; moving the mouse brings them back.
 The "…" button opens the main menu from the design: open files, open a folder, recent files, settings profiles, keyboard shortcuts, Customize Player, Settings and About.
 Right-clicking the video opens the player menu: play, stop, previous, next, hide the controls, the mini player, and submenus for speed and sleep timer, video tracks and transforms, audio tracks, stereo mode and output device, subtitles, the settings tabs, the queue, and opening media.
 Items that need something first, like Convert with nothing open, are shown dimmed.
+
+The menu bar has what a Mac app is expected to have, each item doing what the design's menus do:
+- wushang: About wushang, Settings… (⌘,), Hide wushang (⌘H), Hide Others (⌥⌘H), Show All, Quit wushang (⌘Q);
+- File: Open File… (⌘O), Open Folder… (⌘F), Open Network Stream… (⌘N);
+- Playback: Play/Pause;
+- Window: Minimize, Mini Player (⌘M), and the window itself.
 
 The playlist button opens the queue panel from the design, in the settings panel's place, with three tabs:
 
@@ -110,18 +123,18 @@ The playlist button opens the queue panel from the design, in the settings panel
   They live in `bookmarks.txt` next to the library state.
 - Chapters: the file's chapters with their titles; a click seeks there.
 
-The audio and subtitle buttons open the track popup from the design: video, audio and subtitle tracks (with names like "English" from the file's language tags), the output device, and external subtitle files, with + to load one by hand and the pencil to open the chosen one in its editor.
+The audio and subtitle buttons open the track popup from the design: video, audio and subtitle tracks (with names like "English" from the file's language tags), the output device, and external subtitle files, with + to load one by hand and the pencil to open the chosen one in your text editor (TextEdit unless you picked another).
 "Add Audio File..." in the player menu's Audio submenu plays another file's sound with the video, like a dub or commentary kept beside it; it joins the audio track list under its file name and follows every seek.
 A subtitle file with the same name as the video, next to it or in a "Subs" folder, loads on its own, as in VLC.
 ASS and SSA subtitles, in the file or beside it, are drawn by libass as VLC and mpv draw them: their positions, fonts, colours, borders, shadows, rotation, karaoke and animation, with the fonts a Matroska file carries for them.
 After a seek, a resume or a switch of subtitle track, a second reader goes over the 10 seconds before the new position, so an embedded line that began there shows at once instead of the screen staying empty until the next one.
 On anamorphic video (DVDs and broadcasts store 16:9 in 720x576) libass draws at the shown size, and letters keep the shape they had where the script was laid out, as VSFilter and mpv show them.
-Without `libass-9.dll` next to wushang.exe they fall back to plain text like every other format.
+Without `libass.9.dylib` (inside the app, or Homebrew's) they fall back to plain text like every other format.
 Old subtitle files in a Windows code page instead of UTF-8 are read in the right one: a language tag such as `film.ru.srt` names it, and otherwise wushang tries the Western, Central European, Cyrillic, Greek, Turkish, Hebrew, Arabic, Baltic, Japanese, Chinese and Korean code pages and keeps the one whose text reads like real words.
 The gear opens the settings panel, with four tabs:
 
 - Playback: marks on the seek bar where the subtitles have lines, playback statistics over the video, reverse playback, a sleep timer, an audio visualizer, and speed from 0.25x to 2x without changing pitch.
-- Video: flip, rotation, zoom, resolution, aspect ratio, crop, render, and brightness, contrast, hue and saturation (under "Expand Settings"), all done by the GPU's video processor.
+- Video: flip, rotation, zoom, resolution, aspect ratio, crop, render, and brightness, contrast, hue and saturation (under "Expand Settings"), all done on the GPU in the Metal shader that shows the video.
   Zoom starts at Fill, which covers the window and cuts off what overflows; "1:1 Original" shows the whole picture with bars, and Reset goes back to Fill.
 - Audio: track, stereo mode (stereo, mono, left, right, reverse) with a Test button, audio delay, and VLC's 10-band equalizer with its 18 presets and the "2 Pass" option.
 - Subtitles: track, subtitle delay, speed and duration factor, text size, whether ASS and SSA keep their own styling, font, and text and outline colours.
@@ -132,33 +145,37 @@ Resolution picks between a stream's video tracks by picture size, "Best Availabl
 The stereo Test plays a low tone on the left, then a high one on the right, through the chosen stereo mode.
 The subtitle timeline knows every line of a subtitle file, but only the lines an embedded track has read so far.
 The footer's preset menu switches settings profiles, and "Open Advanced Settings" opens the Settings window.
-HDR "Auto" shows HDR10 video in HDR on a screen in HDR mode, and "Off" tone maps it to SDR there too.
+HDR "Auto" shows HDR10 and HLG video brighter than SDR white on a screen that can show EDR (extended dynamic range), and "Off" tone maps it to SDR there too.
 Switching tracks and seeking land on the exact moment: the decoders read from the keyframe before it and drop what comes earlier.
 
 | Key | Action |
 |---|---|
 | Space | Pause and resume |
-| ← / → | Skip back or forward: 10 s, Alt 3 s, Shift 1 min, Ctrl 5 min (all set in Settings) |
-| ↑ / ↓, mouse wheel | Volume, 10% a press (the wheel scrolls in the library) |
+| ← / → | Skip back or forward: 10 s, ⌥ 3 s, ⇧ 1 min, ⌘ 5 min (all set in Settings) |
+| ↑ / ↓, mouse wheel or trackpad | Volume, 10% a press (scrolling moves the library) |
 | M | Mute |
-| F or double-click the video | Borderless fullscreen |
+| F or double-click the video | Fullscreen (macOS's own, in a Space of its own) |
 | Esc | Close a menu, panel or dialog, leave fullscreen, or go to the library |
-| Backspace | Back, in the library |
+| Delete (⌫) | Back, in the library |
 | S / P / N | Stop, previous file, next file |
-| Ctrl+O / Ctrl+F | Open files / open a folder |
-| Ctrl+P | Settings |
-| Ctrl+\ | Hide the controls until the mouse moves |
-| Ctrl+M | Mini player, and back |
-| Ctrl+I | Properties of the file playing, or of the file under the pointer |
-| F1 / Shift+F1 | Keyboard shortcuts / About |
-| Q, Ctrl+Q | Quit |
+| ⌘O / ⌘F | Open files / open a folder |
+| ⌘P or ⌘, | Settings |
+| ⌘\ | Hide the controls until the mouse moves |
+| ⌘M | Mini player, and back |
+| ⌘I | Properties of the file playing, or of the file under the pointer |
+| F1 / ⇧F1 | Keyboard shortcuts / About (hold fn on keyboards whose top row is media keys) |
+| Q, ⌘Q | Quit |
 
-The window opens the way it was launched, so a shortcut set to "Run: Minimized", or a script that asks for minimized without activation, never takes focus.
+Control works in place of ⌘ for every shortcut, as Ctrl did on Windows, except where macOS keeps the key for itself (Control with the arrows switches Spaces unless that is turned off in System Settings > Keyboard > Keyboard Shortcuts).
+In a text field ⌥← and ⌥→ move by word, ⌘← and ⌘→ go to the start and end, ⌥⌫ deletes a word and ⌘⌫ deletes back to the start, as in other Mac apps.
+Letter shortcuts follow the key's letter on your keyboard layout, so ⌘M is the key marked M on an AZERTY keyboard too.
+
+Started hidden (`open -j -a wushang`), the window stays hidden and doesn't take focus.
 
 ### Snapshots
 
-Shift+S, "Take Snapshot" in the player menu's Video submenu, or the snapshot button from Customize Player saves the frame on screen as a PNG in `Pictures\wushang`; Settings' Recording page can make it a JPEG, or save it on the desktop or next to the file.
-R, "Record" in the player menu, or the record button from Customize Player records what plays into a Matroska file in `Videos\wushang`, copied packet for packet without re-encoding, until R is pressed again or the media ends.
+⇧S, "Take Snapshot" in the player menu's Video submenu, or the snapshot button from Customize Player saves the frame on screen as a PNG in `~/Pictures/wushang`; Settings' Recording page can make it a JPEG, or save it on the desktop or next to the file.
+R, "Record" in the player menu, or the record button from Customize Player records what plays into a Matroska file in `~/Movies/wushang`, copied packet for packet without re-encoding, until R is pressed again or the media ends.
 The Recording page can switch it to MPEG-TS, which keeps what was written if wushang stops mid-recording but holds fewer codecs, and save it on the desktop or next to the file.
 The file holds what was on screen: it starts at the keyframe before the picture (copied video can only start on one), packets go in as playback reaches them rather than as the demuxer reads ahead, and a seek while recording carries on in the same file instead of jumping in it.
 Network streams record too; the recording button lights while it runs.
@@ -179,19 +196,20 @@ The HDR item switches HDR output between Auto and Off, and lights while it is on
 ### Mini player
 
 The mini player is the design's "Miniplayer" card: the video, its progress bar, the file name and folder, and a queue button.
-It shows at the library's bottom right while something plays, and Ctrl+M (or "Mini Player" in the player's right-click menu) turns the whole window into it.
-The mini player window stays above other windows and opens at the bottom right of the screen, or where you last left it.
+It shows at the library's bottom right while something plays, and ⌘M (or "Mini Player" in the player's right-click menu or the Window menu) turns the whole window into it.
+From fullscreen, the window first leaves fullscreen, then shrinks.
+The mini player window stays above other windows and opens at the bottom right of the screen, clear of the Dock and the menu bar, or where you last left it.
 Drag it by its body to move it.
 
 With the pointer on the card, the video dims and shows the design's controls: previous, play/pause and next in the middle, close at the top left and expand at the top right.
 Close stops playback; expand goes back to the full player, and in the window it restores the window's old size and place.
 The progress bar seeks with a click or a drag.
 The queue button opens the queue above the video, in the design's style, with sort, remove and add; the window grows upward to make room.
-Esc or Ctrl+M also leaves the mini player window.
+Esc or ⌘M also leaves the mini player window.
 
 ### Network
 
-Ctrl+N, "Open Network Stream" in the "..." menu, or "Add Network Stream" on the Network page asks for an address and plays it: http, https, HLS (`.m3u8`), RTSP, UDP or RTP.
+⌘N, "Open Network Stream" in the "..." menu or the File menu, or "Add Network Stream" on the Network page asks for an address and plays it: http, https, HLS (`.m3u8`), RTSP, UDP or RTP.
 A bare host like `example.com/live.m3u8` gets `http://` in front, as in VLC, and `wushang <address>` plays one from the command line.
 The address stays on the Network page; right-clicking it offers Remove.
 A stream connects in the background while the player says "Connecting to ...", and if it can't play, the corner says so before the library comes back.
@@ -200,20 +218,25 @@ Podcasts takes an RSS or Atom feed and lists its episodes, newest as the feed or
 A feed fetched more than 10 minutes ago fetches again when its page shows, keeping the episodes on screen meanwhile, and keeping them if the refresh fails.
 Radio lists the 100 most voted stations of the community [Radio Browser](https://www.radio-browser.info) directory, with their genre and country.
 Episodes and stations play with the name the page shows, and next and previous move through the page.
-Feeds and the directory load over WinHTTP on a background thread, so the window never waits on them.
+Feeds and the directory load over HTTP with the [ureq](https://crates.io/crates/ureq) crate on a background thread, so the window never waits on them.
 
 ### Capture devices
 
-"Open Capture Device" in the "..." menu lists the cameras, capture cards and microphones DirectShow sees, and the screen.
+"Open Capture Device" in the "..." menu lists the cameras, capture cards and microphones AVFoundation sees, and each screen.
 Picking one plays it live, and Record saves it like any other media.
+The first time wushang opens a camera, a microphone or a screen, macOS asks whether to allow it; until you do, opening the device fails.
+Camera and microphone access can be changed later in System Settings > Privacy & Security, where screen recording is listed too.
+A camera opens at its biggest picture up to 1080p that runs at 30 frames a second, and a screen at 30 frames a second with the pointer in it.
 The list is gathered in the background and again each time the menu opens, so a camera plugged in later shows up.
 
 ### Discs
 
-"Open Disc" in the "..." menu plays a DVD or Blu-ray: the disc in an optical drive, a disc's files copied to a folder (Ctrl+D), or a Blu-ray image (.iso).
+"Open Disc" in the "..." menu plays a DVD or Blu-ray: a disc in a drive, a disc's files copied to a folder (⌘D), or a disc image (.iso, under "Blu-ray Image...").
+The menu lists every mounted volume that holds a disc's file system (UDF, ISO 9660, audio CD) or a VIDEO_TS or BDMV folder at its top, such as a disc copied to a USB stick, by the name Finder shows.
 A disc folder or image also opens from the command line or when dropped on the window.
-Blu-ray goes through libbluray, which picks the main title.
-DVD needs no library: wushang reads the disc's IFO files, picks the title set whose main program chain runs longest, and plays its VOB files back to back, with the length and chapters the IFO gives.
+An image is mounted read-only with `hdiutil`, out of Finder's sight, and detached when wushang quits; it may hold a Blu-ray or a DVD.
+For a Blu-ray, wushang reads the playlists in `BDMV/PLAYLIST` itself and plays the longest one's clips back to back, with its length and chapter marks; that is the title libbluray would pick, and the FFmpeg here has no libbluray.
+DVD needs no library either: wushang reads the disc's IFO files, picks the title set whose main program chain runs longest, and plays its VOB files back to back, with the length and chapters the IFO gives.
 libdvdnav and libdvdread would add menus and every title, but would make the FFmpeg build GPL.
 Neither plays encrypted discs (CSS on DVDs, AACS on Blu-rays), so commercial discs don't play; discs you made yourself do.
 
@@ -225,18 +248,20 @@ While it runs, the player menu's "Streaming" submenu shows that address, how man
 Like a recording it follows playback, so pausing or seeking here pauses or moves the stream.
 H.264 and HEVC get their parameter sets repeated before every keyframe, so a player that connects midway starts playing at the next one.
 MPEG-TS can't carry VP9, AV1 or the lossless audio formats; such media says so, and converting it to MP4 first works.
-Windows may ask once whether to let wushang through its firewall, since other devices connect to it.
+macOS may ask once whether wushang may find and connect to devices on your local network, and, with the macOS firewall on, whether it may accept incoming connections, since other devices connect to it.
 
 ### Converting
 
-"Convert" in a file's right-click menu, or in the "..." menu for the open file, re-encodes it into an MP4 (H.264 and AAC, saved in `Videos\wushang`) or an MP3 (the sound alone, saved in `Music\wushang`); Ctrl+R makes an MP4 of the open file.
-It encodes with Windows' own Media Foundation encoders, so the FFmpeg build carries no encoder library and stays LGPL.
+"Convert" in a file's right-click menu, or in the "..." menu for the open file, re-encodes it into an MP4 (H.264 and AAC, saved in `~/Movies/wushang`) or an MP3 (the sound alone, saved in `~/Music/wushang`); ⌘R makes an MP4 of the open file.
+H.264 comes from macOS's VideoToolbox encoder (`h264_videotoolbox`) and AAC from AudioToolbox (`aac_at`), so the FFmpeg build needs no encoder library for them and stays LGPL.
+MP3 comes from LAME (`libmp3lame`, LGPL), which the release's FFmpeg and Homebrew's both have; an FFmpeg without it saves the sound as AAC in an M4A instead.
+Where macOS's encoders are missing, FFmpeg's own `aac` and, in a build that has it, `libx264` stand in.
 The conversion runs in the background with its progress in the corner, on the player or the library, and "Stop Converting" in the "..." menu ends it and deletes the unfinished file.
 Video gets about 0.08 bits per pixel per frame (5 Mb/s for 1080p at 30 frames a second), sound 192 kb/s.
 
 ### Settings
 
-Ctrl+P or Settings in the "..." menu opens the Settings window from the design's "Settings" frames: categories on the left, their options on the right, and a search box that finds an option in any category.
+⌘P, ⌘, or Settings in the "..." menu opens the Settings window from the design's "Settings" frames: categories on the left, their options on the right, and a search box that finds an option in any category.
 Every option it lists does something.
 Extensions holds wushang's optional add-on, libass: whether ASS and SSA keep their own styling, and whether it uses the fonts a Matroska file carries.
 VLC's Lua extensions don't run in wushang.
@@ -244,7 +269,7 @@ Changes apply at once and are kept in `settings.txt` next to the library state.
 
 - General: dark, light or system theme, and the accent colour.
   The design has one light frame, and wushang turns every screen light from it, so menus, panels and dialogs follow the same greys.
-  System follows the Windows "app mode" setting and switches when it changes.
+  System follows macOS's Light or Dark appearance (System Settings > Appearance) and switches when it changes.
   The accent replaces the design's orange everywhere except the logo and the volume meter.
   It starts as the logo's red-orange; the design's amber is the next choice along.
   Its nine colours are the onboarding frames' bright ones; Settings dims all but the one picked, as the design does.
@@ -256,6 +281,7 @@ Changes apply at once and are kept in `settings.txt` next to the library state.
 - Audio: output device, startup volume (or the last one), the Up/Down volume step, the equalizer preset, two-pass and stereo mode.
   "Custom" is the last equalizer tuned by hand in the panel, kept while a preset plays.
 - Subtitles: on or off, the preferred language, loading subtitle files on their own, and their size, weight, colour, opacity, outline and shadow.
+  The fonts to pick from are Inter, which comes with wushang, and Helvetica Neue, Arial, Verdana, Tahoma, Georgia, Times New Roman and Menlo, which come with macOS.
 - Library: show hidden files and folders.
 - Network: reconnect when a stream drops, and how long a stalled connection may wait (15 seconds by default).
   FFmpeg reconnects http and HLS itself; an RTSP, RTP, UDP, TCP, SRT or RTMP stream that drops is opened again, each second until it answers or the timeout passes, with "Reconnecting..." over the video.
@@ -272,234 +298,227 @@ Picking a profile applies its settings at once, theme and accent included, and w
 A profile starts as a copy of the settings in force when it is first picked or made, and changes from then on stay with it.
 The window's place and the volume are left alone, since they belong to the machine rather than the profile.
 "New" asks for a name, then adds the profile and switches to it.
-Each profile keeps its settings in `profiles\<name>\settings.txt`, and `profile.txt` names the one in force.
+Each profile keeps its settings in `profiles/<name>/settings.txt`, and `profile.txt` names the one in force.
 
 ## Build requirements
 
-- Rust 1.88 or newer with the MSVC toolchain.
-- An FFmpeg 9 shared build with headers and import libraries.
-  This project uses a slim LGPL build made by [scripts/build-ffmpeg.sh](scripts/build-ffmpeg.sh).
-  Any full FFmpeg 9 shared build also works, for example `ffmpeg-n9.0-latest-win64-lgpl-shared-9.0` from github.com/BtbN/FFmpeg-Builds.
-- `libclang.dll`, which `ffmpeg-sys-next` needs to generate bindings at build time.
-  The one here comes from the `libclang` 18.1.1 wheel on PyPI.
+- A Mac with Apple Silicon.
+- Rust 1.88 or newer, from Homebrew (`brew install rust`) or rustup.
+- Apple's Command Line Tools (`xcode-select --install`); full Xcode isn't needed.
+  The Metal shaders are compiled from source when wushang starts, so no `metal` compiler is needed either.
+- For development, Homebrew's `ffmpeg` and `libass`, and `pkgconf`.
+  `ffmpeg-sys-next` finds FFmpeg through pkg-config, and wushang loads libass from `/opt/homebrew/lib` at run time.
+- libclang, which `ffmpeg-sys-next` needs to generate bindings at build time.
+  [.cargo/config.toml](.cargo/config.toml) points `LIBCLANG_PATH` at the Command Line Tools' copy in `/Library/Developer/CommandLineTools/usr/lib`.
 
-[.cargo/config.toml](.cargo/config.toml) points `FFMPEG_DIR` and `LIBCLANG_PATH` at both folders under `D:\tools`.
-Change those two paths on another machine.
-[build.rs](build.rs) copies the FFmpeg DLLs next to the built exe.
+Homebrew's FFmpeg is GPL (it is configured with `--enable-gpl`, x264 and x265) and its libraries are built for the Mac's own macOS version, so it is only for building and running here.
+The app that is passed on carries the slim LGPL builds below, made for macOS 13 and later.
+[build.rs](build.rs) links the exe with an rpath to `@executable_path/../Frameworks`, where the app keeps them, and room in its load commands for the bundle script to repoint it.
+
+The two build scripts and the bundle script use a `tools` folder beside the repository by default, as the commands below do.
+Both build scripts need Homebrew's `meson`, `ninja` and `pkgconf`, download their tarballs into `SRC` when they aren't there, check them against SHA-256 sums written in the script, and unpack them afresh on each run.
 
 ### Building the slim FFmpeg
 
-The script cross-compiles zlib 1.3.1, dav1d 1.5.4, libbluray 1.3.4 and FFmpeg 9.0.2 for Windows from Linux or WSL with MinGW-w64.
-It needs these Ubuntu packages: `gcc-mingw-w64-x86-64-win32 nasm make pkg-config meson ninja-build gcc libc6-dev`.
+[scripts/build-ffmpeg-macos.sh](scripts/build-ffmpeg-macos.sh) builds FFmpeg 9.0.2 as dylibs for macOS 13 and later (`MACOSX_DEPLOYMENT_TARGET=13.0`), with dav1d 1.5.4 and LAME 4.0 linked into them statically.
 
 ```bash
-SRC=/mnt/d/tools/src/ffmpeg-9.0.2 DAV1D_SRC=/mnt/d/tools/src/dav1d-1.5.4 \
-  ZLIB_SRC=/mnt/d/tools/src/zlib-1.3.1 BLURAY_SRC=/mnt/d/tools/src/bluray/libbluray-1.3.4 \
-  PREFIX=/mnt/d/tools/ffmpeg-9.0.2-wushang bash scripts/build-ffmpeg.sh
+SRC=../tools/src/macos PREFIX=../tools/ffmpeg-9.0.2-wushang scripts/build-ffmpeg-macos.sh
 ```
 
-It builds the file protocol and the network ones a player opens (http, https, tcp, udp, rtp, with TLS from Windows' Schannel), `concat` for a DVD's VOB files, `bluray` for Blu-rays through libbluray (LGPL, linked into `avformat-63.dll`, 282 KB), 36 demuxers (HLS and RTSP among them), 20 parsers, 51 decoders (raw video among them, for capture devices) and the D3D11VA hwaccels, plus libswresample and libswscale.
-For recording and converting it adds 9 muxers (Matroska, MP4 and MPEG-TS among them), every bitstream filter, and Media Foundation's H.264, HEVC, AAC and MP3 encoders, which come with Windows.
-The DirectShow and GDI capture devices are in a sixth DLL, `avdevice-63.dll` (89 KB).
-The subtitle decoders (SRT, ASS/SSA, WebVTT, MP4 text, MicroDVD, SubViewer, SAMI, DVD, DVB and PGS) and their file demuxers add 78 KB.
-zlib, linked statically into `avformat-63.dll` (43 KB more), lets the Matroska reader open tracks stored zlib-compressed, which mkvmerge does to subtitles by default; without it those files log "Unsupported encoding type" and their subtitles are lost.
-One of the decoders is libdav1d, linked statically into `avcodec-63.dll`, so AV1 plays in software on GPUs without AV1 support.
-Other encoders, filters and the command-line programs are left out.
-Networking adds 286 KB to `avformat-63.dll`, which then also imports `WS2_32`, `Secur32`, `CRYPT32` and `ncrypt`.
-x86 assembly stays on, so software decoding is as fast as in a full build.
-Media Foundation makes `avcodec-63.dll` import `mfplat` and `ole32`, and capture makes `avdevice-63.dll` import `GDI32`, `USER32`, `OLEAUT32` and `SHLWAPI`.
-Apart from that, the DLLs import only `KERNEL32`, `msvcrt` and `bcrypt`.
+It builds the file protocol and the network ones a player opens (http, https, tls, tcp, udp, rtp, with TLS from macOS's Secure Transport, so there is no OpenSSL), `concat` for a disc's files, 36 demuxers (HLS and RTSP among them), 20 parsers, 55 decoders (raw video and PCM among them, for capture devices, and ProRes) and the VideoToolbox hwaccels for H.264, HEVC, AV1, VP9, MPEG-2, MPEG-1 and ProRes, plus libswresample and libswscale.
+For recording and converting it adds 10 muxers (Matroska, MP4 and MPEG-TS among them), every bitstream filter, and the `h264_videotoolbox`, `hevc_videotoolbox`, `aac_at`, `aac` and `libmp3lame` encoders.
+libavdevice holds the AVFoundation input, for cameras, microphones and screens.
+One of the decoders is libdav1d, so AV1 plays in software on Macs whose GPU doesn't decode it.
+zlib, which macOS has, lets the Matroska reader open tracks stored zlib-compressed, which mkvmerge does to subtitles by default.
+There is no libbluray (wushang reads Blu-ray playlists itself), no libavfilter, and no command-line programs.
+The script stops if configure doesn't report "LGPL version 2.1 or later" or leaves out one of the pieces wushang needs, and checks that each dylib is built for macOS 13, named by `@rpath`, and needs nothing but macOS and the other FFmpeg dylibs.
 
 ### Building libass
 
-[scripts/build-libass.sh](scripts/build-libass.sh) cross-compiles libass 0.17.3 the same way, with FreeType 2.13.3, FriBidi 1.0.16 and HarfBuzz 10.0.1 linked into one `libass-9.dll` (2.4 MB) that imports only `KERNEL32`, `USER32`, `GDI32` and `msvcrt`.
-Fonts come from Windows through DirectWrite, so there is no fontconfig.
-It needs `g++-mingw-w64-x86-64-win32` as well, since HarfBuzz is C++; the C++ runtime is linked in.
-The release tarballs go unpacked in `SRC`; libass's and FreeType's are GPG-signed by their maintainers.
+[scripts/build-libass-macos.sh](scripts/build-libass-macos.sh) builds libass 0.17.5 with FreeType 2.15.0, FriBidi 1.0.18 and HarfBuzz 15.0.0 linked into one `libass.9.dylib`, for macOS 13 and later, which exports only libass's own functions and needs only system libraries.
+Fonts come from macOS through Core Text, so there is no fontconfig.
 
 ```bash
-SRC=/mnt/d/tools/src/ass PREFIX=/mnt/d/tools/libass-0.17.3 bash scripts/build-libass.sh
+SRC=../tools/src/macos PREFIX=../tools/libass-0.17.5 scripts/build-libass-macos.sh
 ```
 
-[.cargo/config.toml](.cargo/config.toml) names the folder as `LIBASS_DIR`, and [build.rs](build.rs) copies the DLL next to the exe; wushang loads it at run time, so a build without it still runs.
+wushang loads it at run time ([src/ass.rs](src/ass.rs)) from the app's Frameworks folder, else from Homebrew's `/opt/homebrew/lib` or `/usr/local/lib`, so a build without it still runs.
+
+### Building the app
+
+[scripts/bundle-macos.sh](scripts/bundle-macos.sh) builds the release, packs it as `wushang.app`, and makes `wushang-<version>-macos-arm64.dmg` (the app beside a link to Applications, to drag across) and `wushang-<version>-macos-arm64.zip` from it.
+All three go in the `bundle` folder of the build folder, the `target_directory` that `cargo metadata --format-version 1 --no-deps` names.
+
+```bash
+export FFMPEG_DIR="$(cd .. && pwd)/tools/ffmpeg-9.0.2-wushang"
+scripts/bundle-macos.sh
+```
+
+`FFMPEG_DIR` makes `ffmpeg-sys-next` link the release build against the slim FFmpeg instead of Homebrew's.
+The script takes FFmpeg from `FFMPEG_DIR` and libass from `LIBASS_DIR` (by default `../tools/ffmpeg-9.0.2-wushang` and `../tools/libass-0.17.5`), and stops at an exe that needs a library from anywhere else, such as Homebrew's GPL FFmpeg.
+It builds with your home folder cut out of the source paths the exe embeds, so the app doesn't carry your user name.
+It copies every library the exe links, and libass, into `Contents/Frameworks` and points the exe and each library at the copies, fills in the version from Cargo.toml in [assets/macos/Info.plist](assets/macos/Info.plist), draws the icon from `assets/wushang.svg` when the SVG has changed, and copies the licence files into `Contents/Resources`.
+It warns when a library was built for a newer macOS than the Info.plist's minimum, signs the libraries and then the app ad hoc, and checks the signature.
+
+- `scripts/bundle-macos.sh --no-build` bundles the release exe already built.
+- `WUSHANG_EXE=/path/to/exe scripts/bundle-macos.sh --no-build` bundles another exe.
+
+To use your own build, copy `wushang.app` from the bundle folder into Applications.
 
 ## How it works
 
 ```text
 demux thread     libavformat reads packets and routes them to per-stream queues; it also seeks
-video decoder    libavcodec + D3D11VA decodes into GPU textures (software fallback)
-audio decoder    opens WASAPI, decodes, resamples to the device format, fills a 0.3 s ring
-audio callback   plays the ring and sets the master clock (sample time minus device latency)
-main thread      window, input, and the render loop: show a frame when its time comes, skip late ones,
-                 then paint the interface over it with Direct2D
+video decoder    libavcodec + VideoToolbox decodes into CVPixelBuffers (software fallback)
+audio decoder    decodes, resamples to f32 at the device's rate and channels, fills a 0.3 s ring
+audio callback   Core Audio (through cpal) plays the ring and sets the master clock
+                 (media time minus the time until the samples reach the speaker)
+main thread      AppKit events and the menu bar, and the render loop: show a frame when its time
+                 comes, skip late ones, paint the interface with Core Graphics, present with Metal
 thumbnailers     two threads decode one still per visible file, newest request first
 prober           one thread reads music tags for Songs, Albums, Artists and Genres
 ```
 
-The window, the GPU device and the WASAPI device live for the whole run.
+The window, the Metal device and the audio device live for the whole run.
 Opening a file starts a session ([src/session.rs](src/session.rs)): its demux and decoder threads, which stop when the next file opens.
-The audio device opens once at startup, because opening it takes 1.7 s on the test laptop.
+The audio device opens once, on a thread of its own at startup, because opening one can take a while (a Bluetooth headset wakes up first); switching files only clears the ring.
 [src/library.rs](src/library.rs) lists folders, keeps recent files and positions, and reads and writes the M3U playlists; it doesn't touch FFmpeg.
 [src/thumbs.rs](src/thumbs.rs) makes thumbnails and reads tags with FFmpeg in software, so it never competes with playback for the GPU decoder.
-The library page ([src/ui/browse.rs](src/ui/browse.rs)) is painted inside a Direct2D layer masked to everything but the mini player's video, so the grid can sit under the card while the live video shows through.
+The library page ([src/ui/browse.rs](src/ui/browse.rs)) is painted inside a layer masked to everything but the mini player's video, so the grid can sit under the card while the live video shows through.
 
 | VLC module | Here | File |
 |---|---|---|
 | access, demux, packetizer | libavformat | [src/player.rs](src/player.rs) |
-| decoder, hw decoder (d3d11va) | libavcodec with `hw_device_ctx` | [src/player.rs](src/player.rs) |
-| vout display (direct3d11) | `ID3D11VideoContext::VideoProcessorBlt` into a flip swap chain | [src/render.rs](src/render.rs) |
-| audio output (mmdevice) | cpal on WASAPI shared mode | [src/audio.rs](src/audio.rs) |
+| decoder, hw decoder (videotoolbox) | libavcodec with `hw_device_ctx` on VideoToolbox | [src/player.rs](src/player.rs) |
+| vout display | a Metal shader drawing into a `CAMetalLayer`, with VideoToolbox frames read through `CVMetalTextureCache` | [src/render.rs](src/render.rs), [src/shaders/video.metal](src/shaders/video.metal) |
+| audio output (auhal) | cpal on Core Audio | [src/audio.rs](src/audio.rs) |
 | audio filters (scaletempo, equalizer, mono/channel remap) | WSOLA speed, VLC's equalizer, stereo modes | [src/dsp.rs](src/dsp.rs) |
-| subtitle decoders and renderer (subsdec, freetype) | libavcodec subtitle decoders, Direct2D captions | [src/subs.rs](src/subs.rs), [src/captions.rs](src/captions.rs) |
+| subtitle decoders and renderer (subsdec, freetype) | libavcodec subtitle decoders, captions drawn with Core Text | [src/subs.rs](src/subs.rs), [src/captions.rs](src/captions.rs) |
 | libass_plugin | libass, loaded at run time | [src/ass.rs](src/ass.rs) |
-| video filters (transform, adjust, crop) | the D3D11 video processor's rotation, mirror and filters | [src/render.rs](src/render.rs) |
+| video filters (transform, adjust, crop) | the same Metal shader | [src/render.rs](src/render.rs), [src/shaders/video.metal](src/shaders/video.metal) |
 | clock, late-picture dropping | audio master clock, skip to the newest due frame | [src/main.rs](src/main.rs) |
-| Qt interface | Direct2D + DirectWrite interface in a borderless Win32 window | [src/ui.rs](src/ui.rs), [src/ui/browse.rs](src/ui/browse.rs), [src/main.rs](src/main.rs) |
+| Qt interface | Core Graphics + Core Text interface through the d2d shim, in an AppKit window with its title bar hidden | [src/ui.rs](src/ui.rs), [src/ui/browse.rs](src/ui/browse.rs), [src/d2d](src/d2d), [src/platform](src/platform) |
 | media library (medialibrary) | folders, recent files, M3U playlists, thumbnails, tags | [src/library.rs](src/library.rs), [src/thumbs.rs](src/thumbs.rs) |
 
-The decoder, the video processor and Direct2D share one `ID3D11Device`, which wushang creates with BGRA support and hands to FFmpeg.
-Each present draws the video into the rounded video area, then Direct2D paints the bars, icons and text into the same back buffer.
-The icons are the design's SVGs, rendered by Direct2D's SVG support, and the text uses Inter, embedded in the exe.
-Layout numbers come from the design's 1920x1080 frame in DIPs, so the interface scales with the screen's DPI.
-
-Decoded frames stay in the decoder's texture array, and the GPU's video processor converts YUV to RGB and scales straight into the swap chain.
+The decoder, the video shader and the interface share one Metal device.
+VideoToolbox decodes into `CVPixelBuffer`s on IOSurfaces, and `CVMetalTextureCache` hands each one to the shader as two textures, luma and chroma, without a copy.
 Nothing is copied back to system memory.
+One shader ([src/shaders/video.metal](src/shaders/video.metal)) converts YCbCr to RGB with the frame's matrix and range, applies the colour adjustments and, for BT.2020, the tone map, and scales into the drawable; crop, aspect ratio, zoom, rotation and mirroring are all in where the quad's corners read the frame.
+The shaders are compiled from source with `newLibraryWithSource` when the renderer starts, and each output format gets its pipelines the first time it is drawn to.
 
-AV1 needs one extra decision, because libavcodec always prefers libdav1d, which never uses the GPU.
-wushang asks the GPU for an AV1 decoder profile first.
-If it has one, FFmpeg's own AV1 decoder runs on D3D11VA like every other codec; if not, libdav1d decodes on every CPU core.
+The interface is painted by Core Graphics and Core Text through [src/d2d](src/d2d), a shim with Direct2D's and DirectWrite's type and method names, so the interface code in [src/ui](src/ui) is the Windows code with little more than its `use` lines changed.
+It paints into a premultiplied BGRA bitmap whose memory is a Metal buffer, shared between the CPU and the GPU on Apple Silicon, and the same render pass draws that bitmap over the video.
+Two such bitmaps take turns, so the CPU paints the next frame while the GPU may still read the last.
+The icons are the design's SVGs, rasterised by resvg at each scale they are drawn at and cached, and the text uses Inter, embedded in the exe.
+Layout numbers come from the design's 1920x1080 frame in points, so the interface scales with the screen's backing scale factor.
+While the window is hidden behind others or minimized, a present returns at once without drawing.
 
-A stream the GPU turns down after all, such as 10-bit H.264, which no GPU decodes, or a 4:4:4 AV1, is reopened in software on every core (libdav1d for AV1) and decoded again from the last keyframe.
+A stream VideoToolbox doesn't take is decoded in software from the start: MJPEG webcams, MPEG-4 Part 2 and everything but H.264, HEVC, AV1, VP9, MPEG-2, MPEG-1 and ProRes.
+One it turns down after all, such as 10-bit H.264, which VideoToolbox doesn't decode, or a 4:4:4 AV1, is reopened in software on every core (libdav1d for AV1) and decoded again from the last keyframe.
 The decoder thread repacks software frames to NV12, or P010 for 10-bit video so it keeps its precision, with swscale, splitting each frame across the cores, so the render thread only copies them to the GPU.
-On the test laptop a 4K60 10-bit H.264 clip went from 90 dropped frames of 300 to about 50; the rest is the CPU's limit for decoding and repacking at once.
+VideoToolbox frames in other layouts (one-plane formats such as ProRes 4444) are copied back and repacked the same way.
 
-BT.2020 video (HDR10, HLG and SDR) gets its colours from Direct2D rather than the video processor.
-Video processors either can't tone map HDR or wash it out, and the test laptop's Intel one also leaves SDR BT.2020 pale and knows no HLG at all.
-The video processor only converts such a frame from YCbCr to RGB, still encoded and in BT.2020.
-HLG and SDR are labelled PQ for that step, the one BT.2020 pair video processors convert without touching the transfer.
-Direct2D's colour effects do the rest ([src/tonemap.rs](src/tonemap.rs)): to linear light, a tone curve per channel, then sRGB.
+BT.2020 video (HDR10, HLG and SDR) is tone mapped in the same shader; [src/tonemap.rs](src/tonemap.rs) holds its numbers and the same math on the CPU, which the tests hold the shader to.
+The steps are: to linear light, a matrix to the output's primaries (BT.709 for SDR, Display P3 for EDR), a tone curve per channel, then sRGB or the EDR layer's linear values.
 HLG gets its system gamma on luminance, so its colours keep their saturation, and puts reference white at 203 nits.
 SDR BT.2020 is decoded with BT.1886's gamma 2.4 and encoded with it again after the matrix to BT.709, so it has the tones BT.709 video has and only its colours change.
-The curve leaves everything up to three quarters of HDR's reference white (203 nits) as it is and rolls the highlights above it off into the rest of SDR's range, up to the stream's MaxCLL (1000 nits for HLG).
+On an SDR screen the curve leaves everything up to three quarters of HDR's reference white (203 nits) as it is and rolls the highlights above it off into the rest of SDR's range, up to the stream's MaxCLL (else its mastering display's peak, else 1000 nits; 1000 nits for HLG).
 
-On a screen in HDR mode the swap chain switches to 16-bit float scRGB ([src/hdr.rs](src/hdr.rs) asks Windows for the screen's peak and its SDR content brightness).
+On a screen that can show EDR, HDR10 and HLG frames switch the layer from 10-bit sRGB to half-float extended linear Display P3 with `wantsExtendedDynamicRangeContent`, and it switches back as soon as no such frame is on screen, so SDR video and the library never ask the screen for headroom.
+macOS reports how bright EDR can go as headroom, how many times SDR white the brightest pixel can be right now; it moves with the brightness setting, so [src/hdr.rs](src/hdr.rs) reads it on every pass.
+SDR white is taken as 203 nits, HDR's reference white, so the screen's peak is 203 nits times the headroom; with one of the reference presets of Apple's XDR screens (such as "HDR Video (P3-ST 2084)"), SDR white is 100 nits and the peak is what the preset allows.
 HDR10 and HLG video keep their nits up to three quarters of the screen's peak, and the same curve rolls brighter highlights off into the rest.
-SDR BT.2020 goes to the SDR content brightness.
-The interface and BT.709 video are drawn in sRGB as before, into a layer that goes over the video at the SDR content brightness, so they look as they do in other apps.
-The window checks again when it moves to another screen or the display settings change.
-No HDR screen was at hand: the effect chains are checked in numbers on the WARP software renderer (100 nits of PQ comes out as 100 nits, interface white at the SDR level), and the whole path ran in the app on an SDR screen told it was HDR.
-On test clips with a known answer, HDR10, HLG and SDR BT.2020 come out within a few levels of 255 of the exact conversion, and a 4K60 HDR10 clip plays with 2 of 240 frames dropped.
-BT.709 and BT.601 video is unchanged by this.
+The interface stays at SDR white, so it looks as it does in other apps.
+BT.709 and BT.601 video is unchanged by any of this.
 
-The render loop runs above normal priority, as VLC's video output thread does.
-While the window is dragged or resized, Windows runs a message loop of its own until the mouse lets go; a timer then runs the render loop's passes from the window procedure, so the video keeps playing.
+The render loop runs in the user-interactive QoS class, the scheduler's highest for an app, as VLC runs its video output thread above normal priority.
+While the window is dragged or resized, a menu is open or a file picker is up, AppKit runs a loop of its own until it is done; a timer in those run-loop modes then runs the render loop's passes, so the video keeps playing.
 A pass that fails (a lost frame) is logged and skipped rather than closing the player.
-At normal priority, libdav1d's bursts across all cores made it wake up about 40 ms late and skip frames.
 
-## Measured against VLC 3.0.23
+## Measured on macOS
 
-Same laptop (Intel UHD + GTX 1650 Ti, Windows 11), same 6-second 1080p30 clips, release build.
-Each figure is the median of three runs.
-VLC ran with `--intf=dummy`, so its Qt GUI was not loaded either.
-wushang used the slim FFmpeg build.
-CPU time swings by about 100 ms between runs of the same setup, so treat smaller gaps as noise.
-These figures predate the interface; drawing it adds about 19 MB of working set and 9 MB of private memory (H.264 measured minimized: 103 MB working set, 88 MB private).
+M5 MacBook Air, its own screen at 60 Hz.
 
-| Clip | Player | Working set | GPU memory | Threads | CPU time |
-|---|---|---|---|---|---|
-| H.264 + AAC, MP4 | VLC | 282 MB | 215 MB | 27 | 734 ms |
-| H.264 + AAC, MP4 | wushang | 82 MB | 84 MB | 13 | 516 ms |
-| HEVC + Opus, MKV | VLC | 298 MB | 222 MB | 30 | 734 ms |
-| HEVC + Opus, MKV | wushang | 89 MB | 101 MB | 13 | 438 ms |
+| 4K60 clip | Decoding | Presents per second | Late frames |
+|---|---|---|---|
+| HEVC 10-bit PQ, shown with EDR | VideoToolbox | 59.4 | 2 of 416, both at the start while the Metal pipelines were created |
+| H.264 | VideoToolbox | 59.8 | 1 |
+| HEVC 10-bit | software | 60.0 | 2 |
+| H.264 | software | 60.1 | 1 |
 
-GPU memory is the "GPU Process Memory" shared usage counter.
-Dedicated usage was 0 MB for both, so both decoded on the Intel GPU, which keeps video surfaces in system RAM.
-
-The first frame appears 180 to 200 ms after launch.
-On this laptop, opening the WASAPI stream takes 1.7 s inside `IAudioClient::Initialize`, and VLC waits for it, which is the "Decoder wait done in 2514 ms" in its log.
-wushang opens audio on the audio thread while the window and first frame come up, and starts the clock once sound plays.
-
-H.264 and HEVC played with no dropped frames in every run; VP9 dropped one frame in one of four runs.
-A 60-second clip takes 62.3 s of wall time: 60 s of playback plus the 1.7 s audio device startup.
-
-## Slim FFmpeg against the full build
-
-The same `wushang.exe` ran next to each set of DLLs; both are FFmpeg 9 with the same ABI.
-Medians of three runs per clip.
-The memory, CPU and startup rows were measured before libdav1d was added to the slim build.
-
-| | Full (BtbN LGPL) | Slim, with libdav1d |
-|---|---|---|
-| FFmpeg DLLs on disk | 114.4 MB | 15.7 MB (13.5 MB without libdav1d) |
-| `avcodec-63.dll` | 86.9 MB | 10.7 MB (8.7 MB without libdav1d) |
-| H.264: private memory / working set | 88.8 / 88.2 MB | 79.1 / 82.2 MB |
-| HEVC: private memory / working set | 98.2 / 94.9 MB | 88.6 / 89.1 MB |
-| VP9: private memory / working set | 65.3 / 64.6 MB | 55.5 / 58.5 MB |
-| CPU time, GPU decoding | 594-641 ms | 516-594 ms |
-| CPU time, software HEVC (`--sw`) | 2,406 ms | 2,234 ms |
-| First frame on screen | 189-196 ms | 188-199 ms |
-
-Disk size drops by 88%.
-Memory drops by about 10 MB of private bytes, because Windows maps DLL code lazily and only the full build's writable data pages cost RAM up front.
-CPU time and startup are the same within run-to-run noise.
+The first frame is on screen 273 ms after launch.
+On test clips with a known answer, the colour conversion comes within 0.47 levels of 255 of the exact one.
+100 nits of PQ comes out as 0.7294 on an SDR screen, where the Windows build gives 0.726.
 
 ## AV1 in software
 
-Neither GPU in this laptop decodes AV1, so AV1 goes to libdav1d.
-These runs started wushang minimized without activation, so they never took focus.
-A minimized window skips display composition, so the CPU figures are a little lower than for a visible window and are not comparable with the tables above.
-Peak memory comes from Windows' own per-process counters.
-
-| 1080p30 clip, 6 s | AV1, libdav1d | H.264, GPU |
-|---|---|---|
-| CPU time | 2.8 s median of 10 runs (3.5 s over another 5) | 0.7 s median of 3 runs |
-| Peak working set | 154 MB | 84 MB |
-| Peak private memory | 169 MB | 79 MB |
-| Dropped frames | 2 of 2,700 over 15 runs | 0 of 540 over 3 runs |
-
-Before the render loop's priority was raised, the same AV1 clip dropped 5 of 900 frames over 5 runs.
-The first frame still appears in about 0.2 to 0.6 s.
-Opening the audio device took 1.2 to 3.5 s in these runs, and playback starts moving when it is ready.
+libavcodec always prefers libdav1d for AV1, and libdav1d never uses the GPU.
+wushang asks VideoToolbox first (`VTIsHardwareDecodeSupported`), which says yes on M3 and later chips.
+If it does, FFmpeg's own AV1 decoder runs on VideoToolbox like every other codec; if not, libdav1d decodes on every CPU core.
+On Windows, libdav1d's bursts across all cores made a render loop at normal priority wake about 40 ms late and skip frames, which is why the render loop asks for the user-interactive class here.
 
 ## Known limits
 
-Each of these is marked with a `ponytail:` comment in the code, along with the upgrade path.
+Some of these are marked with a `ponytail:` comment in the code, along with the upgrade path.
 
-- DVDs play their main title only, without menus or the other titles, and DVD images (.iso) don't open; Blu-ray menus (BD-J) don't play either.
+- DVDs play their main title only, without menus or the other titles; Blu-ray menus (BD-J) don't play either, and a Blu-ray's main title is taken to be its longest playlist.
 - Without a language tag, traditional Chinese (Big5) subtitles read as simplified (GBK), and Turkish or Baltic ones as Western, since the same bytes are valid in both.
-- Contrast and saturation go up to 2x, like VLC's adjust filter; brightness and hue use the GPU's full range.
-- HDR output hasn't been seen on a real HDR screen yet.
-  It sends no HDR metadata, leaving the final fit to Windows.
-- HLG is graded for a 1000-nit display whatever the screen's peak, and full-range HLG or SDR BT.2020, which no real stream seems to use, still goes through the video processor's own conversion.
-- 4K60 10-bit H.264 decodes in software, which drops frames on a laptop CPU.
-- Audio devices must mix in f32, which every WASAPI shared-mode device seen so far does.
+- Contrast and saturation go up to 2x, like VLC's adjust filter; brightness adds up to 100 of 255 levels and hue turns up to half a circle either way, the ranges the Windows build's video processor has.
+- EDR has been measured only on the M5 MacBook Air's own screen; the XDR reference presets and external HDR screens are handled in the code but haven't been measured.
+- HLG is graded for a 1000-nit display whatever the screen's peak.
+- 4K60 10-bit H.264 decodes in software, since VideoToolbox doesn't decode 10-bit H.264.
 - The audio callback takes a mutex.
-- The stereo Test sound plays through Windows' default device at the system volume, not the chosen device or wushang's volume.
+- The stereo Test sound plays through macOS's default output at the system volume, not the chosen device or wushang's volume.
 - The subtitle timeline shows nothing for ASS and SSA tracks libass draws, and an embedded track's lines only as the demuxer reads them.
 - A recording or network stream of an RTSP or UDP stream ends where that stream drops and reconnects.
 - A reconnected stream must keep its track order; one that comes back with different tracks plays them wrongly.
 - A video stream that fails its first 60 packets counts as undecodable, and playback goes on with audio only.
+- A camera or capture card whose name has a colon in it can't be opened, because FFmpeg's AVFoundation input reads the colon as the end of the name.
 - Thumbnails stay in memory for the whole run, about 350 KB each.
-- The folder picker is modal, so the video pauses on screen while it is open (audio keeps playing).
+- The app is Apple Silicon only, and signed ad hoc rather than with a Developer ID, so it isn't notarized.
+
+## Differences from the Windows version
+
+The macOS app has the same features and interface; these behave differently, mostly to match how Mac apps work.
+
+- Shortcuts use ⌘ where Windows uses Ctrl, and ⌥ where it uses Alt; Control is still accepted for ⌘, and the menus, the Keyboard Shortcuts dialog and Settings show ⌘, ⌥ and ⇧.
+- There is a menu bar (wushang, File, Playback, Window), with ⌘, for Settings and ⌘H to hide, as Mac apps have.
+  ⌘M is the mini player, as Ctrl+M was, so Minimize in the Window menu has no shortcut.
+- Fullscreen is macOS's own, in a Space of its own with an animation, instead of a borderless window over the taskbar; the menu bar and the Dock hide while it is on.
+- macOS's title bar and window buttons are hidden under the design's own, and a double-click on the title bar does what System Settings says.
+- The video keeps playing while a file or folder picker is open; on Windows it paused on screen.
+- Folders are the Mac's: `~/Library/Application Support/wushang` for the library and settings, and `~/Movies`, `~/Music`, `~/Pictures`, `~/Desktop` and `~/Downloads` in place of Windows' Videos, Music, Pictures, Desktop and Downloads.
+  The window's place is kept in points from the main screen's top-left corner, and one from a Windows `settings.txt` copied over is ignored when it is off every screen; a Windows `tags.txt` is read again because its timestamps differ.
+- Updates come as a disk image in `~/Downloads` to drag over the old copy; there is no installer.
+- "Open With" and default apps come from the document types in the app's Info.plist, which Launch Services reads, instead of registry entries.
+- Capture goes through AVFoundation instead of DirectShow and GDI, and macOS asks before wushang uses a camera, microphone or screen.
+- Blu-ray goes through wushang's own playlist reader instead of libbluray, images are mounted with `hdiutil`, and DVD images play too.
+  The disc list shows only discs that are in a drive, where Windows listed every optical drive.
+- Converting uses VideoToolbox, AudioToolbox and LAME instead of Media Foundation's encoders.
+- HDR uses EDR, which wushang asks for only while HDR10 or HLG is on screen, instead of a screen switched to HDR mode in Windows' display settings.
+- The subtitle fonts offer Helvetica Neue and Menlo where Windows offers Segoe UI and Consolas.
+- Streaming to other devices may bring up macOS's local network prompt instead of the Windows firewall's.
+- Starting hidden is `open -j`, which stands for Windows' "Run: Minimized" shortcuts.
 
 ## Licence
 
 wushang is under the MIT licence ([LICENSE](LICENSE)).
 The libraries, crates, design and font it uses keep their own licences, listed in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) with full texts in [licenses](licenses).
-The install script copies all three next to the exe, so a copy of that folder can be passed on as it is.
+[scripts/bundle-macos.sh](scripts/bundle-macos.sh) copies all three, and the font's licence, into `wushang.app/Contents/Resources`, so a copy of the app can be passed on as it is.
 
-Both FFmpeg builds are LGPL, which allows a MIT player as long as FFmpeg stays dynamically linked.
-A GPL FFmpeg build would make the player GPL.
+The FFmpeg and libass in the app are the builds from the scripts above: FFmpeg is LGPL, which allows a MIT player as long as FFmpeg stays dynamically linked.
+Homebrew's FFmpeg is GPL, and an app bundled with it would be GPL, which is why the bundle script only takes the slim build.
 
 ## Credits
 
 The interface is based on [VLC Redesign](https://www.figma.com/community/file/1691465999134370980/vlc-redesign) by Juxtopposed, shared on the Figma Community under [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/).
-The icons in [assets/icons](assets/icons) are exported from that file, except the logo; `volume_fill.svg` and `sidebar.svg` were rewritten into equivalent shapes that Direct2D's SVG renderer supports.
+The icons in [assets/icons](assets/icons) are exported from that file, except the logo; `volume_fill.svg` and `sidebar.svg` were rewritten into equivalent shapes that the Windows build's Direct2D SVG renderer supports.
 The designer's video about it: https://youtu.be/ERFeOgqk324.
 This project is not affiliated with Juxtopposed or with VideoLAN.
 VLC is a trademark of VideoLAN.
 
-The wushang logo is [assets/wushang.svg](assets/wushang.svg); [assets/icons/logo.svg](assets/icons/logo.svg) is its W alone, for the title bar, and [assets/wushang.ico](assets/wushang.ico) the exe's icon, which [build.rs](build.rs) embeds.
+The wushang logo is [assets/wushang.svg](assets/wushang.svg); [assets/icons/logo.svg](assets/icons/logo.svg) is its W alone, for the title bar, and [assets/macos/wushang.icns](assets/macos/wushang.icns) the app's icon, which [scripts/bundle-macos.sh](scripts/bundle-macos.sh) draws from the SVG.
 
 The equalizer presets are VLC's, under LGPL 2.1 or later.
 
