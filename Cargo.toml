@@ -6,37 +6,29 @@ edition = "2024"
 [dependencies]
 cpal = "0.18.2"
 ffmpeg-next = { version = "9.0.0", default-features = false, features = ["codec", "device", "format", "software-resampling", "software-scaling"] }
-windows-numerics = "0.3.1"
-windows = { version = "0.62.2", features = [
-  "Win32_Devices_Display",
-  "Win32_Foundation",
-  "Win32_Graphics_Direct2D",
-  "Win32_Graphics_Direct2D_Common",
-  "Win32_Graphics_Direct3D",
-  "Win32_Graphics_Direct3D11",
-  "Win32_Graphics_DirectWrite",
-  "Win32_Graphics_Dwm",
-  "Win32_Graphics_Dxgi",
-  "Win32_Graphics_Dxgi_Common",
-  "Win32_Graphics_Gdi",
-  "Win32_Graphics_Imaging",
-  "Win32_Media",
-  "Win32_Media_Audio",
-  "Win32_Networking_WinHttp",
-  "Win32_Storage_FileSystem",
-  "Win32_System_Com",
-  "Win32_System_DataExchange",
-  "Win32_System_LibraryLoader",
-  "Win32_System_Memory",
-  "Win32_System_Power",
-  "Win32_System_Registry",
-  "Win32_System_Console",
-  "Win32_System_Threading",
-  "Win32_System_Time",
-  "Win32_UI_Controls",
-  "Win32_UI_HiDpi",
-  "Win32_UI_Input_KeyboardAndMouse",
-  "Win32_UI_Shell",
-  "Win32_UI_Shell_Common",
-  "Win32_UI_WindowsAndMessaging",
-] }
+# AppKit window and event loop, Metal video output, Core Graphics and Core Text for the interface.
+objc2 = "0.6"
+block2 = "0.6"
+objc2-foundation = "0.3"
+objc2-app-kit = "0.3"
+objc2-quartz-core = "0.3"
+objc2-metal = "0.3"
+objc2-core-foundation = "0.3"
+objc2-core-graphics = "0.3"
+objc2-core-text = "0.3"
+objc2-core-video = "0.3"
+objc2-io-surface = "0.3"
+objc2-uniform-type-identifiers = "0.3"
+objc2-av-foundation = "0.3"
+objc2-core-media = "0.3"
+# The design's SVG icons, rasterised once per scale.
+resvg = "0.49"
+# Snapshots and pictures picked for playlists.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "bmp", "gif", "webp"] }
+# Feeds, the radio directory and the update check, in place of WinHTTP.
+ureq = "3"
+# Old subtitle files in Windows code pages.
+encoding_rs = "0.8"
+# libass, loaded at run time as on Windows.
+libloading = "0.8"
+libc = "0.2"
