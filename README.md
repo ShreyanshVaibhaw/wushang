@@ -326,7 +326,7 @@ Both build scripts need Homebrew's `meson`, `ninja` and `pkgconf`, download thei
 SRC=../tools/src/macos PREFIX=../tools/ffmpeg-9.0.2-wushang scripts/build-ffmpeg-macos.sh
 ```
 
-It builds the file protocol and the network ones a player opens (http, https, tls, tcp, udp, rtp, with TLS from macOS's Secure Transport, so there is no OpenSSL), `concat` for a disc's files, 36 demuxers (HLS and RTSP among them), 20 parsers, 55 decoders (raw video and PCM among them, for capture devices, and ProRes) and the VideoToolbox hwaccels for H.264, HEVC, AV1, VP9, MPEG-2, MPEG-1 and ProRes, plus libswresample and libswscale.
+It builds the file protocol and the network ones a player opens (http, https, tls, tcp, udp, rtp, with TLS from macOS's Secure Transport, so there is no OpenSSL), `concat` for a disc's files, 37 demuxers (HLS and RTSP among them), 20 parsers, 58 decoders (raw video and PCM among them, for capture devices, plus ProRes, Monkey's Audio and AMR) and the VideoToolbox hwaccels for H.264, HEVC, AV1, VP9, MPEG-2, MPEG-1 and ProRes, plus libswresample and libswscale.
 For recording and converting it adds 10 muxers (Matroska, MP4 and MPEG-TS among them), every bitstream filter, and the `h264_videotoolbox`, `hevc_videotoolbox`, `aac_at`, `aac` and `libmp3lame` encoders.
 libavdevice holds the AVFoundation input, for cameras, microphones and screens.
 One of the decoders is libdav1d, so AV1 plays in software on Macs whose GPU doesn't decode it.
@@ -351,11 +351,10 @@ wushang loads it at run time ([src/ass.rs](src/ass.rs)) from the app's Framework
 All three go in the `bundle` folder of the build folder, the `target_directory` that `cargo metadata --format-version 1 --no-deps` names.
 
 ```bash
-export FFMPEG_DIR="$(cd .. && pwd)/tools/ffmpeg-9.0.2-wushang"
 scripts/bundle-macos.sh
 ```
 
-`FFMPEG_DIR` makes `ffmpeg-sys-next` link the release build against the slim FFmpeg instead of Homebrew's.
+It sets `FFMPEG_DIR` and `MACOSX_DEPLOYMENT_TARGET=13.0` for its own release build, so `ffmpeg-sys-next` links the slim FFmpeg instead of Homebrew's.
 The script takes FFmpeg from `FFMPEG_DIR` and libass from `LIBASS_DIR` (by default `../tools/ffmpeg-9.0.2-wushang` and `../tools/libass-0.17.5`), and stops at an exe that needs a library from anywhere else, such as Homebrew's GPL FFmpeg.
 It builds with your home folder cut out of the source paths the exe embeds, so the app doesn't carry your user name.
 It copies every library the exe links, and libass, into `Contents/Frameworks` and points the exe and each library at the copies, fills in the version from Cargo.toml in [assets/macos/Info.plist](assets/macos/Info.plist), draws the icon from `assets/wushang.svg` when the SVG has changed, and copies the licence files into `Contents/Resources`.
@@ -476,6 +475,8 @@ Some of these are marked with a `ponytail:` comment in the code, along with the 
 - A video stream that fails its first 60 packets counts as undecodable, and playback goes on with audio only.
 - A camera or capture card whose name has a colon in it can't be opened, because FFmpeg's AVFoundation input reads the colon as the end of the name.
 - Thumbnails stay in memory for the whole run, about 350 KB each.
+- https and HLS go through Secure Transport, which stops at TLS 1.2, so a server that only speaks TLS 1.3 can't be opened by the release build.
+- The release FFmpeg has no PNG decoder, as on Windows, so a song whose embedded cover is a PNG shows no picture.
 - The app is Apple Silicon only, and signed ad hoc rather than with a Developer ID, so it isn't notarized.
 
 ## Differences from the Windows version

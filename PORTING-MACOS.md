@@ -5,7 +5,8 @@ The Windows original is the reference: when in doubt, do what it does, pixel for
 A pristine copy of it lives at `/Users/shreyanshvaibhaw/Dev/Wushang/src-windows` (read-only, never edit it).
 
 Target: macOS 13+ on Apple Silicon (arm64), built with the Homebrew Rust toolchain, `cargo build`.
-FFmpeg 9.0.2 and libass 0.17.5 come from Homebrew (`pkg-config` finds them; `.cargo/config.toml` sets `LIBCLANG_PATH`).
+The app ships FFmpeg 9.0.2 and libass 0.17.5 as slim LGPL builds for macOS 13, made from source by `scripts/build-ffmpeg-macos.sh` and `scripts/build-libass-macos.sh` into `../tools` beside the repository.
+`cargo build`, `cargo run` and `cargo test` use Homebrew's (`pkg-config` finds FFmpeg; `.cargo/config.toml` sets `LIBCLANG_PATH`), unless `FFMPEG_DIR` points them at the slim one.
 There is no full Xcode, only the Command Line Tools: no `metal` shader compiler, no xcodebuild projects.
 Metal shaders are compiled at run time from source with `newLibraryWithSource`.
 
@@ -21,7 +22,7 @@ Metal shaders are compiled at run time from source with `newLibraryWithSource`.
 | WIC (snapshots, pictures) | `image` crate |
 | WASAPI via cpal | cpal on Core Audio (unchanged code) |
 | WinHTTP | `ureq` |
-| Media Foundation encoders | `h264_videotoolbox`, `aac_at`, `libmp3lame` from Homebrew FFmpeg |
+| Media Foundation encoders | `h264_videotoolbox`, `aac_at`, `libmp3lame` (LAME linked into the slim FFmpeg) |
 | DirectShow / GDI capture | FFmpeg `avfoundation` input |
 | Registry file associations | `Info.plist` document types in the `.app` bundle |
 | `%APPDATA%\wushang` | `~/Library/Application Support/wushang` (`WUSHANG_HOME` still overrides) |
@@ -149,12 +150,26 @@ pub fn system_dark_mode() -> bool;                   // NSApp effectiveAppearanc
   - `update::Release` keeps its fields: `zip` is the download (the release's `-macos-arm64.dmg`, else its `.zip`), `msi` is always None. `update::download` saves into ~/Downloads (through `snapshot::known_folder(Folder::Downloads)`) and selects the file in Finder itself (`open -R`); main only shows `Dialog::Downloaded`. `Saved::Installer` is never made; `install_on_exit`, `finish` and `clean_up` do nothing.
   - `assoc::register()` registers the running `.app` with Launch Services (`LSRegisterURL`) and does nothing for a bare exe. The document types are `assets/macos/Info.plist`'s (a test keeps them in step with `VIDEO_EXTS`/`AUDIO_EXTS`). `assoc::read` is gone.
   - Capture addresses are `avfoundation://video=<name>`, `avfoundation://audio=<name>` and `screen://` (`screen://1`, ... for more displays); `capture::devices()`, `open()` and `is_capture_path()` keep their shapes. Cameras open at their biggest mode up to 1080p that runs at 30 fps, in NV12 when they have it.
-  - `disc::drives()` lists mounted volumes in /Volumes that hold a disc (UDF, ISO 9660, CD audio) or a VIDEO_TS/BDMV folder at the top; an empty drive shows nothing. Blu-ray no longer needs libbluray (Homebrew's FFmpeg has none): `disc::url` plays the longest BDMV/PLAYLIST/*.mpls's clips through `concat:`, and `disc::dvd_title` now also gives a Blu-ray's length and chapters. A `.iso` is mounted read-only with `hdiutil` under the temp folder (not in Finder) and detached when wushang exits.
+  - `disc::drives()` lists mounted volumes in /Volumes that hold a disc (UDF, ISO 9660, CD audio) or a VIDEO_TS/BDMV folder at the top; an empty drive shows nothing. Blu-ray no longer needs libbluray (the macOS FFmpeg has none): `disc::url` plays the longest BDMV/PLAYLIST/*.mpls's clips through `concat:`, and `disc::dvd_title` now also gives a Blu-ray's length and chapters. A `.iso` is mounted read-only with `hdiutil` under the temp folder (not in Finder) and detached when wushang exits.
   - `convert::Target::extension()` is "m4a" for `Mp3` when FFmpeg has no libmp3lame (AAC goes in M4A); name output files with it, as main does. Encoders: `h264_videotoolbox` then `libx264`, `aac_at` then `aac`, `libmp3lame`.
   - `prefs::FONTS` swaps Segoe UI and Consolas for Helvetica Neue and Menlo. `SNAP_DIR`/`RECORD_DIR` keys are unchanged (`pictures`, `videos`); their labels read Pictures/wushang and Movies/wushang.
   - `session::open_file` also leaves out the rtp, concat, avfoundation and lavfi demuxers, which Homebrew's FFmpeg has and the Windows build's slim FFmpeg doesn't.
   - `tags::Stamp`'s time is nanoseconds since 1970 (was FILETIME), so a tags.txt from Windows is probed again.
-  - Packaging: `scripts/bundle-macos.sh` builds `<target>/bundle/wushang.app`, `wushang-<version>-macos-arm64.dmg` and `.zip`, with FFmpeg, libass and their Homebrew dependencies in Contents/Frameworks; `build.rs` links bins with `-headerpad_max_install_names` and an rpath to `@executable_path/../Frameworks`. `scripts/make-testdata.sh` makes the test clips with Homebrew's ffmpeg (the minute-long ones now with a keyframe every 2 s, which record.rs's streaming test needs).
-    Open issue: Homebrew's bottles are built for the Mac's own macOS (26 here) and its FFmpeg is GPL (`--enable-gpl`, x264, x265), so the bundle runs on macOS 26+ only and is GPL; the script warns about the first. Both need an FFmpeg and libass built from source with `MACOSX_DEPLOYMENT_TARGET=13.0` and the Windows build's LGPL options, the way scripts/build-ffmpeg.sh does for Windows.
+  - Packaging: `scripts/bundle-macos.sh` builds `<target>/bundle/wushang.app`, `wushang-<version>-macos-arm64.dmg` and `.zip`, with FFmpeg and libass in Contents/Frameworks; `build.rs` links bins with `-headerpad_max_install_names` and an rpath to `@executable_path/../Frameworks`. `scripts/make-testdata.sh` makes the test clips with Homebrew's ffmpeg (the minute-long ones now with a keyframe every 2 s, which record.rs's streaming test needs).
+    Resolved: the bundle used to carry Homebrew's FFmpeg and libass, which are built for the Mac's own macOS (26 here), and Homebrew's FFmpeg is GPL (`--enable-gpl`, x264, x265).
+    Both now come from source, built for macOS 13 (`MACOSX_DEPLOYMENT_TARGET=13.0`), as the Windows build's do:
+    - `scripts/build-ffmpeg-macos.sh` builds FFmpeg 9.0.2, LGPL v2.1 or later, into `../tools/ffmpeg-9.0.2-wushang`, with the Windows build's protocols, demuxers, parsers, decoders, muxers and bitstream filters.
+      macOS's own pieces replace Windows': the VideoToolbox hwaccels (H.264, HEVC, AV1, VP9, MPEG-1/2, ProRes), the `h264_videotoolbox`, `hevc_videotoolbox` and `aac_at` encoders, the `avfoundation` input device and Secure Transport for https.
+      dav1d and LAME are linked in statically, zlib is macOS's, and FFmpeg's own `aac` encoder and the `ipod` (M4A) muxer are there for Convert's fallbacks.
+      It also plays Monkey's Audio and AMR sound, which the Windows build can't, as `.ape` and `.3gp` are in wushang's file lists; ProRes and the PCM layouts Core Audio devices deliver are there too.
+      There is no libbluray (nothing reaches FFmpeg's bluray protocol) and no libavfilter.
+    - `scripts/build-libass-macos.sh` builds libass 0.17.5 into `../tools/libass-0.17.5`: one `libass.9.dylib` with FreeType 2.15.0, FriBidi 1.0.18 and HarfBuzz 15.0.0 inside, fonts through Core Text, exporting only libass's API.
+    - Both download their pinned tarballs, check them against SHA-256 sums (of tarballs whose GPG signatures were checked), and fail unless every dylib is for macOS 13.0, is named `@rpath/lib*.dylib` and needs only system libraries.
+    - `scripts/bundle-macos.sh` builds the release with `FFMPEG_DIR` set to the slim FFmpeg (ffmpeg-sys-next then links it from there instead of asking `pkg-config`, which finds Homebrew's) and `MACOSX_DEPLOYMENT_TARGET=13.0`, so a plain `scripts/bundle-macos.sh` needs nothing set.
+      To develop against the slim FFmpeg too, `.cargo/config.toml` can set `FFMPEG_DIR` and `MACOSX_DEPLOYMENT_TARGET` in `[env]`, plus `rustflags = ['-C', 'link-arg=-Wl,-rpath,<FFmpeg folder>/lib']` under `[target.aarch64-apple-darwin]` so `cargo run` and `cargo test` find its `@rpath` dylibs; the whole test suite passes that way.
+      The bundle script copies from `FFMPEG_DIR` and `LIBASS_DIR` (by default the folders above) and stops at any other library, so an exe linked against Homebrew's FFmpeg can't end up in the app.
+      It takes that rpath out of the app's exe, and still warns when any part of the app needs a newer macOS than Info.plist says.
+    - There is no `libx264`, so Convert's H.264 is `h264_videotoolbox` alone (with `allow_sw` it has a software encoder of its own).
+    - `src/ass.rs` looks for libass in the app's Frameworks, then Homebrew's lib folders, so outside the app (`cargo run`, `cargo test`) it uses Homebrew's libass when there is one.
 - **shell**: `Prefs::window` now holds the window's frame in points (left, top, width, height) measured from the main screen's top-left corner, y down, as AppKit sizes go; the "screen pixels" comment in `prefs.rs` (services) should say so. A Windows `settings.txt` copied over is just ignored when the spot is off every screen.
 - **shell**: debug builds take scripted input for testing without the real mouse and keyboard: `WUSHANG_REMOTE=<fifo>`, one command per line (`key 49`, `click 300 20 2`, `move`, `drag`, `scroll`, `frame`, `menu`, `open`, `drop`, `cancel`, `track`, `appearance`, `terminate`); see `src/platform/remote.rs`. Not compiled into release builds.
