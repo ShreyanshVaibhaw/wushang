@@ -349,7 +349,8 @@ wushang loads it at run time ([src/ass.rs](src/ass.rs)) from the app's Framework
 
 [scripts/bundle-macos.sh](scripts/bundle-macos.sh) builds the release, packs it as `wushang.app`, and makes `wushang-<version>-macos-arm64.dmg` (the app beside a link to Applications, to drag across) and `wushang-<version>-macos-arm64.zip` from it.
 The disk image and zip go in the `bundle` folder of the build folder, the `target_directory` that `cargo metadata --format-version 1 --no-deps` names, and the app in `bundle/app.noindex`.
-The `.noindex` folder keeps that copy out of Spotlight, and wushang doesn't register a copy there, or one run from its mounted disk image, with Launch Services, so only the installed app shows in Spotlight and "Open With".
+The `.noindex` folder keeps that copy out of Spotlight, the script takes it back out of Launch Services, and wushang doesn't register a copy there, or one run from its mounted disk image, so only the installed app shows in Spotlight and "Open With".
+macOS itself still records any app that is launched, so running that copy puts it back in "Open With" until the next bundle run; try builds from `/Applications` instead.
 
 ```bash
 scripts/bundle-macos.sh
