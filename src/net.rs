@@ -776,10 +776,9 @@ mod tests {
     #[test]
     fn fetches_with_limits_and_says_what_went_wrong() {
         let base = serve(|path| match path {
-            "/feed?x=1" => {
-                format!("HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello")
-                    .into_bytes()
-            }
+            "/feed?x=1" => "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello"
+                .to_string()
+                .into_bytes(),
             "/moved" => {
                 b"HTTP/1.1 302 Found\r\nLocation: /feed?x=1\r\nContent-Length: 0\r\n\r\n".to_vec()
             }

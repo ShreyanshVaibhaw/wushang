@@ -1,8 +1,7 @@
 # Porting wushang to macOS
 
-This branch (`macos`) turns the Windows player into a macOS app with the same features, interface and behaviour.
-The Windows original is the reference: when in doubt, do what it does, pixel for pixel and feature for feature.
-A pristine copy of it lives at `/Users/shreyanshvaibhaw/Dev/Wushang/src-windows` (read-only, never edit it).
+This branch (`macos`) is the Windows player as a macOS app with the same features, interface and behaviour.
+The Windows app on `main` is the reference: when in doubt, do what it does, pixel for pixel and feature for feature.
 
 Target: macOS 13+ on Apple Silicon (arm64), built with the Homebrew Rust toolchain, `cargo build`.
 The app ships FFmpeg 9.0.2 and libass 0.17.5 as slim LGPL builds for macOS 13, made from source by `scripts/build-ffmpeg-macos.sh` and `scripts/build-libass-macos.sh` into `../tools` beside the repository.
@@ -31,22 +30,22 @@ Metal shaders are compiled at run time from source with `newLibraryWithSource`.
 | Show in File Explorer | Show in Finder |
 | Borderless fullscreen | native `toggleFullScreen:` |
 
-## Module ownership during the port
+## Carrying Windows changes over
 
-Each agent edits only its own files.
-Errors from other people's files are expected while the port runs; filter `cargo check` output to your own paths.
-Anyone may add a dependency to `Cargo.toml`; add only lines, never reorder or remove others'.
-Nobody commits; the coordinator does.
+`main` is the Windows app and `macos` this port, so `git merge main` (or a cherry-pick) brings upstream work across.
+Most files merge as they are; these are where the two differ:
 
-- **gfx**: `src/d2d/**` (new), `src/ui.rs`, `src/ui/**`, `src/captions.rs`.
-- **video**: `src/render.rs`, `src/tonemap.rs`, `src/hdr.rs`, `src/nv12.rs`, `src/snapshot.rs`, `src/player.rs`, `src/shaders/**` (new).
-- **services**: `src/{ass,assoc,audio,bookmarks,capture,codepage,convert,disc,dsp,library,net,prefs,probe,profiles,queue,record,session,stream,subs,tags,thumbs,update}.rs`, `build.rs`, `scripts/**`, `assets/macos/**` (new: Info.plist, icns).
-- **shell**: `src/main.rs`, `src/platform/**` (new).
+- `src/ui.rs`, `src/ui/**` and `src/captions.rs` differ from Windows mostly in their `use` lines, because `crate::d2d` (`src/d2d/`) has the same names and call shapes as windows-rs's Direct2D and DirectWrite.
+  New drawing code from Windows usually compiles unchanged; a Direct2D or DirectWrite call the shim doesn't have yet goes into `src/d2d/`.
+  After a merge, `cargo test render_check -- --ignored` paints the main screens into PNGs to look over.
+- `src/main.rs` keeps the Windows `App` logic; the window, input and pickers are in `src/platform/` instead of Win32 calls.
+- `src/render.rs`, `src/tonemap.rs`, `src/hdr.rs` and `src/player.rs`'s hardware setup are Metal and VideoToolbox code of their own; port changes there by hand.
+- `src/net.rs`, `src/update.rs`, `src/assoc.rs`, `src/capture.rs`, `src/disc.rs`, `src/convert.rs`, `src/codepage.rs` and `src/ass.rs` swap Windows APIs for macOS ones (see the table above and the notes below).
+- New FFmpeg components the Windows `scripts/build-ffmpeg.sh` gains go into `scripts/build-ffmpeg-macos.sh` too.
 
 ## Contracts between modules
 
-These are fixed so the four parts can be written at the same time.
-If you must change one, keep the old signature working or note the change at the bottom of this file under "Contract changes".
+How the parts of the macOS code meet.
 
 ### d2d shim (gfx provides, video and shell use)
 
@@ -113,9 +112,7 @@ pub fn system_dark_mode() -> bool;                   // NSApp effectiveAppearanc
 `Library::default_dir()` returns `~/Library/Application Support/wushang` unless `WUSHANG_HOME` is set.
 `snapshot::known_folder` and the first-run seeding use the macOS folders from the table above.
 
-## Contract changes
-
-(Append here: who, what, why.)
+## Notes by module
 
 - **shell**: keys, cursors and the clipboard for `src/ui/**`. The UI takes gfx's `d2d::VIRTUAL_KEY` (below); the shell's key mapping (`crate::platform::keys`) produces it, passing Cmd or Ctrl as `ctrl`.
   - `crate::platform::keys::shift_down() -> bool` replaces `GetKeyState(VK_SHIFT) < 0` (in `dialog_down`).

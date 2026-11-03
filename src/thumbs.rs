@@ -92,7 +92,7 @@ pub fn probe(path: &Path) -> Option<MediaInfo> {
 
 /// One still `width` x `height`, scaled to cover the box and centre-cropped (no letterbox).
 /// Video: a frame at 10% of the duration, but no later than 30 s (seek to the keyframe before, then decode until the first frame at/after the target or give up after ~60 frames and use the last one); fall back to the first frame if seeking fails.
-/// Audio: the embedded cover picture (attached_pic stream, decoded with the mjpeg decoder) if any, else None.
+/// Audio: the embedded cover picture (attached_pic stream, decoded with the mjpeg or png decoder) if any, else None.
 /// Software decoding only (never touch the GPU), thread_count 2. Must not panic on corrupt input; return None.
 pub fn render(path: &Path, width: u32, height: u32) -> Option<Thumbnail> {
     if width == 0 || height == 0 {
@@ -183,8 +183,8 @@ fn decode_until(input: &mut ff::format::context::Input, target: f64) -> Option<f
     last
 }
 
-/// Decodes the attached cover picture, if the file has one and the build has its decoder (mjpeg;
-/// this FFmpeg has no PNG decoder, so PNG covers give None).
+/// Decodes the attached cover picture, if the file has one and the build has its decoder (mjpeg
+/// or png).
 fn cover_frame(input: &ff::format::context::Input) -> Option<ff::frame::Video> {
     let stream = input
         .streams()

@@ -129,8 +129,8 @@ pub struct Prefs {
     /// it switches.
     pub time_left: bool,
     pub remember_window: bool,
-    /// The window's last restored rect in screen pixels (left, top, width, height), and whether
-    /// it was maximized.
+    /// The window's last restored rect in points from the main screen's top-left, y down (left,
+    /// top, width, height), and whether it was maximized.
     pub window: Option<([i32; 4], bool)>,
     /// Index into `AUTO_HIDE`.
     pub auto_hide: usize,

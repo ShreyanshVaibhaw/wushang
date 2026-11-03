@@ -326,7 +326,7 @@ Both build scripts need Homebrew's `meson`, `ninja` and `pkgconf`, download thei
 SRC=../tools/src/macos PREFIX=../tools/ffmpeg-9.0.2-wushang scripts/build-ffmpeg-macos.sh
 ```
 
-It builds the file protocol and the network ones a player opens (http, https, tls, tcp, udp, rtp, with TLS from macOS's Secure Transport, so there is no OpenSSL), `concat` for a disc's files, 37 demuxers (HLS and RTSP among them), 20 parsers, 58 decoders (raw video and PCM among them, for capture devices, plus ProRes, Monkey's Audio and AMR) and the VideoToolbox hwaccels for H.264, HEVC, AV1, VP9, MPEG-2, MPEG-1 and ProRes, plus libswresample and libswscale.
+It builds the file protocol and the network ones a player opens (http, https, tls, tcp, udp, rtp, with TLS from macOS's Secure Transport, so there is no OpenSSL), `concat` for a disc's files, 37 demuxers (HLS and RTSP among them), 20 parsers, 59 decoders (raw video and PCM among them, for capture devices, plus ProRes, Monkey's Audio, AMR and PNG for cover art) and the VideoToolbox hwaccels for H.264, HEVC, AV1, VP9, MPEG-2, MPEG-1 and ProRes, plus libswresample and libswscale.
 For recording and converting it adds 10 muxers (Matroska, MP4 and MPEG-TS among them), every bitstream filter, and the `h264_videotoolbox`, `hevc_videotoolbox`, `aac_at`, `aac` and `libmp3lame` encoders.
 libavdevice holds the AVFoundation input, for cameras, microphones and screens.
 One of the decoders is libdav1d, so AV1 plays in software on Macs whose GPU doesn't decode it.
@@ -476,7 +476,6 @@ Some of these are marked with a `ponytail:` comment in the code, along with the 
 - A camera or capture card whose name has a colon in it can't be opened, because FFmpeg's AVFoundation input reads the colon as the end of the name.
 - Thumbnails stay in memory for the whole run, about 350 KB each.
 - https and HLS go through Secure Transport, which stops at TLS 1.2, so a server that only speaks TLS 1.3 can't be opened by the release build.
-- The release FFmpeg has no PNG decoder, as on Windows, so a song whose embedded cover is a PNG shows no picture.
 - The app is Apple Silicon only, and signed ad hoc rather than with a Developer ID, so it isn't notarized.
 
 ## Differences from the Windows version

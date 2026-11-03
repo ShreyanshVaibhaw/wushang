@@ -87,9 +87,10 @@ parsers=(h264 hevc av1 vp8 vp9 mpeg4video mpegvideo vc1 mjpeg
          dvdsub dvbsub)
 # The Windows list, plus ProRes, the PCM layouts a Core Audio device can deliver, and the sound
 # of two kinds of file wushang lists that the Windows build can't play: Monkey's Audio (.ape,
-# with its demuxer above) and AMR, which most .3gp videos carry.
+# with its demuxer above) and AMR, which most .3gp videos carry. PNG is for cover art, which
+# music files embed as PNG about as often as JPEG.
 decoders=(h264 hevc av1 libdav1d vp8 vp9 mpeg4 mpeg2video mpeg1video vc1 wmv3 msmpeg4v3 mjpeg theora rawvideo
-          prores ape amrnb amrwb
+          prores ape amrnb amrwb png
           aac aac_latm mp3float mp2float ac3 eac3 opus vorbis flac alac dca truehd wmav2
           pcm_s16le pcm_s16be pcm_s24le pcm_s24be pcm_s32le pcm_s32be pcm_f32le pcm_f32be
           pcm_u8 pcm_alaw pcm_mulaw pcm_bluray pcm_dvd
