@@ -17,11 +17,17 @@ unsafe extern "C" {
 }
 
 /// Registers the running app bundle, unless it already is. A bare exe (`cargo run`) has no
-/// bundle and no document types, so it registers nothing.
+/// bundle and no document types, so it registers nothing. Nor do the copies that come and go: a
+/// build in a `.noindex` folder (where scripts/bundle-macos.sh leaves its app, out of Spotlight
+/// too) and the app run straight from its mounted disk image, which would otherwise each stay
+/// in "Open With" and Spotlight beside the installed one.
 pub fn register() {
     let Some(bundle) = std::env::current_exe().ok().as_deref().and_then(bundle_of) else {
         return;
     };
+    if is_transient(&bundle) {
+        return;
+    }
     let Some(url) = CFURL::from_directory_path(&bundle) else {
         return;
     };
@@ -43,6 +49,24 @@ fn bundle_of(exe: &Path) -> Option<PathBuf> {
         .then(|| app.to_path_buf())
 }
 
+/// Whether `app` is a build output or sits on a read-only volume such as a mounted .dmg.
+fn is_transient(app: &Path) -> bool {
+    let build = app.ancestors().any(|a| {
+        a.extension()
+            .is_some_and(|e| e.eq_ignore_ascii_case("noindex"))
+    });
+    build || read_only(app)
+}
+
+fn read_only(path: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    let Ok(c) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
+        return false;
+    };
+    let mut fs: libc::statfs = unsafe { std::mem::zeroed() };
+    unsafe { libc::statfs(c.as_ptr(), &mut fs) == 0 && fs.f_flags & libc::MNT_RDONLY as u32 != 0 }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -57,6 +81,17 @@ mod tests {
         );
         assert_eq!(bundle_of(Path::new("/Users/me/target/debug/wushang")), None);
         assert_eq!(bundle_of(Path::new("/wushang")), None);
+    }
+
+    #[test]
+    fn build_copies_and_disk_images_stay_unregistered() {
+        assert!(is_transient(Path::new(
+            "/x/target/bundle/app.noindex/wushang.app"
+        )));
+        assert!(!is_transient(Path::new("/Applications/wushang.app")));
+        // The sealed system volume is read-only, like a mounted disk image.
+        assert!(read_only(Path::new("/System/Applications")));
+        assert!(!read_only(&std::env::temp_dir()));
     }
 
     /// Info.plist claims every extension the library plays, each once, and nothing else.

@@ -34,7 +34,10 @@ target_dir="$(printf '%s' "$meta" | sed -n 's/.*"target_directory":"\([^"]*\)".*
 version="$(sed -n 's/^version = "\(.*\)"$/\1/p' "$root/Cargo.toml" | head -n 1)"
 [ -n "$target_dir" ] && [ -n "$version" ] || { echo "can't read cargo metadata" >&2; exit 1; }
 out="$target_dir/bundle"
-app="$out/wushang.app"
+# The app is kept in a .noindex folder: Spotlight skips it, and wushang doesn't register a copy
+# there with Launch Services, so this build never shows beside the installed app in Spotlight
+# or "Open With". The disk image and zip carry it out.
+app="$out/app.noindex/wushang.app"
 name="wushang-$version-macos-arm64"
 
 tools="$(cd "$root/.." && pwd)/tools"
@@ -77,7 +80,7 @@ if [ ! -f "$icns" ] || [ "$root/assets/wushang.svg" -nt "$icns" ]; then
   rm -rf "$work"
 fi
 
-rm -rf "$app"
+rm -rf "$app" "$out/wushang.app" # the second is where older runs of this script left it
 mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources/licenses" "$app/Contents/Frameworks"
 cp "$exe" "$app/Contents/MacOS/wushang"
 
@@ -212,6 +215,8 @@ ln -s /Applications "$stage/Applications"
 rm -f "$dmg"
 hdiutil create -quiet -volname wushang -srcfolder "$stage" -fs HFS+ -format UDZO -ov "$dmg"
 rm -rf "$stage"
+# Launch Services may have met the app while it was built (codesign, Finder); forget this copy.
+"/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister" -u "$app" 2>/dev/null || true
 rm -f "$zip"
 ditto -c -k --keepParent "$app" "$zip"
 
