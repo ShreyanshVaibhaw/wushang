@@ -101,8 +101,7 @@ pub fn open_input(
         return crate::capture::open(path);
     }
     if crate::disc::is_disc_path(path) {
-        let url = crate::disc::url(path)?;
-        return ff::format::input(&url).map_err(|e| format!("can't play the disc: {e}"));
+        return crate::disc::open(path, cancel);
     }
     if !net::is_url_path(path) {
         return open_file(path);
@@ -128,6 +127,8 @@ pub fn open_input(
         }
         dict.set("reconnect_delay_max", &options.timeout.to_string());
     }
+    // A server can't hand back a concat script (the disc reader's demuxer) or name a device.
+    dict.set("format_whitelist", stream_formats());
     let cancel = cancel.clone();
     ff::format::input_with_interrupt_and_dictionary(path, move || cancel.load(Relaxed), dict)
         .map_err(|e| format!("cannot open {}: {e}", net::redact(&url)))
@@ -154,29 +155,39 @@ pub fn open_file(path: &Path) -> Result<ff::format::context::Input, String> {
 fn local_formats() -> &'static str {
     static FORMATS: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     FORMATS.get_or_init(|| {
-        let mut names = Vec::new();
-        let mut opaque = std::ptr::null_mut();
-        loop {
-            let format = unsafe { ff::ffi::av_demuxer_iterate(&mut opaque) };
-            if format.is_null() {
-                break;
-            }
-            let name = unsafe { CStr::from_ptr((*format).name) }.to_string_lossy();
-            let opens_more = [
-                "hls",
-                "sdp",
-                "rtsp",
-                "rtp",
-                "concat",
-                "avfoundation",
-                "lavfi",
-            ];
-            if !opens_more.contains(&&*name) {
-                names.push(name.into_owned());
-            }
-        }
-        names.join(",")
+        demuxers_except(&[
+            "hls",
+            "sdp",
+            "rtsp",
+            "rtp",
+            "concat",
+            "avfoundation",
+            "lavfi",
+        ])
     })
+}
+
+/// The demuxers a stream address may use: playlists and RTSP, but not ones that read local
+/// files or devices.
+fn stream_formats() -> &'static str {
+    static FORMATS: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    FORMATS.get_or_init(|| demuxers_except(&["concat", "avfoundation", "lavfi"]))
+}
+
+fn demuxers_except(excluded: &[&str]) -> String {
+    let mut names = Vec::new();
+    let mut opaque = std::ptr::null_mut();
+    loop {
+        let format = unsafe { ff::ffi::av_demuxer_iterate(&mut opaque) };
+        if format.is_null() {
+            break;
+        }
+        let name = unsafe { CStr::from_ptr((*format).name) }.to_string_lossy();
+        if !excluded.contains(&&*name) {
+            names.push(name.into_owned());
+        }
+    }
+    names.join(",")
 }
 
 /// Whether `path` is a live stream FFmpeg doesn't reconnect itself (it does http and HLS), so
@@ -990,6 +1001,51 @@ mod tests {
     use std::sync::atomic::AtomicBool;
     use std::thread;
     use std::time::{Duration, Instant};
+
+    /// A server answering with a concat script: plain FFmpeg follows it to more files, a stream
+    /// address won't, and an ordinary stream from the same server still plays.
+    #[test]
+    fn a_stream_cannot_be_a_concat_script() {
+        use std::io::{BufRead, BufReader, Write};
+        ff::init().unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        thread::spawn(move || {
+            let video =
+                std::fs::read(Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/test_h264.mp4"))
+                    .unwrap();
+            for stream in listener.incoming().flatten() {
+                let mut reader = BufReader::new(stream);
+                let mut line = String::new();
+                _ = reader.read_line(&mut line);
+                let path = line.split(' ').nth(1).unwrap_or("/").to_owned();
+                while reader.read_line(&mut line).is_ok_and(|n| n > 2) {}
+                let body = match path.as_str() {
+                    "/live" => b"ffconcat version 1.0\nfile video.mp4\n".to_vec(),
+                    _ => video.clone(),
+                };
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                _ = reader
+                    .get_mut()
+                    .write_all(&[head.as_bytes(), &body].concat());
+            }
+        });
+        let script = format!("{base}/live");
+        let plain = ff::format::input(&script).expect("plain FFmpeg opens it as concat");
+        assert_eq!(plain.format().name(), "concat");
+        drop(plain);
+        let options = NetOptions {
+            timeout: 5,
+            reconnect: false,
+        };
+        let cancel = Arc::new(AtomicBool::new(false));
+        assert!(open_input(Path::new(&script), options, &cancel).is_err());
+        let video = open_input(Path::new(&format!("{base}/video.mp4")), options, &cancel);
+        assert!(video.is_ok(), "real streams still open");
+    }
 
     /// A downloaded HLS playlist pulling its segment from elsewhere: plain FFmpeg follows it
     /// (here to a local file; in an attack to a server, which learns the file was opened),

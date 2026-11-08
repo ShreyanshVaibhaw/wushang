@@ -504,7 +504,20 @@ pub fn spawn_decoder(
                 if next_pts <= shared.seek_floor() {
                     continue;
                 }
-                let bytes = &out.data(0)[..n * format.channels * 4];
+                let (first, last) =
+                    crate::disc::clip_interval(&frame.metadata()).map_or((0, n), |(from, to)| {
+                        let sample = |t: f64| {
+                            ((t - pts) * f64::from(format.rate))
+                                .ceil()
+                                .clamp(0.0, n as f64) as usize
+                        };
+                        (sample(from), sample(to))
+                    });
+                if first >= last {
+                    continue;
+                }
+                let pts = pts + first as f64 / f64::from(format.rate);
+                let bytes = &out.data(0)[first * format.channels * 4..last * format.channels * 4];
                 samples.clear();
                 samples.extend(
                     bytes

@@ -938,6 +938,11 @@ pub fn spawn_video_decoder(
                         }
                         let pts = frame.timestamp().map_or(next_pts, |t| t as f64 * time_base);
                         next_pts = pts + frame_duration;
+                        if crate::disc::clip_interval(&frame.metadata())
+                            .is_some_and(|(from, to)| pts < from || pts >= to)
+                        {
+                            continue;
+                        }
                         // Decoded only to reach the seek target from the keyframe before it.
                         if shared.exact() && pts + frame_duration / 2.0 < shared.seek_floor() {
                             continue;

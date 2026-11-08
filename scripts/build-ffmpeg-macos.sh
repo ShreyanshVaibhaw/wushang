@@ -74,7 +74,7 @@ demuxers=(mov matroska avi mpegts mpegps flv ogg asf ivf obu
           wav w64 aiff caf mp3 aac ac3 eac3 dts truehd flac
           h264 hevc m4v mpegvideo
           srt ass webvtt microdvd subviewer sami vobsub sup
-          hls rtsp sdp
+          hls rtsp sdp concat
           ape)
 protocols=(file data http https tls tcp udp rtp crypto concat)
 # ipod is the M4A flavour of MP4, which Convert writes when it has no MP3 encoder.
@@ -128,7 +128,7 @@ if grep -q 'did not match anything' configure.out; then
 fi
 grep -q '^License: LGPL version 2.1 or later$' configure.out ||
   { echo "not an LGPL v2.1+ build" >&2; exit 1; }
-for name in SECURETRANSPORT ZLIB HTTPS_PROTOCOL AVFOUNDATION_INDEV LIBDAV1D_DECODER \
+for name in CONCAT_DEMUXER SECURETRANSPORT ZLIB HTTPS_PROTOCOL AVFOUNDATION_INDEV LIBDAV1D_DECODER \
     LIBMP3LAME_ENCODER H264_VIDEOTOOLBOX_ENCODER HEVC_VIDEOTOOLBOX_ENCODER AAC_AT_ENCODER \
     H264_VIDEOTOOLBOX_HWACCEL AV1_VIDEOTOOLBOX_HWACCEL PRORES_VIDEOTOOLBOX_HWACCEL; do
   grep -q "^#define CONFIG_$name 1$" config.h config_components.h ||

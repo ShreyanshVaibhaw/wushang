@@ -10,10 +10,12 @@
 //! .iso is mounted read-only with hdiutil, out of Finder's sight, and read like a folder. No
 //! menus either way, and encrypted discs (CSS, AACS) don't play.
 
+use ffmpeg_next as ff;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+use std::sync::{Arc, Mutex};
 
 const DVD: &str = "dvd://";
 const BLURAY: &str = "bluray://";
@@ -66,11 +68,82 @@ fn strip(path: &Path) -> &str {
         .unwrap_or(p)
 }
 
-/// The URL FFmpeg opens for a disc address.
+/// Byte concatenation is only sufficient for DVDs, whose whole VOBs form the title.
 pub fn url(path: &Path) -> Result<String, String> {
     let title = main_title(path)?;
+    if !title.intervals.is_empty() {
+        return Err("Blu-ray clips require the playlist demuxer".into());
+    }
     let parts: Vec<String> = title.vobs.iter().map(|v| v.display().to_string()).collect();
     Ok(format!("concat:{}", parts.join("|")))
+}
+
+/// Open an internally generated concat script, so clip bounds and seek offsets survive.
+/// Local downloaded concat scripts remain blocked by session::open_file.
+pub fn open(path: &Path, cancel: &Arc<AtomicBool>) -> Result<ff::format::context::Input, String> {
+    let title = main_title(path)?;
+    let cancel = cancel.clone();
+    let fail = |e| format!("can't play the disc: {e}");
+    if title.intervals.is_empty() {
+        return ff::format::input_with_interrupt(&url(path)?, move || cancel.load(Relaxed))
+            .map_err(fail);
+    }
+    let io = ff::format::context::StreamIo::from_read_seek(std::io::Cursor::new(playlist_script(
+        &title,
+    )?))
+    .map_err(fail)?;
+    let mut options = ff::Dictionary::new();
+    options.set("safe", "0");
+    options.set("protocol_whitelist", "file");
+    options.set("format_whitelist", "concat,mpegts");
+    // Decoder preroll packets can straddle an in/out point. These tags let decoded frames
+    // and audio samples be clipped without discarding packets needed as codec references.
+    options.set("segment_time_metadata", "1");
+    ff::format::input_from_stream_with_interrupt(
+        io,
+        Some("wushang.ffconcat"),
+        Some(options),
+        move || cancel.load(Relaxed),
+    )
+    .map_err(fail)
+}
+
+fn playlist_script(title: &Title) -> Result<Vec<u8>, String> {
+    use std::fmt::Write;
+    let mut script = String::from("ffconcat version 1.0\n");
+    for (path, &(from, to)) in title.vobs.iter().zip(&title.intervals) {
+        let path = std::fs::canonicalize(path).map_err(|e| format!("can't find the clip: {e}"))?;
+        let path = path.to_str().ok_or("the clip name isn't valid Unicode")?;
+        if path.contains(['\n', '\r', '\0']) {
+            return Err("the clip name contains a control character".into());
+        }
+        // FFmpeg's quoted token grammar escapes an apostrophe outside the quoted portion.
+        let escaped = path.replace('\'', "'\\''");
+        writeln!(
+            script,
+            "file 'file:{escaped}'\ninpoint {:.6}\noutpoint {:.6}\nduration {:.6}",
+            f64::from(from) / 45_000.0,
+            f64::from(to) / 45_000.0,
+            f64::from(to - from) / 45_000.0
+        )
+        .unwrap();
+    }
+    Ok(script.into_bytes())
+}
+
+/// The selected interval in the rebased concat timeline, carried from packet to frame.
+pub fn clip_interval(metadata: &ff::DictionaryRef) -> Option<(f64, f64)> {
+    let value = |key| {
+        unsafe { crate::thumbs::tag(metadata.as_ptr(), key) }?
+            .parse::<i64>()
+            .ok()
+    };
+    let start = value(c"lavf.concatdec.start_time")?;
+    let duration = value(c"lavf.concatdec.duration")?;
+    (duration > 0).then_some((
+        start as f64 / 1_000_000.0,
+        start.checked_add(duration)? as f64 / 1_000_000.0,
+    ))
 }
 
 /// The main title of the DVD or Blu-ray at a disc address, with the length and chapters its
@@ -101,6 +174,8 @@ fn main_title(path: &Path) -> Result<Title, String> {
 #[derive(Debug, PartialEq)]
 pub struct Title {
     pub vobs: Vec<PathBuf>,
+    /// Blu-ray IN_time and OUT_time in 45 kHz ticks; DVDs use their whole VOBs.
+    intervals: Vec<(u32, u32)>,
     pub length: f64,
     pub chapters: Vec<f64>,
 }
@@ -128,6 +203,7 @@ pub fn dvd(root: &Path) -> Option<Title> {
         if !vobs.is_empty() && best.as_ref().is_none_or(|b| length > b.length) {
             best = Some(Title {
                 vobs,
+                intervals: Vec::new(),
                 length,
                 chapters,
             });
@@ -212,13 +288,14 @@ pub fn bluray(root: &Path) -> Option<Title> {
         let Some((clips, length, chapters)) = playlist_title(&bytes) else {
             continue;
         };
-        let vobs: Option<Vec<PathBuf>> = clips.iter().map(|c| clip_file(&bdmv, c)).collect();
+        let vobs: Option<Vec<PathBuf>> = clips.iter().map(|c| clip_file(&bdmv, &c.name)).collect();
         let Some(vobs) = vobs.filter(|v| !v.is_empty()) else {
             continue;
         };
         if best.as_ref().is_none_or(|b| length > b.length) {
             best = Some(Title {
                 vobs,
+                intervals: clips.iter().map(|c| (c.from, c.to)).collect(),
                 length,
                 chapters,
             });
@@ -243,7 +320,13 @@ fn clip_file(bdmv: &Path, name: &str) -> Option<PathBuf> {
 /// A Blu-ray playlist's clips in play order, its length, and its chapters' start times. Times
 /// count in 45 kHz ticks; each play item plays its clip from IN_time to OUT_time, and each entry
 /// mark is a chapter at a time inside one play item.
-fn playlist_title(mpls: &[u8]) -> Option<(Vec<String>, f64, Vec<f64>)> {
+struct PlayItem {
+    name: String,
+    from: u32,
+    to: u32,
+}
+
+fn playlist_title(mpls: &[u8]) -> Option<(Vec<PlayItem>, f64, Vec<f64>)> {
     if !mpls.starts_with(b"MPLS") {
         return None;
     }
@@ -263,7 +346,11 @@ fn playlist_title(mpls: &[u8]) -> Option<(Vec<String>, f64, Vec<f64>)> {
         starts.push(length);
         ins.push(from);
         length += f64::from(to.checked_sub(from)?) / TICKS;
-        clips.push(name.to_owned());
+        clips.push(PlayItem {
+            name: name.to_owned(),
+            from,
+            to,
+        });
         at = at.checked_add(2 + size)?;
     }
     let mut chapters = Vec::new();
@@ -453,6 +540,130 @@ mod tests {
     }
 
     #[test]
+    fn bluray_reuses_trimmed_clips_with_rebased_frames_and_seeks() {
+        use crate::{player, record, session};
+        use std::sync::atomic::Ordering::Relaxed;
+        use std::thread;
+        use std::time::{Duration, Instant};
+        ff::init().unwrap();
+        let root = std::env::temp_dir().join(format!("wushang-bd-clips-{}", std::process::id()));
+        let bdmv = root.join("Film | O'Brien").join("BDMV");
+        std::fs::create_dir_all(bdmv.join("PLAYLIST")).unwrap();
+        std::fs::create_dir_all(bdmv.join("STREAM")).unwrap();
+        std::fs::write(bdmv.join("index.bdmv"), b"INDX0200").unwrap();
+        let clip = bdmv.join("STREAM/00001.m2ts");
+        let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/test_tracks.mkv");
+        let mut source = session::open_file(&source).unwrap();
+        // The recorder chooses TS by extension, then the disc uses its normal .m2ts name.
+        let ts = clip.with_extension("ts");
+        let mut copy = record::Recorder::start(&source, &record::Sink::File(ts.clone())).unwrap();
+        for (_, packet) in source.packets() {
+            copy.push(&packet);
+        }
+        copy.play_to(f64::INFINITY);
+        copy.finish(0.0).unwrap();
+        std::fs::rename(ts, &clip).unwrap();
+        let raw = ff::format::input(&clip).unwrap();
+        let origin = unsafe { (*raw.as_ptr()).start_time }.max(0) as u32 * 45 / 1000;
+        drop(raw);
+        std::fs::write(
+            bdmv.join("PLAYLIST/00001.mpls"),
+            mpls(
+                &[
+                    ("00001", origin + 49_500, origin + 94_500),
+                    ("00001", origin + 139_500, origin + 184_500),
+                ],
+                &[(1, 0, origin + 49_500), (1, 1, origin + 139_500)],
+            ),
+        )
+        .unwrap();
+        let address = address(&bdmv).unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut input = session::open_input(
+            &address,
+            session::NetOptions {
+                timeout: 2,
+                reconnect: false,
+            },
+            &cancel,
+        )
+        .unwrap();
+        assert!((input.duration() as f64 / 1_000_000.0 - 2.0).abs() < 0.001);
+        let video = input.streams().best(ff::media::Type::Video).unwrap();
+        let index = video.index();
+        let base = f64::from(video.time_base());
+        let decoder =
+            player::open_video_decoder(video.parameters(), video.time_base(), None).unwrap();
+        let shared = Arc::new(player::Shared::new());
+        let packets = Arc::new(player::PacketQueue::default());
+        let frames = Arc::new(player::FrameQueue::default());
+        let worker = player::spawn_video_decoder(
+            decoder,
+            base,
+            1.0 / 30.0,
+            packets.clone(),
+            frames.clone(),
+            shared.clone(),
+        );
+        let (send, received) = std::sync::mpsc::channel();
+        let consume = {
+            let frames = frames.clone();
+            let shared = shared.clone();
+            thread::spawn(move || {
+                while !shared.quitting() {
+                    frames.with(|queue| {
+                        while let Some(frame) = queue.pop_front() {
+                            _ = send.send(frame.pts);
+                        }
+                    });
+                    thread::sleep(Duration::from_millis(1));
+                }
+            })
+        };
+        for (_, packet) in input.packets().filter(|(s, _)| s.index() == index) {
+            packets.push(player::Msg::Packet(packet));
+        }
+        packets.push(player::Msg::Eof);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !shared.video_done.load(Relaxed) {
+            assert!(Instant::now() < deadline);
+            thread::sleep(Duration::from_millis(5));
+        }
+        thread::sleep(Duration::from_millis(20));
+        shared.quit.store(true, Relaxed);
+        packets.close();
+        worker.join().unwrap();
+        consume.join().unwrap();
+        let times: Vec<_> = received.try_iter().collect();
+        assert!(times.len() >= 40, "too few selected frames: {times:?}");
+        assert!(
+            times.iter().all(|t| *t >= 0.0 && *t < 2.0),
+            "preroll leaked: {times:?}"
+        );
+        assert!(
+            times.windows(2).all(|t| t[1] >= t[0]),
+            "clip timeline stepped backwards: {times:?}"
+        );
+        input.seek(1_500_000, ..1_500_001).unwrap();
+        let mut packet = ff::Packet::empty();
+        packet.read(&mut input).unwrap();
+        // Seeking selects the second instance of the same source clip.
+        let tagged = packet
+            .side_data()
+            .find_map(|side| {
+                let fields: Vec<_> = side.data().split(|b| *b == 0).collect();
+                fields
+                    .windows(2)
+                    .find(|pair| pair[0] == b"lavf.concatdec.start_time")
+                    .map(|pair| pair[1].to_vec())
+            })
+            .unwrap();
+        assert_eq!(tagged, b"1000000");
+        drop(input);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn reads_the_main_title_and_its_chapters() {
         let root = std::env::temp_dir().join(format!("wushang-dvd-{}", std::process::id()));
         let dir = root.join("VIDEO_TS");
@@ -522,15 +733,19 @@ mod tests {
         .unwrap();
         let disc = super::address(&bdmv).unwrap();
         assert_eq!(disc, PathBuf::from(format!("bluray://{}", bd.display())));
-        let streams = bdmv.join("STREAM");
-        assert_eq!(
-            super::url(&disc).unwrap(),
-            format!(
-                "concat:{}|{}",
-                streams.join("00001.m2ts").display(),
-                streams.join("00002.m2ts").display()
-            )
-        );
+        // The script names clips by their real paths; macOS's temp dir sits behind a symlink.
+        let streams = std::fs::canonicalize(bdmv.join("STREAM")).unwrap();
+        let title = dvd_title(&disc).unwrap();
+        let script = String::from_utf8(playlist_script(&title).unwrap()).unwrap();
+        assert!(script.contains(&format!(
+            "file 'file:{}'",
+            streams.join("00001.m2ts").display()
+        )));
+        assert!(script.contains(&format!(
+            "file 'file:{}'",
+            streams.join("00002.m2ts").display()
+        )));
+        assert!(script.contains("inpoint 0.000000"));
         let title = dvd_title(&disc).unwrap();
         assert_eq!(title.length, 210.0);
         assert_eq!(title.chapters, [0.0, 60.0, 130.0]);
@@ -547,9 +762,9 @@ mod tests {
         assert!(made.success(), "hdiutil makehybrid failed");
         let image = super::address(&iso).unwrap();
         assert_eq!(image, PathBuf::from(format!("bluray://{}", iso.display())));
-        let url = super::url(&image).unwrap();
+        let url = String::from_utf8(playlist_script(&dvd_title(&image).unwrap()).unwrap()).unwrap();
         assert!(
-            url.starts_with("concat:") && url.ends_with("/BDMV/STREAM/00002.m2ts"),
+            url.starts_with("ffconcat version 1.0") && url.contains("/BDMV/STREAM/00002.m2ts"),
             "{url}"
         );
         assert!(
