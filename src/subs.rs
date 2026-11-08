@@ -1,11 +1,14 @@
 //! Subtitle cues, decoded from an embedded stream as the demuxer routes it or from an external
-//! file all at once. No drawing here; `captions` paints what `Cues::active` returns.
+//! file: all at once for text, around the playback position for pictures. No drawing here;
+//! `captions` paints what `Cues::active` returns.
 //!
 //! libavcodec turns every text format (SRT, ASS, WebVTT, mov_text, SAMI...) into ASS event lines,
 //! so one small ASS parser covers them all. Picture formats (DVD, DVB, PGS) arrive as palettized
 //! rects, converted here to premultiplied BGRA.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::Relaxed};
+use std::sync::mpsc::{SyncSender, sync_channel};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 
@@ -60,16 +63,42 @@ const DEFAULT_DURATION: f64 = 5.0;
 /// PGS pictures never carry a duration; each stays until an empty "clear" picture or the next
 /// one, which the demuxer delivers ahead of time, so they get a much longer guess.
 const PGS_HOLD: f64 = 60.0;
+// Bound decoded data as well as input bytes: a tiny PGS packet can expand to a full frame.
+const MAX_CUE_BYTES: usize = 32 << 20;
+const MAX_TRACK_BYTES: usize = 64 << 20;
+const MAX_CUES: usize = 20_000;
+const MAX_SPANS: usize = 100_000;
+const BITMAP_LOOKAHEAD: f64 = 5.0;
+/// The most the subtitle duration control stretches a cue (`main.rs` clamps it to this).
+const MAX_STRETCH: f64 = 4.0;
 
 /// A subtitle track's cues, filled by a decoder thread or loaded at once from a file. An ASS or
 /// SSA track goes to libass instead, which draws each moment whole.
 #[derive(Default)]
 pub struct Cues {
     list: Mutex<Vec<Entry>>,
+    retained_bytes: AtomicUsize,
+    exceeded: AtomicBool,
+    /// For an external bitmap track, the playback position: cues over before it are skipped.
+    floor: Mutex<Option<f64>>,
+    external: Option<ExternalBitmap>,
     ass: Option<crate::ass::Track>,
     /// Every cue's span seen so far, by start time's bits (starts are never negative, so the
     /// bits sort like the times). A seek clears `list` but not this, for the timeline.
     seen: Mutex<std::collections::BTreeMap<u64, f64>>,
+}
+
+/// One pending playback position is enough; stale scrub requests never form a backlog.
+struct ExternalBitmap {
+    send: SyncSender<f64>,
+    requested: Mutex<f64>,
+    cancel: Arc<AtomicBool>,
+}
+
+impl Drop for ExternalBitmap {
+    fn drop(&mut self) {
+        self.cancel.store(true, Relaxed);
+    }
 }
 
 struct Entry {
@@ -90,6 +119,14 @@ impl Cues {
     /// `active`, with each text or picture cue lasting `stretch` times as long; 0 leaves them
     /// as they are. libass draws its own timing.
     pub fn active_stretched(&self, t: f64, stretch: f64) -> Vec<Cue> {
+        if let Some(external) = &self.external
+            && t.is_finite()
+        {
+            let mut requested = external.requested.lock().unwrap();
+            if (t - *requested).abs() >= 0.25 && external.send.try_send(t.max(0.0)).is_ok() {
+                *requested = t;
+            }
+        }
         if let Some(track) = &self.ass {
             let (width, height) = track.size();
             return track
@@ -137,12 +174,32 @@ impl Cues {
     }
 
     pub fn clear(&self) {
-        self.list.lock().unwrap().clear();
+        let mut list = self.list.lock().unwrap();
+        list.clear();
+        self.retained_bytes.store(0, Relaxed);
+        self.exceeded.store(false, Relaxed);
     }
 
     #[cfg(test)]
     pub fn len(&self) -> usize {
         self.list.lock().unwrap().len()
+    }
+
+    /// Release expired pictures while keeping a compact, bounded timeline for seeking.
+    fn prune(&self, before: f64) {
+        let mut cues = self.list.lock().unwrap();
+        cues.retain(|e| still_showing(e.cue.start, e.cue.end, before));
+        self.retained_bytes.store(
+            cues.iter().map(|e| content_bytes(&e.cue.content)).sum(),
+            Relaxed,
+        );
+    }
+
+    fn accepts(&self, start: f64, end: f64) -> bool {
+        self.floor
+            .lock()
+            .unwrap()
+            .is_none_or(|t| still_showing(start, end, t))
     }
 
     /// Adds a cue in start order. With `open`, its end is only a guess.
@@ -157,6 +214,14 @@ impl Cues {
         if cues[same..at].iter().any(|e| e.cue.content == cue.content) {
             return;
         }
+        let bytes = content_bytes(&cue.content);
+        if bytes > MAX_CUE_BYTES
+            || cues.len() >= MAX_CUES
+            || self.retained_bytes.load(Relaxed).saturating_add(bytes) > MAX_TRACK_BYTES
+        {
+            self.exceeded.store(true, Relaxed);
+            return;
+        }
         if open && let Some(next) = cues.get(at) {
             cue.end = cue.end.min(next.cue.start).max(cue.start);
         }
@@ -167,6 +232,10 @@ impl Cues {
             seen.insert(e.cue.start.max(0.0).to_bits(), e.cue.end);
         }
         seen.insert(cue.start.max(0.0).to_bits(), cue.end);
+        while seen.len() > MAX_SPANS {
+            seen.pop_first();
+        }
+        self.retained_bytes.fetch_add(bytes, Relaxed);
         cues.insert(at, Entry { cue, open });
     }
 
@@ -175,6 +244,22 @@ impl Cues {
         let mut cues = self.list.lock().unwrap();
         let at = cues.partition_point(|e| e.cue.start < t);
         close_open(&mut cues[..at], t);
+    }
+}
+
+/// Whether a cue can still be onscreen at `t` with the longest duration stretch.
+fn still_showing(start: f64, end: f64, t: f64) -> bool {
+    start + (end - start) * MAX_STRETCH >= t
+}
+
+fn content_bytes(content: &CueContent) -> usize {
+    match content {
+        CueContent::Text(lines) => lines
+            .iter()
+            .flatten()
+            .map(|s| s.text.len() + std::mem::size_of::<Span>())
+            .sum(),
+        CueContent::Bitmap { rects, .. } => rects.iter().map(|r| r.bgra.len()).sum(),
     }
 }
 
@@ -233,6 +318,7 @@ pub fn spawn_embedded(
             match packets.pop() {
                 Some(Msg::Packet(p)) => {
                     if let Some(d) = &mut decoder {
+                        out.prune(shared.clock.get().unwrap_or(shared.seek_floor()));
                         d.decode(&p, &out);
                     }
                 }
@@ -276,9 +362,8 @@ fn spawn_styled(
     (handle, cues)
 }
 
-/// Reads a whole external subtitle file (.srt, .ass, .ssa, .vtt, .sub, .idx, .smi, .sup) with
-/// libavformat and decodes every cue up front. An .ass or .ssa file goes to libass whole, drawn on
-/// a `canvas` the video's size.
+/// Reads external text subtitles up front, with a decoded-size budget. Bitmap formats decode
+/// on a worker around the current playback position. ASS/SSA goes to libass on `canvas`.
 pub fn load_external(
     path: &Path,
     canvas: impl Into<crate::ass::Canvas>,
@@ -320,6 +405,14 @@ pub fn load_external(
         .ok_or_else(|| format!("no subtitles in {path:?}"))?;
     let index = stream.index();
     let mut decoder = Decoder::open(stream.parameters(), f64::from(stream.time_base()))?;
+    if matches!(
+        stream.parameters().id(),
+        ff::codec::Id::HDMV_PGS_SUBTITLE
+            | ff::codec::Id::DVD_SUBTITLE
+            | ff::codec::Id::DVB_SUBTITLE
+    ) {
+        return Ok(load_bitmap(path.to_owned(), input, decoder, index));
+    }
     // The whole file says far more about its code page than one cue does.
     if decoder.plain_text
         && let Ok(text) = std::fs::read(path)
@@ -331,12 +424,92 @@ pub fn load_external(
     loop {
         let mut packet = ff::Packet::empty();
         match packet.read(&mut input) {
-            Ok(()) if packet.stream() == index => decoder.decode(&packet, &cues),
+            Ok(()) if packet.stream() == index => {
+                decoder.decode(&packet, &cues);
+                if cues.exceeded.load(Relaxed) {
+                    return Err("the decoded subtitle track is too large".into());
+                }
+            }
             Ok(()) | Err(ff::Error::InvalidData) => {}
             Err(_) => break,
         }
     }
     Ok(Arc::new(cues))
+}
+
+/// Bitmap tracks decode around the requested position, never the entire movie on the UI thread.
+fn load_bitmap(
+    path: PathBuf,
+    mut input: ff::format::context::Input,
+    mut decoder: Decoder,
+    index: usize,
+) -> Arc<Cues> {
+    let (send, requests) = sync_channel(1);
+    let cancel = Arc::new(AtomicBool::new(false));
+    let cues = Arc::new(Cues {
+        external: Some(ExternalBitmap {
+            send: send.clone(),
+            requested: Mutex::new(0.0),
+            cancel: cancel.clone(),
+        }),
+        ..Default::default()
+    });
+    let weak = Arc::downgrade(&cues);
+    _ = send.send(0.0);
+    // Only Cues keeps a sender alive, so dropping the track wakes and stops an idle worker.
+    drop(send);
+    thread::spawn(move || {
+        let mut previous = 0.0;
+        let mut read_to = 0.0;
+        let mut eof = false;
+        while let Ok(mut target) = requests.recv() {
+            for newer in requests.try_iter() {
+                target = newer;
+            }
+            let Some(cues) = weak.upgrade() else { break };
+            if target < previous || target > read_to + PGS_HOLD {
+                // A picture shows until the next one, so start a hold early to find the one up.
+                let from = (target - PGS_HOLD).max(0.0);
+                let seek = (from * f64::from(ffi::AV_TIME_BASE)) as i64;
+                read_to = from;
+                if input.seek(seek, ..seek.saturating_add(1)).is_err() {
+                    let Ok(fresh) = crate::session::open_file(&path) else {
+                        break;
+                    };
+                    input = fresh;
+                    read_to = 0.0;
+                }
+                decoder.inner.flush();
+                cues.clear();
+                eof = false;
+            }
+            previous = target;
+            *cues.floor.lock().unwrap() = Some(target);
+            cues.prune(target);
+            // Checked before each read, so the packet that crosses the lookahead keeps its cue
+            // and a position already covered reads nothing more.
+            while !eof
+                && read_to <= target + BITMAP_LOOKAHEAD
+                && !cancel.load(Relaxed)
+                && weak.strong_count() > 1
+            {
+                let mut packet = ff::Packet::empty();
+                match packet.read(&mut input) {
+                    Ok(()) if packet.stream() == index => {
+                        read_to = packet
+                            .pts()
+                            .or(packet.dts())
+                            .map_or(read_to, |p| p as f64 * decoder.time_base);
+                        decoder.decode(&packet, &cues);
+                        cues.prune(target);
+                    }
+                    Ok(()) | Err(ff::Error::InvalidData) => {}
+                    Err(_) => eof = true,
+                }
+            }
+        }
+    });
+    cues
 }
 
 /// File types `find_external` picks up. A `.sub` next to an `.idx` of the same name is VobSub
@@ -424,7 +597,10 @@ impl Decoder {
     fn open(parameters: ff::codec::Parameters, time_base: f64) -> Result<Decoder, String> {
         let id = parameters.id();
         let mut ctx = ff::codec::Context::from_parameters(parameters).map_err(|e| e.to_string())?;
-        unsafe { (*ctx.as_mut_ptr()).pkt_timebase = ff::Rational::from(time_base).into() };
+        unsafe {
+            (*ctx.as_mut_ptr()).pkt_timebase = ff::Rational::from(time_base).into();
+            (*ctx.as_mut_ptr()).max_pixels = (MAX_CUE_BYTES / 4) as i64;
+        }
         let inner = ctx
             .decoder()
             .subtitle()
@@ -486,6 +662,9 @@ impl Decoder {
             0 | u32::MAX => (start + self.hold, true),
             ms => (base + f64::from(ms) / 1000.0, false),
         };
+        if !cues.accepts(start, end) {
+            return;
+        }
         let rects: &[*mut ffi::AVSubtitleRect] = if s.num_rects == 0 || s.rects.is_null() {
             &[]
         } else {
@@ -493,6 +672,7 @@ impl Decoder {
         };
         let mut lines = Vec::new();
         let mut bitmaps = Vec::new();
+        let mut bitmap_bytes = 0usize;
         for &rect in rects {
             let r = unsafe { &*rect };
             match r.type_ {
@@ -510,7 +690,23 @@ impl Decoder {
                         }]
                     }));
                 }
-                ffi::AVSubtitleType::SUBTITLE_BITMAP => bitmaps.extend(bitmap_rect(r)),
+                ffi::AVSubtitleType::SUBTITLE_BITMAP => {
+                    let Some(bytes) = bitmap_size(r.w, r.h) else {
+                        continue;
+                    };
+                    bitmap_bytes = bitmap_bytes.saturating_add(bytes);
+                    if bitmap_bytes > MAX_CUE_BYTES
+                        || cues
+                            .retained_bytes
+                            .load(Relaxed)
+                            .saturating_add(bitmap_bytes)
+                            > MAX_TRACK_BYTES
+                    {
+                        cues.exceeded.store(true, Relaxed);
+                        return;
+                    }
+                    bitmaps.extend(bitmap_rect(r));
+                }
                 _ => {}
             }
         }
@@ -576,11 +772,20 @@ fn recode(packet: &ff::Packet, data: &[u8], cp: u32) -> ff::Packet {
     out
 }
 
+fn bitmap_size(w: i32, h: i32) -> Option<usize> {
+    let bytes = usize::try_from(w)
+        .ok()?
+        .checked_mul(usize::try_from(h).ok()?)?
+        .checked_mul(4)?;
+    (bytes > 0 && bytes <= MAX_CUE_BYTES).then_some(bytes)
+}
+
 /// Converts a PAL8 rect (indices in data[0], ARGB palette in data[1]) to premultiplied BGRA.
 fn bitmap_rect(r: &ffi::AVSubtitleRect) -> Option<BitmapRect> {
     if r.w <= 0 || r.h <= 0 || r.data[0].is_null() || r.data[1].is_null() {
         return None;
     }
+    let bytes = bitmap_size(r.w, r.h)?;
     let (w, h) = (r.w as usize, r.h as usize);
     let colors = r.nb_colors.clamp(0, 256) as usize;
     let palette: Vec<[u8; 4]> =
@@ -592,12 +797,16 @@ fn bitmap_rect(r: &ffi::AVSubtitleRect) -> Option<BitmapRect> {
                 [premul(0), premul(8), premul(16), a as u8]
             })
             .collect();
-    let stride = r.linesize[0] as usize;
+    let stride = usize::try_from(r.linesize[0]).ok()?;
     if stride < w {
         return None;
     }
-    let indices = unsafe { std::slice::from_raw_parts(r.data[0], stride * (h - 1) + w) };
-    let mut bgra = Vec::with_capacity(w * h * 4);
+    let len = stride.checked_mul(h - 1)?.checked_add(w)?;
+    if len > isize::MAX as usize {
+        return None;
+    }
+    let indices = unsafe { std::slice::from_raw_parts(r.data[0], len) };
+    let mut bgra = Vec::with_capacity(bytes);
     for y in 0..h {
         for &i in &indices[y * stride..y * stride + w] {
             bgra.extend(palette.get(usize::from(i)).unwrap_or(&[0; 4]));
@@ -755,6 +964,145 @@ mod tests {
 
     fn close(a: f64, b: f64) -> bool {
         (a - b).abs() < 0.002
+    }
+
+    /// Small RLE packets with full-frame pictures reproduce the compressed bitmap attack.
+    fn pgs_file(count: u16) -> Vec<u8> {
+        let mut file = Vec::new();
+        let (w, h) = (1920u16, 1080u16);
+        for i in 0..count {
+            let mut pcs = Vec::new();
+            pcs.extend(w.to_be_bytes());
+            pcs.extend(h.to_be_bytes());
+            pcs.push(0x10);
+            pcs.extend(i.to_be_bytes());
+            pcs.extend([0x80, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0]);
+            let mut window = vec![1, 0, 0, 0, 0, 0];
+            window.extend(w.to_be_bytes());
+            window.extend(h.to_be_bytes());
+            let pixels = [0, 0xc7, 0x80, 1, 0, 0].repeat(h as usize);
+            let mut object = vec![0, 0, 0, 0xc0];
+            object.extend(&(pixels.len() as u32 + 4).to_be_bytes()[1..]);
+            object.extend(w.to_be_bytes());
+            object.extend(h.to_be_bytes());
+            object.extend(pixels);
+            for (kind, body) in [
+                (0x16, pcs),
+                (0x17, window),
+                (0x14, vec![0, 0, 1, 235, 128, 128, 255]),
+                (0x15, object),
+                (0x80, vec![]),
+            ] {
+                file.extend(b"PG");
+                file.extend((u32::from(i) * 180000).to_be_bytes());
+                file.extend((u32::from(i) * 180000).to_be_bytes());
+                file.push(kind);
+                file.extend((body.len() as u16).to_be_bytes());
+                file.extend(body);
+            }
+        }
+        file
+    }
+
+    #[test]
+    fn bitmap_files_decode_on_demand_and_seek_without_retaining_the_movie() {
+        let path = temp_dir("bounded-pgs").join("movie.sup");
+        let data = pgs_file(16);
+        assert!(data.len() < 110_000);
+        std::fs::write(&path, data).unwrap();
+        let cues = load_external(&path, (1920, 1080)).unwrap();
+        // Pictures start every 2 s. Playing through must find each one, including the one that
+        // crosses the lookahead; then a jump forward and one back must too.
+        let forward = (0..16).map(|i| f64::from(i) * 2.0 + 0.5);
+        for time in forward.chain([12.5, 2.5]) {
+            let want = (time / 2.0).floor() * 2.0;
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                let active = cues.active(time);
+                if active.len() == 1 && close(active[0].start, want) {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "not the picture from {want} at {time}"
+                );
+                thread::sleep(Duration::from_millis(5));
+            }
+            assert!(cues.retained_bytes.load(Relaxed) <= MAX_TRACK_BYTES);
+            assert!(cues.len() < 16, "the whole movie must not be retained");
+        }
+    }
+
+    /// DVD pictures are one packet each, so the packet that crosses the lookahead is a picture
+    /// of its own, which must be kept rather than read and dropped.
+    #[test]
+    fn bitmap_files_keep_the_picture_past_the_lookahead() {
+        ff::init().unwrap();
+        let path = temp_dir("bounded-dvd").join("movie.mkv");
+        let mut out = ff::format::output(&path).unwrap();
+        let mut stream = out
+            .add_stream(ff::encoder::find(ff::codec::Id::None))
+            .unwrap();
+        stream.set_parameters(dvd_parameters());
+        out.write_header().unwrap();
+        let base = f64::from(out.stream(0).unwrap().time_base());
+        for i in 0..12 {
+            let mut packet = ff::Packet::copy(&dvd_packet(100, 400, 64, 20, 1000));
+            let pts = (f64::from(i) * 2.0 / base) as i64;
+            packet.set_pts(Some(pts));
+            packet.set_dts(Some(pts));
+            packet.set_stream(0);
+            packet.write_interleaved(&mut out).unwrap();
+        }
+        out.write_trailer().unwrap();
+        drop(out);
+        let cues = load_external(&path, (720, 480)).unwrap();
+        for i in 0..12 {
+            let (want, time) = (f64::from(i) * 2.0, f64::from(i) * 2.0 + 0.5);
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !cues
+                .active(time)
+                .first()
+                .is_some_and(|c| close(c.start, want))
+            {
+                assert!(Instant::now() < deadline, "lost the picture from {want}");
+                thread::sleep(Duration::from_millis(5));
+            }
+        }
+    }
+
+    #[test]
+    fn decoded_cues_have_a_budget_and_expired_pixels_are_released() {
+        let cues = Cues::default();
+        let pixels: Arc<[u8]> = vec![0; 1 << 20].into();
+        for i in 0..100 {
+            cues.insert(
+                Cue {
+                    start: i as f64,
+                    end: i as f64 + 1.0,
+                    content: CueContent::Bitmap {
+                        width: 512,
+                        height: 512,
+                        rects: vec![BitmapRect {
+                            x: 0,
+                            y: 0,
+                            w: 512,
+                            h: 512,
+                            bgra: pixels.clone(),
+                        }],
+                    },
+                },
+                false,
+            );
+        }
+        assert!(cues.exceeded.load(Relaxed));
+        assert_eq!(cues.retained_bytes.load(Relaxed), MAX_TRACK_BYTES);
+        cues.prune(100.0);
+        assert_eq!(cues.retained_bytes.load(Relaxed), 0);
+        assert_eq!(cues.len(), 0);
+        assert_eq!(bitmap_size(-1, 10), None);
+        assert_eq!(bitmap_size(i32::MAX, i32::MAX), None);
+        assert_eq!(bitmap_size(1920, 1080), Some(8_294_400));
     }
 
     #[test]
@@ -1170,8 +1518,8 @@ mod tests {
         [&size.to_be_bytes()[..], &first.to_be_bytes(), &body].concat()
     }
 
-    #[test]
-    fn decodes_dvd_bitmaps() {
+    /// A 720x480 DVD subtitle stream whose colour 1 is 0x3366cc.
+    fn dvd_parameters() -> ff::codec::Parameters {
         let mut parameters = ff::codec::Parameters::new();
         parameters.set_medium(ff::media::Type::Subtitle);
         parameters.set_id(ff::codec::Id::DVD_SUBTITLE);
@@ -1183,6 +1531,12 @@ mod tests {
             std::ptr::copy_nonoverlapping(extradata.as_ptr(), (*p).extradata, extradata.len());
             (*p).extradata_size = extradata.len() as i32;
         }
+        parameters
+    }
+
+    #[test]
+    fn decodes_dvd_bitmaps() {
+        let parameters = dvd_parameters();
         let shared = Arc::new(Shared::new());
         let queue = Arc::new(PacketQueue::default());
         let (thread, cues) = spawn_embedded(
