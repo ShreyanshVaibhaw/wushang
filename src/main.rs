@@ -157,6 +157,24 @@ fn main() {
     }
 }
 
+/// The notice for `path` failing to open, since a launch from Finder has no terminal to read.
+fn cannot_play(path: &Path) -> String {
+    if !net::is_address(path) {
+        let name = path.file_name().unwrap_or(path.as_os_str());
+        return format!("Can't play {}", name.to_string_lossy());
+    }
+    let host = net::is_url_path(path)
+        .then(|| net::host_of(&path.to_string_lossy()))
+        .flatten();
+    match host {
+        Some(host) => format!("Can't play the stream from {host}"),
+        None if disc::is_disc_path(path) => {
+            "Can't play the disc (an encrypted one needs AACS or CSS keys)".to_owned()
+        }
+        None => "Can't open the capture device".to_owned(),
+    }
+}
+
 /// What the render loop owns besides the window: the library and the file playing.
 struct App {
     shared: Arc<Shared>,
@@ -395,20 +413,7 @@ impl App {
             }
             Err(e) => {
                 eprintln!("wushang: {e}");
-                if net::is_address(path) {
-                    let host = net::is_url_path(path)
-                        .then(|| net::host_of(&path.to_string_lossy()))
-                        .flatten();
-                    let line = match host {
-                        Some(host) => format!("Can't play the stream from {host}"),
-                        None if disc::is_disc_path(path) => {
-                            "Can't play the disc (an encrypted one needs AACS or CSS keys)"
-                                .to_owned()
-                        }
-                        None => "Can't open the capture device".to_owned(),
-                    };
-                    self.notice = Some((line, Instant::now()));
-                }
+                self.notice = Some((cannot_play(path), Instant::now()));
                 false
             }
         }
@@ -1512,10 +1517,11 @@ fn run() -> Result<(), Box<dyn Error>> {
         } else {
             app.play_file(path)
         };
-        if !opened {
-            return Err(format!("cannot play {path:?}").into());
+        // Otherwise the window opens on the library with the notice; only --play-and-exit, whose
+        // open above returns its error, has nothing to show.
+        if opened {
+            UI.with_borrow_mut(|ui| ui.show(Page::Player));
         }
-        UI.with_borrow_mut(|ui| ui.show(Page::Player));
     }
 
     let mut shown_title = window_title(app.session.as_ref());
@@ -1541,8 +1547,8 @@ fn run() -> Result<(), Box<dyn Error>> {
     // same reason; here the main thread asks for the user-interactive class.
     platform::raise_thread_priority();
 
-    // Started on a file, it plays; the welcome waits for a launch without one.
-    if first_run && path.is_none() {
+    // Started on a file, it plays; the welcome waits for a launch without one, or one that failed.
+    if first_run && app.session.is_none() && app.opening.is_none() {
         let folder = videos_folder(&app.library);
         UI.with_borrow_mut(|ui| ui.open_onboarding(settings.clone(), folder));
     }
@@ -3945,4 +3951,21 @@ fn fit_mini(win: Window, queue: bool) {
 /// Native fullscreen on the window's screen, and back.
 fn toggle_fullscreen(win: Window) {
     win.toggle_fullscreen();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_failed_open_says_what_failed() {
+        let line = |path: &str| cannot_play(Path::new(path));
+        assert_eq!(line("/Movies/Holiday.mp4"), "Can't play Holiday.mp4");
+        assert_eq!(line("/Movies/Shows"), "Can't play Shows");
+        assert_eq!(
+            line("https://example.com/live.m3u8"),
+            "Can't play the stream from example.com"
+        );
+        assert!(line("screen://").starts_with("Can't open the capture"));
+    }
 }

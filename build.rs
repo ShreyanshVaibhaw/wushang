@@ -8,4 +8,8 @@ fn main() {
     println!("cargo:rustc-link-arg-bins=-Wl,-headerpad_max_install_names");
     // Where the bundled dylibs sit, for anything that names them by @rpath.
     println!("cargo:rustc-link-arg-bins=-Wl,-rpath,@executable_path/../Frameworks");
+    // cpal's loopback device needs AudioHardwareDestroyProcessTap, from macOS 14.2. wushang never
+    // makes one, but a strong import would stop dyld loading the app on anything older, so
+    // Core Audio's symbols bind if they exist. scripts/bundle-macos.sh checks none slips back.
+    println!("cargo:rustc-link-arg-bins=-Wl,-weak_framework,CoreAudio");
 }

@@ -196,7 +196,45 @@ needed="$(for f in "$app/Contents/MacOS/wushang" "$frameworks"/*.dylib; do
   otool -l "$f" | awk '/LC_BUILD_VERSION/ {b = 1} b && /minos/ {print $2; exit}'
 done | sort -V | tail -n 1)"
 if [ "$(printf '%s\n%s\n' "$wanted" "$needed" | sort -V | tail -n 1)" != "$wanted" ]; then
-  echo "warning: the libraries were built for macOS $needed, so the app needs it, not $wanted" >&2
+  echo "the libraries were built for macOS $needed, so the app needs it, not $wanted" >&2
+  exit 1
+fi
+
+# A part can say macOS 13 and still not load there: dyld stops at launch on a strong import the
+# running system lacks. Every strong import of the exe and its libraries is compiled against the
+# minimum, and clang names any that are newer. It reads each framework's every header, since an
+# umbrella header can leave one out, as CoreAudio.h does AudioHardwareTapping.h.
+imports="$(mktemp -d)/imports.m"
+sdk="$(xcrun --show-sdk-path)"
+{
+  for f in "$app/Contents/MacOS/wushang" "$frameworks"/*.dylib; do otool -L "$f"; done |
+    sed -n 's|.*/System/Library/Frameworks/\([^./]*\)\.framework/.*|\1|p' | sort -u |
+    while read -r framework; do
+      for header in "$sdk/System/Library/Frameworks/$framework.framework/Headers"/*.h; do
+        [ -f "$header" ] && printf '#import <%s/%s>\n' "$framework" "$(basename "$header")"
+      done
+    done
+  echo 'void use(void *);'
+  echo 'void check(void) {'
+  for f in "$app/Contents/MacOS/wushang" "$frameworks"/*.dylib; do dyld_info -imports "$f"; done |
+    awk '/ \(from / && !/weak-import/ {print substr($2, 2)}' | grep -E '^[A-Za-z_][A-Za-z0-9_]*$' |
+    sort -u | sed 's/.*/use((void *)\&&);/'
+  echo '}'
+} > "$imports"
+scan="$(clang -fsyntax-only -ferror-limit=0 -Wunguarded-availability-new \
+  -target "arm64-apple-macos$wanted" "$imports" 2>&1 || true)"
+rm -rf "$(dirname "$imports")"
+# Names no header declares are expected; a scan that stopped early proves nothing.
+if grep -q 'fatal error:' <<<"$scan"; then
+  echo "can't check the app's imports:" >&2
+  grep 'fatal error:' <<<"$scan" >&2
+  exit 1
+fi
+too_new="$(grep 'is only available on' <<<"$scan" || true)"
+if [ -n "$too_new" ]; then
+  echo "the app wouldn't load on macOS $wanted:" >&2
+  echo "$too_new" >&2
+  exit 1
 fi
 
 # Signed inside out: each library, then the app, whose seal covers them. install_name_tool

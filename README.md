@@ -360,7 +360,8 @@ It sets `FFMPEG_DIR` and `MACOSX_DEPLOYMENT_TARGET=13.0` for its own release bui
 The script takes FFmpeg from `FFMPEG_DIR` and libass from `LIBASS_DIR` (by default `../tools/ffmpeg-9.0.2-wushang` and `../tools/libass-0.17.5`), and stops at an exe that needs a library from anywhere else, such as Homebrew's GPL FFmpeg.
 It builds with your home folder cut out of the source paths the exe embeds, so the app doesn't carry your user name.
 It copies every library the exe links, and libass, into `Contents/Frameworks` and points the exe and each library at the copies, fills in the version from Cargo.toml in [assets/macos/Info.plist](assets/macos/Info.plist), draws the icon from `assets/wushang.svg` when the SVG has changed, and copies the licence files into `Contents/Resources`.
-It warns when a library was built for a newer macOS than the Info.plist's minimum, signs the libraries and then the app ad hoc, and checks the signature.
+It stops when a library was built for a newer macOS than the Info.plist's minimum, or when the exe or a library has a strong import that macOS doesn't have, since either would keep the app from loading there.
+Then it signs the libraries and then the app ad hoc, and checks the signature.
 
 - `scripts/bundle-macos.sh --no-build` bundles the release exe already built.
 - `WUSHANG_EXE=/path/to/exe scripts/bundle-macos.sh --no-build` bundles another exe.
