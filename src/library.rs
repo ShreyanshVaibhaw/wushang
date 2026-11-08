@@ -1049,7 +1049,6 @@ impl Library {
     }
 
     /// The files of a playlist in order. Relative lines resolve against the playlists folder.
-    // ponytail: URL and file:// lines come out as bogus paths; parse them when network streams land.
     pub fn playlist_items(&self, name: &str) -> Vec<PathBuf> {
         let Ok(file) = self.playlist_file(name) else {
             return Vec::new();
@@ -1062,7 +1061,16 @@ impl Library {
             .lines()
             .map(|l| l.trim_start_matches('\u{feff}').trim())
             .filter(|l| !l.is_empty() && !l.starts_with('#'))
-            .map(|l| dir.join(l))
+            .filter_map(|line| {
+                if net::is_url(line) {
+                    net::normalize_url(line).ok().map(PathBuf::from)
+                } else if line.contains("://") {
+                    // Imported playlists must not open capture devices or other FFmpeg protocols.
+                    None
+                } else {
+                    Some(dir.join(line))
+                }
+            })
             .collect()
     }
 
@@ -1901,6 +1909,32 @@ mod tests {
             assert!(lib.add_to_playlist(bad, &a).is_err(), "{bad:?}");
         }
         assert_eq!(lib.playlists().len(), 2);
+    }
+
+    #[test]
+    fn playlists_preserve_streams_and_relative_files_but_reject_other_protocols() {
+        let tmp = TempDir::new();
+        let mut lib = Library::open(&tmp.0, false);
+        let url = Path::new("https://example.com/live.mp3?token=123");
+        lib.create_playlist("Mixed").unwrap();
+        lib.add_to_playlist("Mixed", url).unwrap();
+        assert_eq!(lib.playlist_items("Mixed"), [url]);
+        assert!(net::is_url_path(&lib.playlist_items("Mixed")[0]));
+        let file = lib.playlist_file("Mixed").unwrap();
+        fs::write(&file, "#EXTM3U\nhttps://example.com/live.mp3?token=123\n../music/song.mp3\nudp://239.1.2.3:1234\nfile:///etc/passwd\navfoundation://video=Camera\ndshow://video=Camera\nhttps://\nhttps://example.com/bad address\n").unwrap();
+        assert_eq!(
+            lib.playlist_items("Mixed"),
+            [
+                url.to_path_buf(),
+                lib.playlist_dir().join("../music/song.mp3"),
+                PathBuf::from("udp://239.1.2.3:1234")
+            ]
+        );
+        let reloaded = Library::open(&tmp.0, false);
+        assert_eq!(
+            reloaded.media_in(&Place::Playlist("Mixed".into())),
+            lib.playlist_items("Mixed")
+        );
     }
 
     #[test]
