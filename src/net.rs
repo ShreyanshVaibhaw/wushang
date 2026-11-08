@@ -193,7 +193,7 @@ fn decode_entities(s: &str) -> String {
     while let Some(at) = rest.find('&') {
         out.push_str(&rest[..at]);
         let after = &rest[at + 1..];
-        let Some(end) = after.find(';').filter(|e| *e <= 10) else {
+        let Some(end) = after.as_bytes().iter().take(11).position(|&b| b == b';') else {
             out.push('&');
             rest = after;
             continue;
@@ -642,6 +642,57 @@ impl Fetcher {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    #[test]
+    fn malformed_entities_do_not_block_later_feed_requests() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            for title in ["&".repeat(1 << 20), "Next feed".into()] {
+                let (mut socket, _) = listener.accept().unwrap();
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut request = [0; 1024];
+                _ = socket.read(&mut request).unwrap();
+                let body = format!(
+                    "<rss><channel><title>{title}</title><item><enclosure url=\"https://example.com/a.mp3\"/></item></channel></rss>"
+                );
+                write!(
+                    socket,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .unwrap();
+            }
+        });
+        let fetcher = Fetcher::new();
+        fetcher.feed(&format!("{base}/malformed"), Duration::from_secs(5));
+        fetcher.feed(&format!("{base}/next"), Duration::from_secs(5));
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let mut titles = Vec::new();
+        while titles.len() < 2 {
+            for result in fetcher.take_ready() {
+                if let Fetched::Feed { result, .. } = result {
+                    titles.push(result.unwrap().title);
+                }
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the malformed feed blocked the worker"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(titles[0].len(), 1 << 20);
+        assert_eq!(titles[1], "Next feed");
+        server.join().unwrap();
+        assert_eq!(
+            decode_entities("é&unterminatedé& amp; &amp; &#233;"),
+            "é&unterminatedé& amp; & é"
+        );
+    }
 
     #[test]
     fn urls_are_recognised_and_tidied() {
