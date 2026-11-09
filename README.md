@@ -217,7 +217,8 @@ Click a tab to show it, or use ⇧⌘] and ⇧⌘[ (or ⌃Tab and ⌃⇧Tab) for
 
 Only the tab on screen is heard.
 The others play on silently, marked with a small play sign, so switching to one shows its picture at once and brings its sound back.
-Each tab keeps its own queue, position, tracks, subtitles and picture settings; the volume, mute, output device and sound effects are the window's.
+Each tab keeps its own queue, position, tracks, subtitles, picture settings, volume, mute and sound effects (speed, audio delay, equalizer and stereo mode), so a change in one tab leaves the others as they were.
+A new tab starts at the volume of the tab it was opened from, unmuted, with the sound effects in Settings; the output device is the window's.
 ⌘W (File > Close Tab, or a tab's ×) closes a tab and keeps its place, as Stop does, and closing the last tab stops playback.
 When the tabs get narrow they drop their × and then show only their number; ⌘W still closes them.
 

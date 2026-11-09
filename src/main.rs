@@ -760,27 +760,23 @@ impl App {
         }
     }
 
-    /// Makes tab `i` the one on screen and heard. It takes over the volume and mute, and the
-    /// window's keys and seek bar act on it from now on.
+    /// Makes tab `i` the one on screen and heard, at its own volume and mute; the window's keys
+    /// and seek bar act on it from now on.
     fn show_tab(&mut self, i: usize) {
         if i >= self.tabs.len() {
             return;
         }
-        let from = self.tab().shared.clone();
         if i != self.active {
             // A drag of the seek bar ends with the tab it was on.
             self.tab_mut().scrub(None);
         }
         self.active = i;
-        self.sync_active(&from);
+        self.sync_active();
     }
 
-    /// After the tab on screen changed: it is heard, at the volume and mute `from` had, the
-    /// others silenced, and the window's keys, seek bar, title bar and popups follow it.
-    fn sync_active(&self, from: &Shared) {
-        let shared = &self.tab().shared;
-        shared.set_volume(from.volume());
-        shared.muted.store(from.muted.load(Relaxed), Relaxed);
+    /// After the tab on screen changed: it is heard and the others silenced, and the window's
+    /// keys, seek bar, title bar and popups follow it.
+    fn sync_active(&self) {
         for (i, tab) in self.tabs.iter().enumerate() {
             tab.shared.silenced.store(i != self.active, Relaxed);
         }
@@ -803,10 +799,9 @@ impl App {
         if self.tabs.len() == 1 {
             return;
         }
-        let from = self.tab().shared.clone();
         self.active = active_after_close(self.active, i, self.tabs.len());
         self.tabs.remove(i);
-        self.sync_active(&from);
+        self.sync_active();
     }
 
     /// Whether a tab can open; if not, the notice says to close one first. An empty tab on
@@ -838,10 +833,8 @@ impl App {
         let added = !self.tab().is_empty();
         if added {
             let tab = Tab::new(&prefs());
-            // The audio delay is the window's, as the equaliser is.
-            tab.audio
-                .effects()
-                .set_delay(self.tab().audio.effects().delay());
+            // From then on its volume is its own, as its mute and sound effects are.
+            tab.shared.set_volume(self.tab().shared.volume());
             self.tabs.push(tab);
             self.show_tab(self.tabs.len() - 1);
         }
@@ -947,14 +940,6 @@ impl App {
         }
     }
 
-    /// Applies a change to the sound effects to every tab's output: like the volume, they are
-    /// the window's, not one tab's. Speed is each file's own.
-    fn all_effects(&self, change: impl Fn(&dsp::Effects)) {
-        for tab in &self.tabs {
-            change(tab.audio.effects());
-        }
-    }
-
     /// Applies one change from the popups.
     fn apply(&mut self, win: Window, action: PanelAction) {
         let effects = self.tab().audio.effects();
@@ -979,23 +964,21 @@ impl App {
                 effects.set_speed(v);
                 self.tab().shared.clock.set_speed(effects.speed());
             }
-            PanelAction::SetAudioDelay(v) => self.all_effects(|e| e.set_delay(v)),
+            PanelAction::SetAudioDelay(v) => effects.set_delay(v),
             PanelAction::SetSubDelay(v) => self.tab_mut().sub_delay = v.clamp(-10.0, 10.0),
-            PanelAction::SetEqPreset(i) => self.all_effects(|e| e.set_eq(i)),
+            PanelAction::SetEqPreset(i) => effects.set_eq(i),
             PanelAction::SetEqBand(band, db) => {
                 let eq = effects.eq();
                 let mut bands = eq.bands;
                 bands[band] = db;
-                self.all_effects(|e| e.set_eq_bands(bands, eq.preamp));
+                effects.set_eq_bands(bands, eq.preamp);
             }
             PanelAction::SetPreamp(db) => {
                 let bands = effects.eq().bands;
-                self.all_effects(|e| e.set_eq_bands(bands, db + dsp::PREAMP_UNITY_DB));
+                effects.set_eq_bands(bands, db + dsp::PREAMP_UNITY_DB);
             }
-            PanelAction::SetTwoPass(on) => self.all_effects(|e| e.set_two_pass(on)),
-            PanelAction::SetStereo(i) => {
-                self.all_effects(|e| e.set_stereo(StereoMode::ALL[i.min(4)]))
-            }
+            PanelAction::SetTwoPass(on) => effects.set_two_pass(on),
+            PanelAction::SetStereo(i) => effects.set_stereo(StereoMode::ALL[i.min(4)]),
             PanelAction::SetFlip(f) => {
                 self.tab_mut().adjust.flip = match f {
                     1 => Flip::Horizontal,
@@ -1280,8 +1263,10 @@ impl App {
                 let name = (!new.device.is_empty()).then_some(new.device.as_str());
                 tab.audio.switch_to(name);
             }
-            apply_effects(&tab.audio, Some(&old), &new);
         }
+        // Like the popups, Settings' sound effects change the tab on screen; tabs opened later
+        // start with them.
+        apply_effects(&self.tab().audio, Some(&old), &new);
         self.caption = new.caption();
         ui::theme::set(theme_of(&new));
         PREFS.set(new);
@@ -4402,8 +4387,8 @@ mod tests {
         let (sound, silent) = (data.join("test_60s.mp4"), data.join("test_60s_noaudio.mp4"));
         let p = Prefs::default();
         let mut app = App::new(Tab::new(&p), None, &p, &dir);
-        app.sync_active(&app.tab().shared.clone());
-        // Tests play on the real device; the mute passes to every tab shown.
+        app.sync_active();
+        // Tests play on the real device: mute the first tab, the only one whose file has sound.
         app.tab().shared.toggle_mute();
 
         assert!(app.play_file(&sound));
@@ -4415,7 +4400,14 @@ mod tests {
                 .collect()
         };
         assert_eq!(silenced(&app), [true, false]);
-        assert!(app.tab().shared.muted.load(Relaxed), "the mute came along");
+        // Each tab has its own volume and mute: a new one starts at the volume of the tab it
+        // was opened from, but unmuted.
+        assert!(
+            !app.tab().shared.muted.load(Relaxed),
+            "the mute stays with its tab"
+        );
+        assert!(app.tabs[0].shared.muted.load(Relaxed));
+        assert_eq!(app.tab().shared.volume(), app.tabs[0].shared.volume());
         let on_screen =
             |app: &App| Arc::ptr_eq(SHARED.lock().unwrap().as_ref().unwrap(), &app.tab().shared);
         assert!(on_screen(&app));
@@ -4432,12 +4424,30 @@ mod tests {
         assert!(passes(&mut app, 5.0, |app| frame(app, 0) > before + 0.3));
         assert!(passes(&mut app, 5.0, |app| position(app, 0) > 1.5));
 
-        // Switching moves the sound and the window's keys and seek bar.
+        // The keys and the popups change the tab on screen alone.
+        let volume = app.tabs[0].shared.volume();
+        SHARED.lock().unwrap().as_ref().unwrap().set_volume(0.5);
+        app.apply(Window, PanelAction::SetEqPreset(Some(2)));
+        app.apply(Window, PanelAction::SetAudioDelay(0.25));
+        let heard = |app: &App, i: usize| {
+            let (shared, effects) = (&app.tabs[i].shared, app.tabs[i].audio.effects());
+            let muted = shared.muted.load(Relaxed);
+            (shared.volume(), muted, effects.eq().preset, effects.delay())
+        };
+        let (first, second) = ((volume, true, None, 0.0), (0.5, false, Some(2), 0.25));
+        assert_eq!((heard(&app, 0), heard(&app, 1)), (first, second));
+
+        // Switching moves the sound and the window's keys and seek bar, and each tab keeps the
+        // volume, mute and sound it had.
         app.show_tab(tab_step(app.active, app.tabs.len(), 1));
         assert_eq!(app.active, 0);
         assert_eq!(silenced(&app), [false, true]);
         assert!(on_screen(&app));
         assert_eq!(f64::from_bits(DURATION.load(Relaxed)), 60.0);
+        assert_eq!((heard(&app, 0), heard(&app, 1)), (first, second));
+        app.show_tab(1);
+        assert_eq!((heard(&app, 0), heard(&app, 1)), (first, second));
+        app.show_tab(0);
 
         // Closing the tab on screen keeps its place and shows its neighbour, which plays on.
         app.close_tab(0);
