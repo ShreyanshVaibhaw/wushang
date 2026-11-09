@@ -287,3 +287,164 @@ fn render_check_popup() {
     s.panel = Some(&data);
     shoot(&ctx, &mut painter, &s, "popup");
 }
+
+#[test]
+#[ignore = "writes PNGs to look at"]
+fn render_check_tabs() {
+    const TITLES: [&str; 8] = [
+        "Big Buck Bunny (2008)",
+        "Sintel",
+        "Tears of Steel, the extended cut with a long name",
+        "Elephants Dream",
+        "Cosmos Laundromat",
+        "Spring",
+        "Agent 327: Operation Barbershop",
+        "Caminandes 3: Llamigos",
+    ];
+    // Name, window size, tab count, the tab on screen, the tabs playing, what's hovered and
+    // whether the bars float over fullscreen video.
+    type Shot = (
+        &'static str,
+        (f32, f32),
+        usize,
+        usize,
+        &'static [usize],
+        Option<Hit>,
+        bool,
+    );
+    let shots: [Shot; 10] = [
+        ("1", (1280.0, 720.0), 1, 0, &[0], None, false),
+        (
+            "1-new-hover",
+            (1280.0, 720.0),
+            1,
+            0,
+            &[0],
+            Some(Hit::NewTab),
+            false,
+        ),
+        ("3", (1280.0, 720.0), 3, 0, &[0, 2], None, false),
+        (
+            "3-tab-hover",
+            (1280.0, 720.0),
+            3,
+            0,
+            &[0, 2],
+            Some(Hit::Tab(1)),
+            false,
+        ),
+        (
+            "3-close-hover",
+            (1280.0, 720.0),
+            3,
+            1,
+            &[0, 1],
+            Some(Hit::CloseTab(2)),
+            false,
+        ),
+        ("3-fullscreen", (1280.0, 720.0), 3, 1, &[0, 2], None, true),
+        (
+            "4-800",
+            (800.0, 450.0),
+            4,
+            1,
+            &[0, 3],
+            Some(Hit::Tab(2)),
+            false,
+        ),
+        (
+            "8-800",
+            (800.0, 450.0),
+            8,
+            2,
+            &[0, 5],
+            Some(Hit::Tab(4)),
+            false,
+        ),
+        (
+            "8-1920",
+            (1920.0, 1080.0),
+            8,
+            2,
+            &[0, 5],
+            Some(Hit::Tab(4)),
+            false,
+        ),
+        (
+            "8-1920-close-hover",
+            (1920.0, 1080.0),
+            8,
+            7,
+            &[0, 5],
+            Some(Hit::CloseTab(7)),
+            false,
+        ),
+    ];
+    let browse = Browse::new();
+    let style = CaptionStyle::default();
+    for light in [false, true] {
+        theme::set(theme::Theme {
+            light,
+            ..Default::default()
+        });
+        let (ctx, mut painter) = painter();
+        for (name, (w, h), n, active, playing, hover, fullscreen) in shots {
+            let tabs: Vec<TabInfo> = (0..n)
+                .map(|i| TabInfo {
+                    title: TITLES[i].to_owned(),
+                    playing: playing.contains(&i),
+                })
+                .collect();
+            let mut layout = Layout::new(w, h, true, fullscreen);
+            layout.add_tabs(n);
+            let mut s = scene(&layout, &browse, &style);
+            s.tabs = &tabs;
+            s.active_tab = active;
+            s.title = TITLES[active];
+            s.hover = hover;
+            s.fullscreen = fullscreen;
+            let theme = if light { "light" } else { "dark" };
+            shoot(&ctx, &mut painter, &s, &format!("tabs-{name}-{theme}"));
+        }
+    }
+    theme::set(theme::Theme::default());
+
+    // Title bar groups other than the design's: one reaching past the title's usual start, and
+    // none at all.
+    let (ctx, mut painter) = painter();
+    let mut busy = Toolbar::default();
+    busy.title.push(toolbar::Item::FileName);
+    let empty = Toolbar {
+        title: Vec::new(),
+        ..Toolbar::default()
+    };
+    for (name, t, n) in [("1-busy-800", busy, 1), ("8-empty-800", empty, 8)] {
+        let tabs: Vec<TabInfo> = TITLES[..n]
+            .iter()
+            .map(|title| TabInfo {
+                title: (*title).to_owned(),
+                playing: false,
+            })
+            .collect();
+        let mut layout = Layout::player(800.0, 450.0, true, false, &t);
+        layout.add_tabs(n);
+        let mut s = scene(&layout, &browse, &style);
+        s.tabs = &tabs;
+        shoot(&ctx, &mut painter, &s, &format!("tabs-{name}-dark"));
+    }
+}
+
+#[test]
+#[ignore = "writes PNGs to look at"]
+fn render_check_shortcuts() {
+    let (ctx, mut painter) = painter();
+    let mut ui = Ui::new();
+    ui.open_dialog(Dialog::Shortcuts);
+    let mut layout = Layout::new(1280.0, 1200.0, true, false);
+    painter.add_dialog(&mut layout, ui.dialog.as_ref().unwrap());
+    let browse = Browse::new();
+    let style = CaptionStyle::default();
+    let mut s = scene(&layout, &browse, &style);
+    s.dialog = ui.dialog.as_ref();
+    shoot(&ctx, &mut painter, &s, "shortcuts");
+}

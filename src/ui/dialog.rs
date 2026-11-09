@@ -125,7 +125,7 @@ const FG_BUTTON_OFF: u32 = 0x606060;
 /// The keys main.rs handles, for the Keyboard Shortcuts dialog.
 // ponytail: a copy of on_key and the menus' accelerators; one table both read would keep them
 // in step.
-const SHORTCUTS: [(&str, &str); 25] = [
+const SHORTCUTS: [(&str, &str); 30] = [
     ("Space", "Play or pause"),
     ("Left / Right", "Skip back or forward (Settings > Controls)"),
     ("⌥ / ⇧ / ⌘ + arrows", "Very short, medium or long skip"),
@@ -145,6 +145,11 @@ const SHORTCUTS: [(&str, &str); 25] = [
     ("⌘F", "Open a folder"),
     ("⌘N", "Open a network stream"),
     ("⌘D", "Open a DVD or Blu-ray folder"),
+    ("⌘T", "Open files in a new tab"),
+    ("⌘W", "Close the tab"),
+    ("⇧⌘] or ⌃Tab", "Next tab"),
+    ("⇧⌘[ or ⌃⇧Tab", "Previous tab"),
+    ("⌘1 to ⌘8, ⌘9", "That tab, or the last tab"),
     ("⌘R", "Convert to MP4, saved in Movies/wushang"),
     ("⌘P or ⌘,", "Settings"),
     ("⌘M", "Mini player, and back"),

@@ -15,6 +15,7 @@ pub mod preferences;
 pub mod queue;
 #[cfg(test)]
 mod render_check;
+mod tabs;
 pub mod theme;
 pub mod toolbar;
 
@@ -245,8 +246,11 @@ pub struct Layout {
     preferences: Option<preferences::Geometry>,
     onboarding: Option<onboarding::Geometry>,
     customize: Option<customize::Geometry>,
-    /// How many tabs the player's title bar has room laid out for; see `add_tabs`.
+    /// How many tabs the player's title bar is laid out for, the strip of them (two or more) and
+    /// the new-tab button; see `add_tabs`.
     tab_count: usize,
+    tab_slots: Vec<tabs::Slot>,
+    new_tab: Option<Rect>,
 }
 
 impl Layout {
@@ -322,16 +326,6 @@ impl Layout {
             tools,
             ..Default::default()
         }
-    }
-
-    /// Lays the player's title bar out for `count` tabs.
-    pub fn add_tabs(&mut self, count: usize) {
-        self.tab_count = count;
-    }
-
-    /// The tab count `add_tabs` laid out for, so a change of count relayouts.
-    pub fn tab_count(&self) -> usize {
-        self.tab_count
     }
 
     pub fn has_overlay(&self) -> bool {
@@ -1331,6 +1325,8 @@ pub struct Painter {
     mini: mini::Resources,
     onboard: onboarding::Resources,
     custom: customize::Resources,
+    /// The title bar's tabs.
+    strip: tabs::Resources,
     /// The bar items' icons, and their lit versions for repeat, shuffle and favourite.
     tools: HashMap<ToolItem, Svg>,
     tools_on: HashMap<ToolItem, Svg>,
@@ -1385,6 +1381,7 @@ impl Painter {
             mini: mini::Resources::new(ctx, &dwrite, &fonts)?,
             onboard: onboarding::Resources::new(ctx, &dwrite, &fonts)?,
             custom: customize::Resources::new(ctx, &factory, &dwrite, &fonts)?,
+            strip: tabs::Resources::new(ctx, &dwrite, &fonts)?,
             tools: tool_icons(ctx, false)?,
             tools_on: tool_icons(ctx, true)?,
             skip_text: text_format(
@@ -1797,7 +1794,7 @@ impl Painter {
     }
 
     unsafe fn title_bar(&self, rt: &ID2D1RenderTarget, ctx: &ID2D1DeviceContext5, s: &Scene) {
-        let (i, w) = (&self.icons, s.layout.width);
+        let i = &self.icons;
         unsafe {
             self.icon(ctx, &i.logo, 13.0, 8.0, false);
             // The library page has its own sidebar and breadcrumb; the player's title bar group
@@ -1816,17 +1813,18 @@ impl Painter {
                 self.hover_box(rt, s, Hit::More);
                 self.icon(ctx, &i.more, 56.0, 11.0, true);
             }
-            let title = if s.title.is_empty() {
-                "wushang"
-            } else {
-                s.title
-            };
-            self.text(
-                rt,
-                title,
-                &self.title,
-                Rect::new(300.0, 0.0, w - 300.0, TITLE_BAR),
-            );
+            // Two or more tabs take the title's place.
+            let strip = s.layout.page == Page::Player && self.tab_strip(rt, ctx, s);
+            let area = s.layout.title_area();
+            if !strip && area.w() > 0.0 {
+                let title = if s.title.is_empty() {
+                    "wushang"
+                } else {
+                    s.title
+                };
+                self.text(rt, title, &self.title, area);
+            }
+            self.new_tab_button(rt, ctx, s);
             let full = if s.fullscreen {
                 &i.fullscreen_exit
             } else {
