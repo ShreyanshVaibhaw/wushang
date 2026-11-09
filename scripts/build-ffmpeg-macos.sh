@@ -88,10 +88,14 @@ parsers=(h264 hevc av1 vp8 vp9 mpeg4video mpegvideo vc1 mjpeg
 # The Windows list, plus ProRes, the PCM layouts a Core Audio device can deliver, and the sound
 # of two kinds of file wushang lists that the Windows build can't play: Monkey's Audio (.ape,
 # with its demuxer above) and AMR, which most .3gp videos carry. PNG is for cover art, which
-# music files embed as PNG about as often as JPEG.
+# music files embed as PNG about as often as JPEG. The rest of Windows Media too: a .wmv or
+# .asf can hold WMV 7 or 8 (wmv1, wmv2) or MS-MPEG-4 v1 or v2 rather than WMV 9, and WMA 1,
+# Pro, Lossless or Voice rather than WMA 2, and without its video decoder a file won't open.
 decoders=(h264 hevc av1 libdav1d vp8 vp9 mpeg4 mpeg2video mpeg1video vc1 wmv3 msmpeg4v3 mjpeg theora rawvideo
           prores ape amrnb amrwb png
+          wmv1 wmv2 vc1image wmv3image msmpeg4v1 msmpeg4v2
           aac aac_latm mp3float mp2float ac3 eac3 opus vorbis flac alac dca truehd wmav2
+          wmav1 wmapro wmalossless wmavoice
           pcm_s16le pcm_s16be pcm_s24le pcm_s24be pcm_s32le pcm_s32be pcm_f32le pcm_f32be
           pcm_u8 pcm_alaw pcm_mulaw pcm_bluray pcm_dvd
           subrip srt ass ssa webvtt movtext text microdvd subviewer sami dvdsub dvbsub pgssub)
@@ -130,7 +134,8 @@ grep -q '^License: LGPL version 2.1 or later$' configure.out ||
   { echo "not an LGPL v2.1+ build" >&2; exit 1; }
 for name in CONCAT_DEMUXER SECURETRANSPORT ZLIB HTTPS_PROTOCOL AVFOUNDATION_INDEV LIBDAV1D_DECODER \
     LIBMP3LAME_ENCODER H264_VIDEOTOOLBOX_ENCODER HEVC_VIDEOTOOLBOX_ENCODER AAC_AT_ENCODER \
-    H264_VIDEOTOOLBOX_HWACCEL AV1_VIDEOTOOLBOX_HWACCEL PRORES_VIDEOTOOLBOX_HWACCEL; do
+    H264_VIDEOTOOLBOX_HWACCEL AV1_VIDEOTOOLBOX_HWACCEL PRORES_VIDEOTOOLBOX_HWACCEL \
+    WMV2_DECODER WMAPRO_DECODER; do
   grep -q "^#define CONFIG_$name 1$" config.h config_components.h ||
     { echo "configure left out $name" >&2; exit 1; }
 done
