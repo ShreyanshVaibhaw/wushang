@@ -262,7 +262,8 @@ impl Shared {
         self.muted.store(false, Relaxed);
     }
 
-    /// The gain the audio callback applies: zero while muted or silenced.
+    /// The gain the audio callback applies, which it ramps to over a few milliseconds: zero
+    /// while muted or silenced.
     pub fn gain(&self) -> f32 {
         if self.muted.load(Relaxed) || self.silenced.load(Relaxed) {
             0.0

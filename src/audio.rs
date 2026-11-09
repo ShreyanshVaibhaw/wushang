@@ -19,6 +19,10 @@ const BUFFER_SECONDS: f64 = 0.3;
 /// converts to whatever the hardware runs at.
 const DEVICE_FORMAT: ff::format::Sample = ff::format::Sample::F32(ff::format::sample::Type::Packed);
 
+/// How long the gain the callback applies takes from silence to full volume. Changed between
+/// two samples (a tab switch, mute, a volume step), it cuts the waveform, which can click.
+const RAMP_SECONDS: f64 = 0.005;
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 struct Format {
     rate: u32,
@@ -133,6 +137,37 @@ impl AudioRing {
     }
 }
 
+/// The gain the callback applies, moving to the one asked for over `RAMP_SECONDS` rather than
+/// at once.
+struct Ramp {
+    gain: f32,
+    /// The most it moves in a frame.
+    step: f32,
+}
+
+impl Ramp {
+    /// Starts silent, so a new stream fades in.
+    fn new(rate: u32) -> Ramp {
+        Ramp {
+            gain: 0.0,
+            step: (1.0 / (f64::from(rate) * RAMP_SECONDS)) as f32,
+        }
+    }
+
+    /// Scales `samples`, frames of `channels` interleaved, moving the gain towards `target`.
+    fn apply(&mut self, target: f32, samples: &mut [f32], channels: usize) {
+        for frame in samples.chunks_mut(channels) {
+            let gap = target - self.gain;
+            self.gain = if gap.abs() <= self.step {
+                target
+            } else {
+                self.gain + self.step.copysign(gap)
+            };
+            frame.iter_mut().for_each(|s| *s *= self.gain);
+        }
+    }
+}
+
 enum Output {
     Opening,
     Failed,
@@ -160,7 +195,8 @@ pub struct Device {
 }
 
 impl Device {
-    /// Opens the output named as in `output_devices`, or the system default for None.
+    /// Opens the output named as in `output_devices`, or the system default for None or when
+    /// that output isn't there.
     pub fn open(shared: Arc<Shared>, name: Option<&str>) -> Arc<Device> {
         let device = Arc::new_cyclic(|me| Device {
             shared,
@@ -196,7 +232,7 @@ impl Device {
         self.reopen(name.map(str::to_owned));
     }
 
-    /// The device asked for last; None means the system default.
+    /// The output playing, by the name it was asked for; None means the system default.
     pub fn current_output(&self) -> Option<String> {
         match &*self.output.lock().unwrap() {
             Output::Open { name, .. } => name.clone(),
@@ -210,11 +246,27 @@ impl Device {
         };
         thread::spawn(move || {
             let _one_at_a_time = device.opening.lock().unwrap();
-            match device.build_stream(name.as_deref()) {
+            let mut name = name;
+            let mut built = device.build_stream(name.as_deref());
+            if let Err(e) = &built {
+                let which = name.as_deref().unwrap_or("the default device");
+                eprintln!("audio: cannot open {which} ({e})");
+                // Nothing plays yet and the output asked for is away (AirPods in their case):
+                // start on the system default rather than leave the tab without sound. Once
+                // something plays, a missing output leaves it playing.
+                let first = matches!(*device.output.lock().unwrap(), Output::Opening);
+                if first && name.is_some() {
+                    eprintln!("audio: using the default device");
+                    name = None;
+                    built = device.build_stream(None);
+                    if let Err(e) = &built {
+                        eprintln!("audio: cannot open the default device ({e})");
+                    }
+                }
+            }
+            match built {
                 Ok((stream, format)) => device.install(stream, format, name),
-                Err(e) => {
-                    let which = name.as_deref().unwrap_or("the default device");
-                    eprintln!("audio: cannot open {which} ({e})");
+                Err(_) => {
                     let mut output = device.output.lock().unwrap();
                     if matches!(*output, Output::Opening) {
                         eprintln!("audio: playing without sound");
@@ -266,6 +318,7 @@ impl Device {
             channels: usize::from(config.channels),
         };
         let rate = f64::from(format.rate);
+        let mut ramp = Ramp::new(format.rate);
         let shared = self.shared.clone();
         let effects = self.effects.clone();
         let feed = self.ring.clone();
@@ -303,11 +356,16 @@ impl Device {
                         shared.clock.set(pts - latency * speed + effects.delay());
                     }
                 }
-                let volume = shared.gain();
                 for (o, s) in out.iter_mut().zip(ring.samples.drain(..n)) {
-                    *o = s * volume;
+                    *o = s;
                 }
+                ramp.apply(shared.gain(), &mut out[..n], format.channels);
                 out[n..].fill(0.0);
+                // A gap (a pause, a seek, the decoder falling behind) cut the sound off, so
+                // what comes after it fades in.
+                if n < out.len() {
+                    ramp.gain = 0.0;
+                }
                 ring.consume(n / format.channels);
                 drop(ring);
                 // The visualizer's copy; skipped rather than waited for while the UI reads it.
@@ -658,6 +716,48 @@ mod tests {
     }
 
     #[test]
+    fn gain_changes_ramp_rather_than_step() {
+        // Full scale stereo at 48 kHz, and a tab switch silences it.
+        let mut ramp = Ramp::new(48_000);
+        ramp.gain = 1.0;
+        let mut out = vec![1.0; 2 * 512];
+        ramp.apply(0.0, &mut out, 2);
+        let frames: Vec<f32> = out.chunks(2).map(|f| f[0]).collect();
+        assert!(
+            out.chunks(2).all(|f| f[0] == f[1]),
+            "channels move together"
+        );
+        assert!(frames[0] > 0.99, "no step down: {}", frames[0]);
+        let biggest = frames.windows(2).map(|w| (w[1] - w[0]).abs());
+        assert!(biggest.fold(0.0, f32::max) <= 1.01 / 240.0);
+        // Silent within 5 ms (240 frames), and exactly so.
+        assert!(frames[240..].iter().all(|s| *s == 0.0));
+
+        // Back to 50% across buffers shorter than the ramp: it carries on from where the
+        // last one ended.
+        let mut first = vec![1.0; 2 * 64];
+        let mut second = vec![1.0; 2 * 64];
+        ramp.apply(0.5, &mut first, 2);
+        ramp.apply(0.5, &mut second, 2);
+        let joint = second[0] - first[first.len() - 1];
+        assert!(joint > 0.0 && joint <= 1.01 / 240.0, "joint {joint}");
+        assert_eq!(second[second.len() - 1], 0.5);
+        // Held there: the samples are only scaled.
+        let mut held = vec![0.25, -0.5];
+        ramp.apply(0.5, &mut held, 2);
+        assert_eq!(held, [0.125, -0.25]);
+    }
+
+    #[test]
+    fn a_new_stream_fades_in() {
+        let mut ramp = Ramp::new(44_100);
+        let mut out = vec![1.0; 441];
+        ramp.apply(1.0, &mut out, 1);
+        assert!(out[0] > 0.0 && out[0] < 0.01, "first sample {}", out[0]);
+        assert!(out[220] == 1.0 && out[440] == 1.0);
+    }
+
+    #[test]
     fn push_drops_samples_made_for_an_old_format() {
         let shared = Shared::new();
         let ring = AudioRing {
@@ -682,6 +782,42 @@ mod tests {
             ring.state.lock().unwrap().spans.len(),
             1,
             "stale serial queued"
+        );
+    }
+
+    /// A tab opened with Settings' output away (AirPods in their case) plays on the system
+    /// default rather than without sound for its whole life. Once it plays, a switch to a
+    /// missing output keeps what plays. Silent: nothing is queued.
+    #[test]
+    fn a_missing_output_opens_the_default_instead() {
+        let Some(default) = output_devices().into_iter().next() else {
+            eprintln!("no audio output device here; skipping");
+            return;
+        };
+        let shared = Arc::new(Shared::new());
+        shared.toggle_mute();
+        let missing = "wushang test: no such output";
+        let device = Device::open(shared.clone(), Some(missing));
+        let packets = PacketQueue::default();
+        assert!(
+            device.ring(&shared, &packets).is_some(),
+            "the tab plays without sound"
+        );
+        assert_eq!(device.current_output(), None, "reported as the default");
+
+        // A switch runs on a thread of its own: let it start, then wait for it to finish.
+        let switch = |name| {
+            device.switch_to(Some(name));
+            thread::sleep(Duration::from_millis(200));
+            drop(device.opening.lock().unwrap());
+        };
+        switch(&default);
+        assert_eq!(device.current_output().as_ref(), Some(&default));
+        switch(missing);
+        assert_eq!(
+            device.current_output(),
+            Some(default),
+            "kept, not the default"
         );
     }
 
