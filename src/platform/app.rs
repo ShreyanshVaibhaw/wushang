@@ -360,7 +360,8 @@ pub fn end_pump() {
     END_PUMP.set(true);
 }
 
-/// Whether `end_pump` was asked for in this pass.
+/// Whether `end_pump` was asked for in this pass, for the debug remote's lines.
+#[cfg(debug_assertions)]
 pub(super) fn pump_ended() -> bool {
     END_PUMP.get()
 }
