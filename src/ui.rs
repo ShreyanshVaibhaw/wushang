@@ -190,6 +190,12 @@ pub enum Hit {
     Preferences(preferences::Target),
     /// The first-run welcome, which takes every click outside an open dialog.
     Onboarding(onboarding::Target),
+    /// A tab in the player's title bar: shows it.
+    Tab(usize),
+    /// A tab's close button.
+    CloseTab(usize),
+    /// The title bar's new-tab button.
+    NewTab,
     /// A bar item the design's customize palette adds.
     Tool(toolbar::Item),
     /// Customize Player and the bars under it, which take every click while it's open.
@@ -239,6 +245,8 @@ pub struct Layout {
     preferences: Option<preferences::Geometry>,
     onboarding: Option<onboarding::Geometry>,
     customize: Option<customize::Geometry>,
+    /// How many tabs the player's title bar has room laid out for; see `add_tabs`.
+    tab_count: usize,
 }
 
 impl Layout {
@@ -314,6 +322,16 @@ impl Layout {
             tools,
             ..Default::default()
         }
+    }
+
+    /// Lays the player's title bar out for `count` tabs.
+    pub fn add_tabs(&mut self, count: usize) {
+        self.tab_count = count;
+    }
+
+    /// The tab count `add_tabs` laid out for, so a change of count relayouts.
+    pub fn tab_count(&self) -> usize {
+        self.tab_count
     }
 
     pub fn has_overlay(&self) -> bool {
@@ -1030,6 +1048,17 @@ pub struct Scene<'a> {
     pub notice: Option<&'a str>,
     /// Seconds into the file at the pointer over the seek bar (or its drag), for the preview.
     pub seek_hover: Option<f64>,
+    /// The open tabs, in title bar order, and which one is on screen.
+    pub tabs: &'a [TabInfo],
+    pub active_tab: usize,
+}
+
+/// What the title bar shows for one tab.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct TabInfo {
+    pub title: String,
+    /// Playing rather than paused or stopped. Tabs out of sight keep playing, without sound.
+    pub playing: bool,
 }
 
 fn fill_width(volume: f32) -> f32 {

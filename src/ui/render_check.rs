@@ -53,6 +53,8 @@ fn scene<'a>(layout: &'a Layout, browse: &'a Browse, style: &'a CaptionStyle) ->
         stats: None,
         notice: None,
         seek_hover: None,
+        tabs: &[],
+        active_tab: 0,
     }
 }
 

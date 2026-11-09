@@ -88,6 +88,17 @@ pub enum MenuAction {
     /// Plays the DVD or Blu-ray in a drive or folder; None asks for the folder.
     OpenDisc(Option<PathBuf>),
     OpenDiscImage,
+    /// Picks files to play in a new tab.
+    NewTab,
+    /// Plays a file in a new tab, with its folder as that tab's queue.
+    PlayInNewTab(PathBuf),
+    /// Closes the tab on screen.
+    CloseTab,
+    /// Shows the tab after or before the one on screen, wrapping around.
+    NextTab,
+    PreviousTab,
+    /// Shows the tab at this index (Cmd+1 to Cmd+9).
+    SelectTab(usize),
     /// Converts a file into an MP4 or an MP3.
     Convert(PathBuf, Format),
     /// Converts the open file into an MP4 (Ctrl+R).

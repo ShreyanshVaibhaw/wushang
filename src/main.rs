@@ -2141,6 +2141,8 @@ fn run() -> Result<(), Box<dyn Error>> {
                     stats: stats.as_deref(),
                     notice: app.notice.as_ref().map(|(text, _)| text.as_str()),
                     seek_hover: ui.seek_hover().map(|f| f * duration),
+                    tabs: &[],
+                    active_tab: 0,
                 };
                 renderer.present(
                     app.current.as_ref().map(|c| &c.frame),
@@ -2520,6 +2522,13 @@ fn open_menu(app: &mut App, hit: Hit, at: (f32, f32)) {
 fn menu_action(app: &mut App, win: Window, action: MenuAction) {
     let show_player = || UI.with_borrow_mut(|ui| ui.show(Page::Player));
     match action {
+        // Tabs: wired up with the multi-session engine.
+        MenuAction::NewTab
+        | MenuAction::PlayInNewTab(_)
+        | MenuAction::CloseTab
+        | MenuAction::NextTab
+        | MenuAction::PreviousTab
+        | MenuAction::SelectTab(_) => {}
         MenuAction::OpenFiles => pick_media_files(Picked::OpenFiles),
         MenuAction::OpenFolder => pick_folder(Picked::OpenFolder),
         MenuAction::PlayRecent(path) => {
