@@ -26,23 +26,35 @@ pub fn shift_down() -> bool {
 /// The virtual key for a macOS key event: by key position for keys that type no character,
 /// else by the character the layout types without modifiers, so Ctrl+Z is the key marked Z
 /// on an AZERTY keyboard too. Layouts without Latin letters fall back to the ANSI position,
-/// as Windows' virtual keys do.
+/// as Windows' virtual keys do, and so does the top row unless it types a letter or digit.
 pub(super) fn from_event(event: &NSEvent) -> Option<VIRTUAL_KEY> {
-    let code = event.keyCode();
-    if let Some(key) = by_position(code) {
-        return Some(key);
-    }
     let typed = event
         .charactersByApplyingModifiers(NSEventModifierFlags::empty())
         .map(|s| s.to_string())
         .unwrap_or_default();
+    virtual_key(event.keyCode(), &typed)
+}
+
+/// `from_event` for the key with macOS key code `code`, which types `typed` without modifiers.
+fn virtual_key(code: u16, typed: &str) -> Option<VIRTUAL_KEY> {
+    if let Some(key) = by_position(code) {
+        return Some(key);
+    }
     let mut chars = typed.chars();
     if let (Some(c), None) = (chars.next(), chars.next())
+        // AZERTY types punctuation on the top row and its digits with Shift: ' on 4, and - on
+        // 6 on French - PC. Those keys stay digits, as on Windows, so Command+4 picks a tab.
+        && (c.is_ascii_alphanumeric() || !is_digit_key(code))
         && let Some(key) = by_char(c)
     {
         return Some(key);
     }
     by_ansi_position(code)
+}
+
+/// The top row's 1 to 0 (kVK_ANSI_1 to kVK_ANSI_0).
+fn is_digit_key(code: u16) -> bool {
+    matches!(code, 0x12..=0x17 | 0x19 | 0x1A | 0x1C | 0x1D)
 }
 
 /// Keys that type no character, by their macOS key code (Carbon's kVK_ values).
@@ -156,4 +168,62 @@ fn by_ansi_position(code: u16) -> Option<VIRTUAL_KEY> {
         0x27 => VK_OEM_7,
         _ => return None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::d2d::{VK_1, VK_A, VK_M, VK_Q, VK_W, VK_Z};
+
+    #[test]
+    fn top_row_is_digits_on_us_and_azerty() {
+        // Key codes from 1 to 0.
+        let top_row = [0x12, 0x13, 0x14, 0x15, 0x17, 0x16, 0x1A, 0x1C, 0x19, 0x1D];
+        let digits = "1234567890";
+        // What the top row types without Shift on AZERTY, whose digits need Shift: French and
+        // Belgian, then French - PC.
+        let french = "&\u{e9}\"'(\u{a7}\u{e8}!\u{e7}\u{e0}";
+        let french_pc = "&\u{e9}\"'(-\u{e8}_\u{e7}\u{e0}";
+        for layout in [digits, french, french_pc] {
+            for ((code, typed), digit) in
+                top_row.into_iter().zip(layout.chars()).zip(digits.chars())
+            {
+                let key = virtual_key(code, &typed.to_string());
+                assert_eq!(
+                    key,
+                    Some(VIRTUAL_KEY(digit as u16)),
+                    "{typed:?} on key {code:#x}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn punctuation_off_the_top_row_keeps_its_key() {
+        // US: ' and - beside Return and 0.
+        assert_eq!(virtual_key(0x27, "'"), Some(VK_OEM_7));
+        assert_eq!(virtual_key(0x1B, "-"), Some(VK_OEM_MINUS));
+        // French AZERTY: - where US has =, and ) where US has -.
+        assert_eq!(virtual_key(0x18, "-"), Some(VK_OEM_MINUS));
+        assert_eq!(virtual_key(0x1B, ")"), Some(VK_OEM_MINUS));
+        assert_eq!(virtual_key(0x21, "["), Some(VK_OEM_4));
+        assert_eq!(virtual_key(0x1E, "]"), Some(VK_OEM_6));
+        assert_eq!(virtual_key(0x2B, ","), Some(VK_OEM_COMMA));
+    }
+
+    #[test]
+    fn letters_follow_the_layout() {
+        // AZERTY: A where US has Q, Q where US has A, M where US has ;, Z where US has W.
+        assert_eq!(virtual_key(0x0C, "a"), Some(VK_A));
+        assert_eq!(virtual_key(0x00, "q"), Some(VK_Q));
+        assert_eq!(virtual_key(0x29, "m"), Some(VK_M));
+        assert_eq!(virtual_key(0x0D, "z"), Some(VK_Z));
+        assert_eq!(virtual_key(0x06, "w"), Some(VK_W));
+        // Cyrillic: by US position.
+        assert_eq!(virtual_key(0x0D, "\u{446}"), Some(VK_W));
+        // A letter on the top row stays a letter.
+        assert_eq!(virtual_key(0x12, "q"), Some(VK_Q));
+        // Nothing typed: by US position.
+        assert_eq!(virtual_key(0x12, ""), Some(VK_1));
+    }
 }
