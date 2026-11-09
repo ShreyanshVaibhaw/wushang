@@ -15,7 +15,11 @@ fn out_dir() -> PathBuf {
     std::env::var_os("WUSHANG_RENDER_DIR").map_or_else(std::env::temp_dir, PathBuf::from)
 }
 
-fn scene<'a>(layout: &'a Layout, browse: &'a Browse, style: &'a CaptionStyle) -> Scene<'a> {
+pub(super) fn scene<'a>(
+    layout: &'a Layout,
+    browse: &'a Browse,
+    style: &'a CaptionStyle,
+) -> Scene<'a> {
     Scene {
         layout,
         hover: None,
@@ -59,7 +63,7 @@ fn scene<'a>(layout: &'a Layout, browse: &'a Browse, style: &'a CaptionStyle) ->
 }
 
 /// A painter on a fresh device context, as the renderer makes one.
-fn painter() -> (ID2D1DeviceContext5, Painter) {
+pub(super) fn painter() -> (ID2D1DeviceContext5, Painter) {
     let ctx = ID2D1DeviceContext5::new();
     let painter = Painter::new(&ctx, ID2D1Factory1::new()).unwrap();
     (ctx, painter)
@@ -288,19 +292,21 @@ fn render_check_popup() {
     shoot(&ctx, &mut painter, &s, "popup");
 }
 
+/// Titles for eight tabs, short and long.
+pub(super) const TITLES: [&str; 8] = [
+    "Big Buck Bunny (2008)",
+    "Sintel",
+    "Tears of Steel, the extended cut with a long name",
+    "Elephants Dream",
+    "Cosmos Laundromat",
+    "Spring",
+    "Agent 327: Operation Barbershop",
+    "Caminandes 3: Llamigos",
+];
+
 #[test]
 #[ignore = "writes PNGs to look at"]
 fn render_check_tabs() {
-    const TITLES: [&str; 8] = [
-        "Big Buck Bunny (2008)",
-        "Sintel",
-        "Tears of Steel, the extended cut with a long name",
-        "Elephants Dream",
-        "Cosmos Laundromat",
-        "Spring",
-        "Agent 327: Operation Barbershop",
-        "Caminandes 3: Llamigos",
-    ];
     // Name, window size, tab count, the tab on screen, the tabs playing, what's hovered and
     // whether the bars float over fullscreen video.
     type Shot = (
@@ -312,7 +318,7 @@ fn render_check_tabs() {
         Option<Hit>,
         bool,
     );
-    let shots: [Shot; 10] = [
+    let shots: [Shot; 17] = [
         ("1", (1280.0, 720.0), 1, 0, &[0], None, false),
         (
             "1-new-hover",
@@ -352,6 +358,25 @@ fn render_check_tabs() {
             Some(Hit::Tab(2)),
             false,
         ),
+        // Narrow tabs at the smaller window sizes, several of them playing.
+        (
+            "5-800",
+            (800.0, 450.0),
+            5,
+            0,
+            &[1, 3],
+            Some(Hit::Tab(3)),
+            false,
+        ),
+        (
+            "6-800",
+            (800.0, 450.0),
+            6,
+            0,
+            &[1, 3, 5],
+            Some(Hit::Tab(2)),
+            false,
+        ),
         (
             "8-800",
             (800.0, 450.0),
@@ -359,6 +384,43 @@ fn render_check_tabs() {
             2,
             &[0, 5],
             Some(Hit::Tab(4)),
+            false,
+        ),
+        (
+            "5-900",
+            (900.0, 506.0),
+            5,
+            0,
+            &[1, 3],
+            Some(Hit::Tab(3)),
+            false,
+        ),
+        (
+            "7-900",
+            (900.0, 506.0),
+            7,
+            2,
+            &[0, 3, 5],
+            Some(Hit::Tab(5)),
+            false,
+        ),
+        ("8-900", (900.0, 506.0), 8, 0, &[1, 3, 5, 7], None, false),
+        (
+            "5-1000",
+            (1000.0, 563.0),
+            5,
+            0,
+            &[1, 3],
+            Some(Hit::CloseTab(1)),
+            false,
+        ),
+        (
+            "8-1000",
+            (1000.0, 563.0),
+            8,
+            0,
+            &[1, 3, 5, 7],
+            Some(Hit::Tab(3)),
             false,
         ),
         (

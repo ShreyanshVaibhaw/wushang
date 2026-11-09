@@ -19,17 +19,18 @@ const GAP: f32 = 4.0;
 const MARGIN: f32 = 12.0;
 /// Between the new-tab button and the window buttons.
 const NEW_GAP: f32 = 20.0;
-/// Tabs narrower than this have no close button, which would take most of the tab (Cmd+W still
-/// closes them).
-const CLOSE_MIN_W: f32 = 72.0;
-/// Tabs narrower than this show their number, which is also their Cmd shortcut, for the title.
-const TITLE_MIN_W: f32 = 40.0;
+/// The least room for a tab's title: about three letters and the ellipsis. A tab with less shows
+/// its number, which is also its Cmd shortcut, and one that would have less beside a close
+/// button has none (Cmd+W still closes it).
+const TITLE_MIN: f32 = 32.0;
 /// With less room than this for each tab the title bar keeps its title.
 const MIN_W: f32 = 24.0;
 const RADIUS: f32 = 6.0;
 /// The close button's box, inset from the tab's right end.
 const CLOSE: f32 = 18.0;
 const CLOSE_INSET: f32 = 5.0;
+/// Between a tab's title and its close button.
+const CLOSE_GAP: f32 = 4.0;
 /// The space either side of a tab's title.
 const PAD: f32 = 10.0;
 /// The playing mark's box, and the space between it and the title.
@@ -46,6 +47,25 @@ pub(super) struct Slot {
     pub tab: Rect,
     /// None when the tab is too narrow for one.
     pub close: Option<Rect>,
+}
+
+impl Slot {
+    /// Whether the tab shows its title rather than its number.
+    pub fn titled(&self) -> bool {
+        title_room(self.tab.w(), self.close.is_some()) >= TITLE_MIN
+    }
+}
+
+/// The room a tab `w` wide leaves its title: the tab less its pads, the close button's area when
+/// it has one, and the playing mark's. The mark counts whether it's shown or not, so a tab
+/// doesn't swap its title for its number as it starts or stops playing.
+fn title_room(w: f32, close: bool) -> f32 {
+    let close = if close {
+        CLOSE_INSET + CLOSE + CLOSE_GAP - PAD
+    } else {
+        0.0
+    };
+    w - 2.0 * PAD - (MARK + MARK_GAP) - close
 }
 
 impl Layout {
@@ -134,7 +154,7 @@ fn strip(count: usize, width: f32, start: f32, end: f32) -> Vec<Slot> {
         .map(|i| {
             let l = left + (w + GAP) * i as f32;
             let tab = Rect::new(l, 6.0, l + w, 34.0);
-            let close = (w >= CLOSE_MIN_W).then(|| {
+            let close = (title_room(w, true) >= TITLE_MIN).then(|| {
                 let r = tab.r - CLOSE_INSET;
                 let cy = TITLE_BAR / 2.0;
                 Rect::new(r - CLOSE, cy - CLOSE / 2.0, r, cy + CLOSE / 2.0)
@@ -142,6 +162,16 @@ fn strip(count: usize, width: f32, start: f32, end: f32) -> Vec<Slot> {
             Slot { tab, close }
         })
         .collect()
+}
+
+/// A tab's title or number, as `Painter::label` places it.
+#[derive(Debug)]
+struct Label<'a> {
+    text: Cow<'a, str>,
+    /// The playing mark's centre, when the tab has one.
+    mark: Option<f32>,
+    /// The box the text is set in.
+    words: Rect,
 }
 
 pub(super) struct Resources {
@@ -231,24 +261,16 @@ impl Painter {
         true
     }
 
-    /// A tab's title (or number, when narrow), its playing mark and its close button.
-    unsafe fn tab_label(
-        &self,
-        rt: &ID2D1RenderTarget,
-        ctx: &ID2D1DeviceContext5,
-        s: &Scene,
-        i: usize,
-        slot: &Slot,
-        lit: bool,
-    ) {
+    /// What a tab's label shows and where: its title, or its number when narrow, after the
+    /// playing mark when it has one.
+    fn label<'a>(&self, s: &'a Scene, i: usize, slot: &Slot) -> Label<'a> {
         let (r, t) = (&self.strip, slot.tab);
         let info = s.tabs.get(i);
         // The tab on screen shows its state in the control bar; the mark is for the others.
         let playing = i != s.active_tab && info.is_some_and(|t| t.playing);
         let mark = if playing { MARK + MARK_GAP } else { 0.0 };
-        let brush = if lit { &self.fg } else { &r.dim };
-        let (cx, cy) = ((t.l + t.r) / 2.0, TITLE_BAR / 2.0);
-        let (text, area) = if t.w() < TITLE_MIN_W {
+        let cx = (t.l + t.r) / 2.0;
+        let (text, area) = if !slot.titled() {
             let number = (i + 1).to_string();
             let w = self.measure(&number, &r.text);
             let x = (cx - (mark + w) / 2.0).round();
@@ -263,7 +285,7 @@ impl Painter {
             };
             // Centred like the title it replaces, unless that would run into the close button;
             // a long title ends in an ellipsis before it.
-            let end = slot.close.map_or(t.r - PAD, |c| c.l - 4.0);
+            let end = slot.close.map_or(t.r - PAD, |c| c.l - CLOSE_GAP);
             let w = self.measure(title, &r.text);
             let x = (cx - (mark + w) / 2.0)
                 .min(end - mark - w)
@@ -271,12 +293,32 @@ impl Painter {
                 .round();
             (Cow::Borrowed(title), Rect::new(x, 0.0, end, TITLE_BAR))
         };
+        Label {
+            text,
+            mark: playing.then_some(area.l + MARK / 2.0),
+            words: Rect::new(area.l + mark, area.t, area.r, area.b),
+        }
+    }
+
+    /// A tab's title (or number, when narrow), its playing mark and its close button.
+    unsafe fn tab_label(
+        &self,
+        rt: &ID2D1RenderTarget,
+        ctx: &ID2D1DeviceContext5,
+        s: &Scene,
+        i: usize,
+        slot: &Slot,
+        lit: bool,
+    ) {
+        let r = &self.strip;
+        let label = self.label(s, i, slot);
+        let brush = if lit { &self.fg } else { &r.dim };
+        let cy = TITLE_BAR / 2.0;
         unsafe {
-            if playing {
-                self.glyph(ctx, &r.playing, area.l + MARK / 2.0, cy, MARK);
+            if let Some(x) = label.mark {
+                self.glyph(ctx, &r.playing, x, cy, MARK);
             }
-            let words = Rect::new(area.l + mark, area.t, area.r, area.b);
-            self.put(rt, &text, &r.text, words, brush);
+            self.put(rt, &label.text, &r.text, label.words, brush);
             if let Some(c) = slot.close.filter(|_| lit) {
                 let over = s.hover == Some(Hit::CloseTab(i));
                 if over {
@@ -421,6 +463,97 @@ mod tests {
         let mut l = Layout::new(1920.0, 1080.0, true, false);
         l.add_tabs(8);
         assert!(l.tab_slots.iter().all(|s| s.close.is_some()));
+    }
+
+    #[test]
+    fn narrow_tabs_show_their_numbers() {
+        // Window width, tab count, and whether the tabs have titles and close buttons. With 5
+        // tabs at 800 a playing tab once had room for the ellipsis alone, and with 6 not even
+        // that, so its title was cut mid-letter.
+        for (w, n, titled, close) in [
+            (800.0, 3, true, true),
+            (800.0, 4, true, false),
+            (800.0, 5, false, false),
+            (800.0, 6, false, false),
+            (900.0, 5, true, false),
+            (900.0, 7, false, false),
+            (900.0, 8, false, false),
+            (1000.0, 5, true, true),
+            (1000.0, 8, false, false),
+        ] {
+            let mut l = Layout::new(w, 450.0, true, false);
+            l.add_tabs(n);
+            assert_eq!(l.tab_slots.len(), n);
+            for s in &l.tab_slots {
+                assert_eq!(
+                    (s.titled(), s.close.is_some()),
+                    (titled, close),
+                    "{n} tabs at {w}: {s:?}"
+                );
+            }
+        }
+    }
+
+    /// Every tab, playing or not, shows its title cut to a few letters and an ellipsis or else
+    /// its number, whole either way, and the same one whether it's playing or not.
+    #[test]
+    fn tab_labels_are_readable_and_steady() {
+        use super::super::render_check::{TITLES, painter, scene};
+        let (_ctx, p) = painter();
+        let browse = Browse::new();
+        let style = crate::captions::CaptionStyle::default();
+        // The width `text` takes set in `w` DIPs, and whether its end gave way to an ellipsis.
+        let set = |text: &str, w: f32| unsafe {
+            let utf16: Vec<u16> = text.encode_utf16().collect();
+            let layout = p
+                .dwrite
+                .CreateTextLayout(&utf16, &p.strip.text, w, TITLE_BAR)
+                .unwrap();
+            let mut m = DWRITE_TEXT_METRICS::default();
+            layout.GetMetrics(&mut m).unwrap();
+            let (mut lines, mut count) = ([DWRITE_LINE_METRICS::default()], 0);
+            layout.GetLineMetrics(Some(&mut lines), &mut count).unwrap();
+            (m.width, lines[0].isTrimmed.as_bool())
+        };
+        for w in [800.0, 900.0, 1000.0, 1100.0, 1280.0, 1920.0] {
+            for n in 2..=8 {
+                let mut l = Layout::new(w, 450.0, true, false);
+                l.add_tabs(n);
+                for playing in [false, true] {
+                    let tabs: Vec<TabInfo> = TITLES[..n]
+                        .iter()
+                        .map(|title| TabInfo {
+                            title: (*title).to_owned(),
+                            playing,
+                        })
+                        .collect();
+                    let mut s = scene(&l, &browse, &style);
+                    s.tabs = &tabs;
+                    for (i, slot) in l.tab_slots.iter().enumerate() {
+                        let at = format!("tab {i} of {n} at {w}, playing {playing}");
+                        let (t, label) = (slot.tab, p.label(&s, i, slot));
+                        let shown = if slot.titled() {
+                            TITLES[i].to_owned()
+                        } else {
+                            (i + 1).to_string()
+                        };
+                        assert_eq!(label.text, shown, "{at}");
+                        assert_eq!(label.mark.is_some(), playing && i != 0, "{at}");
+                        let left = label.mark.map_or(label.words.l, |x| x - MARK / 2.0);
+                        assert!(left >= t.l && label.words.r <= t.r, "{at}: {t:?}");
+                        let (width, trimmed) = set(&label.text, label.words.w());
+                        assert!(width <= label.words.w() + 0.01, "{at}: clipped");
+                        if !slot.titled() {
+                            assert!(!trimmed, "{at}");
+                        } else if trimmed {
+                            // A lone ellipsis, or one after a single letter, says nothing.
+                            let two: String = TITLES[i].chars().take(2).chain(['…']).collect();
+                            assert!(!set(&two, label.words.w()).1, "{at}: {label:?}");
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[test]
