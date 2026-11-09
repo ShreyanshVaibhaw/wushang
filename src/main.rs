@@ -43,7 +43,7 @@ use std::error::Error;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering::Relaxed;
 use std::sync::atomic::{AtomicBool, AtomicU64};
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{Arc, Mutex, Weak, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -137,6 +137,8 @@ thread_local! {
     static MINI_CARD: std::cell::Cell<(f32, f32)> = const { std::cell::Cell::new((ui::mini::W, ui::mini::H)) };
     /// Whether the mini player window is sized with its queue open.
     static MINI_QUEUE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Whether the last press was on the title bar, for its double-click.
+    static PRESSED_CAPTION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 fn prefs() -> Prefs {
@@ -195,6 +197,7 @@ struct App {
     durations: HashMap<PathBuf, f64>,
     queue_prober: thumbs::Prober,
     bookmarks: Bookmarks,
+    /// Settings' subtitle look; each tab has its own size.
     caption: CaptionStyle,
     devices: Vec<String>,
     /// Index into the panel's sleep list, and when a timed one runs out.
@@ -224,6 +227,8 @@ struct App {
     converting: Option<convert::Job>,
     /// The playlist the next `play` comes from, which only playing from a playlist sets.
     next_playlist: Option<String>,
+    /// Closed tabs' last recording and stream, until the notice has said how they ended.
+    closed: Vec<(Option<record::Control>, Option<record::Control>)>,
 }
 
 /// One tab: a file playing, or nothing yet, with its own clock, sound output, queue and
@@ -248,18 +253,22 @@ struct Tab {
     crop: usize,
     /// The embedded subtitle track's decoder thread and cues.
     embedded: Option<(thread::JoinHandle<()>, Arc<Cues>)>,
+    /// The fonts the open file carries, for its styled subtitles alone.
+    fonts: ass::Fonts,
     /// Subtitle files next to the open file, loaded when first chosen, and the one shown.
     external: Vec<(PathBuf, Option<Arc<Cues>>)>,
     external_selected: Option<usize>,
     /// Positive shows subtitles later.
     sub_delay: f64,
+    /// Subtitle size, as a multiple of the design's.
+    sub_size: f32,
     /// How fast the subtitles' clock runs (1 = as written), and how many times longer each line
     /// stays (0 = as written).
     sub_speed: f64,
     sub_duration: f64,
     /// Playing backwards: the position last stepped back to, and when.
     reverse: Option<(f64, Instant)>,
-    /// A stream address connecting on a thread of its own, so the window never waits on it.
+    /// What opens on a thread of its own, so the window never waits on it.
     opening: Option<Opening>,
     /// Where the last recording reports back; it outlives the session it recorded.
     record_control: Option<record::Control>,
@@ -316,12 +325,16 @@ const SCRUB_WAIT: Duration = Duration::from_millis(250);
 /// A pointer that rests this long gets an exact seek, for the frame under it.
 const SCRUB_REST: Duration = Duration::from_millis(150);
 
+/// A file opening on a thread of its own: a stream, disc or device connecting, or the next file
+/// of a tab out of sight, so the window never waits on it.
 struct Opening {
     path: PathBuf,
     /// What the title bar calls the tab meanwhile.
     title: String,
     ready: mpsc::Receiver<Result<ff::format::context::Input, String>>,
     cancel: Arc<AtomicBool>,
+    /// For a tab `in_new_tab` made for it, the tab on screen before, to show again if it fails.
+    back: Option<Weak<Shared>>,
 }
 
 impl App {
@@ -354,6 +367,7 @@ impl App {
             capture_devices: Arc::default(),
             converting: None,
             next_playlist: None,
+            closed: Vec::new(),
         }
     }
 
@@ -392,7 +406,8 @@ impl App {
     }
 
     /// Opens `path` from where it was left in tab `i`, keeping its queue as it is. A stream
-    /// address connects in the background and starts playing once it answers.
+    /// address connects in the background and starts playing once it answers. So does every
+    /// file in a tab out of sight, so a tab moving on to its next file never holds up the window.
     fn open(&mut self, i: usize, path: &Path) -> bool {
         self.stop(i);
         let p = prefs();
@@ -401,10 +416,16 @@ impl App {
             reconnect: p.net_reconnect,
         };
         let cancel = Arc::new(AtomicBool::new(false));
-        if net::is_address(path) {
-            let (done, ready) = mpsc::channel();
-            let (url, flag) = (path.to_owned(), cancel.clone());
-            thread::spawn(move || _ = done.send(session::open_input(&url, options, &flag)));
+        let address = net::is_address(path);
+        let seen = i == self.active;
+        if seen && !address {
+            let input = session::open_input(path, options, &cancel);
+            return self.start(i, path, input.map(|input| (input, cancel)));
+        }
+        let (done, ready) = mpsc::channel();
+        let (url, flag) = (path.to_owned(), cancel.clone());
+        thread::spawn(move || _ = done.send(session::open_input(&url, options, &flag)));
+        if seen {
             // Disc and capture addresses have "://" too, but no host.
             let host = net::is_url_path(path)
                 .then(|| net::host_of(&path.to_string_lossy()))
@@ -414,25 +435,23 @@ impl App {
                 None if disc::is_disc_path(path) => "Opening the disc...".to_owned(),
                 None => "Opening the capture device...".to_owned(),
             };
-            let title = match self.stream_titles.get(path) {
-                Some(title) => title.clone(),
-                None if disc::is_disc_path(path) => disc::title(path),
-                None if net::is_url_path(path) => net::url_name(&path.to_string_lossy()),
-                None => "Capture".to_owned(),
-            };
-            if i == self.active {
-                self.notice = Some((line, Instant::now()));
-            }
-            self.tabs[i].opening = Some(Opening {
-                path: path.to_owned(),
-                title,
-                ready,
-                cancel,
-            });
-            return true;
+            self.notice = Some((line, Instant::now()));
         }
-        let input = session::open_input(path, options, &cancel);
-        self.start(i, path, input.map(|input| (input, cancel)))
+        let title = match self.stream_titles.get(path) {
+            Some(title) => title.clone(),
+            None if !address => session::file_title(path),
+            None if disc::is_disc_path(path) => disc::title(path),
+            None if net::is_url_path(path) => net::url_name(&path.to_string_lossy()),
+            None => "Capture".to_owned(),
+        };
+        self.tabs[i].opening = Some(Opening {
+            path: path.to_owned(),
+            title,
+            ready,
+            cancel,
+            back: None,
+        });
+        true
     }
 
     /// Starts playing what `open` opened at `path` in tab `i`.
@@ -523,19 +542,35 @@ impl App {
         }
     }
 
-    /// Starts tab `i`'s stream, disc or device once it has connected.
-    fn finish_opening(&mut self, i: usize) -> bool {
+    /// Starts what tab `i` was opening once it has opened: None until then, else whether it
+    /// plays. A tab `in_new_tab` made whose stream failed goes again.
+    fn finish_opening(&mut self, i: usize) -> Option<bool> {
         let tab = &mut self.tabs[i];
-        let Some(input) = tab.opening.as_ref().and_then(|o| o.ready.try_recv().ok()) else {
-            return false;
-        };
-        let o = tab.opening.take().unwrap();
+        let input = tab.opening.as_ref()?.ready.try_recv().ok()?;
+        let o = tab.opening.take()?;
         // The notice said it was connecting.
         if i == self.active {
             self.notice = None;
         }
-        self.start(i, &o.path, input.map(|input| (input, o.cancel)));
-        true
+        let played = self.start(i, &o.path, input.map(|input| (input, o.cancel)));
+        if !played && let Some(back) = o.back {
+            self.drop_new_tab(i, &back);
+        }
+        Some(played)
+    }
+
+    /// Closes tab `i`, which `in_new_tab` made for a file that never opened, as long as `back`,
+    /// the tab on screen before it, is still open; that one shows again if `i` was on screen.
+    fn drop_new_tab(&mut self, i: usize, back: &Weak<Shared>) {
+        let Some(back) =
+            (self.tabs.iter()).position(|t| Weak::ptr_eq(back, &Arc::downgrade(&t.shared)))
+        else {
+            return;
+        };
+        let shown = if i == self.active { back } else { self.active };
+        self.tabs.remove(i);
+        self.active = if shown > i { shown - 1 } else { shown };
+        self.sync_active();
     }
 
     /// Plays a file opened from outside the library, queued with the rest of its folder.
@@ -651,27 +686,36 @@ impl App {
         self.notice = Some((line, Instant::now()));
     }
 
-    /// Shows how the last recordings ended, once their files are closed, in every tab.
+    /// Shows how the last recordings ended, once their files are closed, in every tab and in
+    /// those closed since.
     fn take_recordings(&mut self) {
-        for tab in &mut self.tabs {
-            if let Some(control) = &tab.record_control {
-                let done = std::mem::take(&mut control.lock().unwrap().done);
-                for result in done {
-                    let line = match result {
+        // A closed tab's recording and stream ended with it, so this is the last they say.
+        let closed = std::mem::take(&mut self.closed);
+        let closed = (closed.iter()).map(|(record, stream)| (record.as_ref(), stream.as_ref()));
+        let open =
+            (self.tabs.iter()).map(|t| (t.record_control.as_ref(), t.stream_control.as_ref()));
+        let mut line = None;
+        for (record, stream) in closed.chain(open) {
+            if let Some(control) = record {
+                for result in std::mem::take(&mut control.lock().unwrap().done) {
+                    line = Some(match result {
                         Ok(path) => format!("Recording saved to {}", path.display()),
                         Err(e) => format!("Can't record: {e}"),
-                    };
-                    self.notice = Some((line, Instant::now()));
-                    UI.with_borrow_mut(|ui| ui.dirty = true);
+                    });
                 }
             }
-            if let Some(control) = &tab.stream_control {
+            if let Some(control) = stream {
                 let done = std::mem::take(&mut control.lock().unwrap().done);
-                for e in done.into_iter().filter_map(Result::err) {
-                    self.notice = Some((format!("Can't stream: {e}"), Instant::now()));
-                    UI.with_borrow_mut(|ui| ui.dirty = true);
+                if let Some(e) = done.into_iter().filter_map(Result::err).next_back() {
+                    line = Some(format!("Can't stream: {e}"));
                 }
             }
+        }
+        if let Some(line) = line {
+            self.notice = Some((line, Instant::now()));
+            UI.with_borrow_mut(|ui| ui.dirty = true);
+        }
+        for tab in &mut self.tabs {
             // The stream ended with its media, or failed: let the players go.
             if tab.stream_server.is_some() && !tab.session.as_ref().is_some_and(Session::streaming)
             {
@@ -730,15 +774,19 @@ impl App {
     }
 
     /// Keeps tab `i` playing out of sight, as the render loop plays the tab on screen: starts
-    /// its stream once it connects, takes its frames as they come due (keeping the newest, so it
-    /// shows at once when switched to, and the decoder gets its surfaces back), starts its clock
-    /// from video when it has no sound, and moves on at the end of a file.
-    fn play_unseen(&mut self, i: usize) {
-        self.finish_opening(i);
+    /// what it opens once it is open, takes its frames as they come due (keeping the newest, so
+    /// it shows at once when switched to, and the decoder gets its surfaces back), starts its
+    /// clock from video when it has no sound, and moves on at the end of a file. Returns whether
+    /// it reached the end of its queue and stopped.
+    fn play_unseen(&mut self, i: usize) -> bool {
+        // A new tab whose stream failed may have gone.
+        if self.finish_opening(i) == Some(false) {
+            return false;
+        }
         let tab = &mut self.tabs[i];
         tab.step_reverse();
         let Some(session) = &tab.session else {
-            return;
+            return false;
         };
         let shared = &tab.shared;
         let serial = shared.serial.load(Relaxed);
@@ -754,10 +802,59 @@ impl App {
         {
             tab.current = Some(f);
         }
-        let ended = !paused && session.finished();
-        if ended && !self.advance(i) {
-            self.stop(i);
+        if paused || !session.finished() {
+            return false;
         }
+        // Continue Watching and Recent follow, as they do for the tab on screen.
+        UI.with_borrow_mut(|ui| {
+            ui.browse.stale = true;
+            ui.dirty = true;
+        });
+        if self.advance(i) {
+            return false;
+        }
+        self.stop(i);
+        true
+    }
+
+    /// Keeps every tab out of sight playing (`play_unseen`). Returns whether one of them
+    /// reached the end of its queue.
+    fn play_out_of_sight(&mut self) -> bool {
+        // Followed by identity, as a new tab whose stream failed goes meanwhile.
+        let unseen: Vec<Arc<Shared>> = (self.tabs.iter().enumerate())
+            .filter(|(i, _)| *i != self.active)
+            .map(|(_, t)| t.shared.clone())
+            .collect();
+        let mut ended = false;
+        for shared in unseen {
+            if let Some(i) = (self.tabs.iter()).position(|t| Arc::ptr_eq(&t.shared, &shared)) {
+                ended |= self.play_unseen(i);
+            }
+        }
+        ended
+    }
+
+    /// Whether every tab has ended and Settings say to quit when playback does.
+    fn quit_at_end(&self) -> bool {
+        PREFS.with_borrow(|p| p.at_end == 1) && self.tabs.iter().all(Tab::is_empty)
+    }
+
+    /// Whether a tab besides the one on screen has something open or opening.
+    fn others_open(&self) -> bool {
+        (self.tabs.iter().enumerate()).any(|(i, t)| i != self.active && !t.is_empty())
+    }
+
+    /// Whether the player page has nothing to show: nothing open or opening in any tab, and no
+    /// notice saying why. With other tabs open, it stays up with the empty one, so the tab strip
+    /// leads back to them.
+    fn nothing_to_show(&self) -> bool {
+        self.tab().is_empty() && self.notice.is_none() && !self.others_open()
+    }
+
+    /// Whether the library page shows its mini card: for the file on screen, or with that tab
+    /// empty, as the way back to the player page and the other tabs.
+    fn has_card(&self) -> bool {
+        self.session().is_some() || self.others_open()
     }
 
     /// Makes tab `i` the one on screen and heard, at its own volume and mute; the window's keys
@@ -775,15 +872,24 @@ impl App {
     }
 
     /// After the tab on screen changed: it is heard and the others silenced, and the window's
-    /// keys, seek bar, title bar and popups follow it.
-    fn sync_active(&self) {
+    /// keys, seek bar, title bar, popups and Settings follow it.
+    fn sync_active(&mut self) {
         for (i, tab) in self.tabs.iter().enumerate() {
             tab.shared.silenced.store(i != self.active, Relaxed);
         }
-        *SHARED.lock().unwrap() = Some(self.tab().shared.clone());
+        let shown = self.tab().shared.clone();
+        let before = SHARED.lock().unwrap().replace(shown.clone());
+        let changed = before.is_none_or(|b| !Arc::ptr_eq(&b, &shown));
         let duration = self.session().map_or(0.0, |s| s.duration);
         DURATION.store(duration.to_bits(), Relaxed);
+        // Settings show this tab's sound, subtitle size and repeat from now on, so whatever is
+        // changed there next starts from them.
+        self.sync_prefs();
         UI.with_borrow_mut(|ui| {
+            // A press or a drag of the seek bar belonged to the tab before.
+            if changed {
+                ui.end_pointer();
+            }
             ui.relayout = true;
             ui.dirty = true;
         });
@@ -800,7 +906,9 @@ impl App {
             return;
         }
         self.active = active_after_close(self.active, i, self.tabs.len());
-        self.tabs.remove(i);
+        let tab = self.tabs.remove(i);
+        // Its recording or stream says how it ended once the notice looks.
+        self.closed.push((tab.record_control, tab.stream_control));
         self.sync_active();
     }
 
@@ -842,8 +950,22 @@ impl App {
         if added && !played {
             self.show_tab(back);
             self.tabs.pop();
+        } else if added {
+            // A stream connects for a while yet, and can still fail.
+            let back = Arc::downgrade(&self.tabs[back].shared);
+            if let Some(o) = self.tabs.last_mut().and_then(|t| t.opening.as_mut()) {
+                o.back = Some(back);
+            }
         }
         played
+    }
+
+    /// The subtitle look: Settings', at the size of the tab on screen.
+    fn caption(&self) -> CaptionStyle {
+        CaptionStyle {
+            size_ratio: CaptionStyle::default().size_ratio * self.tab().sub_size,
+            ..self.caption.clone()
+        }
     }
 
     /// What the tracks and settings popups show.
@@ -919,7 +1041,7 @@ impl App {
             saturation: tab.adjust.saturation,
             sleep_timer: self.sleep,
             show_statistics: self.show_statistics,
-            sub_size: self.caption.size_ratio / CaptionStyle::default().size_ratio,
+            sub_size: tab.sub_size,
             video_sizes: s.map_or_else(Vec::new, |s| {
                 s.tracks(TrackKind::Video).iter().map(|t| t.size).collect()
             }),
@@ -1017,9 +1139,7 @@ impl App {
                     .map(|m| Instant::now() + Duration::from_secs(m * 60));
             }
             PanelAction::SetShowStatistics(on) => self.show_statistics = on,
-            PanelAction::SetSubSize(v) => {
-                self.caption.size_ratio = CaptionStyle::default().size_ratio * v.clamp(0.5, 2.0)
-            }
+            PanelAction::SetSubSize(v) => self.tab_mut().sub_size = v.clamp(0.5, 2.0),
             PanelAction::SetReverse(on) => self.tab_mut().set_reverse(on),
             PanelAction::SetVisualizer(i) => self.change_prefs(win, |p| p.visualizer = i),
             PanelAction::SetSubTimeline(on) => self.change_prefs(win, |p| p.sub_timeline = on),
@@ -1236,9 +1356,10 @@ impl App {
         }
     }
 
-    /// Settings from the Settings window. What changed takes effect now, in every tab, except
-    /// the per-file defaults (speed, aspect ratio, tracks, decoding, fullscreen), which the next
-    /// file uses.
+    /// Settings from the Settings window. What changed takes effect now, except the per-file
+    /// defaults (speed, aspect ratio, tracks, decoding, fullscreen), which the next file uses.
+    /// The sound effects, subtitle size, repeat and shuffle change the tab on screen, as the
+    /// popups and the queue do, and are where tabs opened later start; the rest is the window's.
     fn apply_prefs(&mut self, win: Window, new: Prefs) {
         let old = prefs();
         if new.on_top != old.on_top {
@@ -1254,19 +1375,23 @@ impl App {
         library::SHOW_HIDDEN.store(new.show_hidden, Relaxed);
         ass::STYLES.store(new.sub_styles, Relaxed);
         let restyle = new.sub_styles != old.sub_styles;
-        for tab in &mut self.tabs {
-            if (new.repeat, new.shuffle) != (old.repeat, old.shuffle) {
-                tab.queue.set_repeat(REPEAT[new.repeat.min(2)]);
-                tab.queue.set_shuffle(new.shuffle);
-            }
-            if new.device != old.device {
-                let name = (!new.device.is_empty()).then_some(new.device.as_str());
+        if new.device != old.device {
+            let name = (!new.device.is_empty()).then_some(new.device.as_str());
+            for tab in &self.tabs {
                 tab.audio.switch_to(name);
             }
         }
-        // Like the popups, Settings' sound effects change the tab on screen; tabs opened later
-        // start with them.
         apply_effects(&self.tab().audio, Some(&old), &new);
+        let tab = self.tab_mut();
+        if new.sub_size != old.sub_size {
+            tab.sub_size = new.sub_size;
+        }
+        if new.repeat != old.repeat {
+            tab.queue.set_repeat(REPEAT[new.repeat.min(2)]);
+        }
+        if new.shuffle != old.shuffle {
+            tab.queue.set_shuffle(new.shuffle);
+        }
         self.caption = new.caption();
         ui::theme::set(theme_of(&new));
         PREFS.set(new);
@@ -1307,7 +1432,8 @@ impl App {
     }
 
     /// Changes the panels, queue and menus make to things Settings also holds, so the
-    /// equalizer, stereo mode, subtitle size, repeat and shuffle stick across launches.
+    /// equalizer, stereo mode, subtitle size, repeat and shuffle stick across launches. Settings
+    /// hold the tab on screen's.
     fn sync_prefs(&mut self) {
         let tab = self.tab();
         let effects = tab.audio.effects();
@@ -1321,7 +1447,7 @@ impl App {
         let stereo = (StereoMode::ALL.iter())
             .position(|m| *m == effects.stereo())
             .unwrap_or(0);
-        let size = self.caption.size_ratio / CaptionStyle::default().size_ratio;
+        let size = tab.sub_size;
         let repeat = REPEAT.iter().position(|r| *r == tab.queue.repeat());
         let shuffle = tab.queue.shuffle();
         let changed = PREFS.with_borrow_mut(|p| {
@@ -1346,7 +1472,7 @@ impl App {
 
 impl Tab {
     /// A tab with nothing open, its sound going to the output Settings name, with Settings'
-    /// sound effects, repeat and shuffle.
+    /// sound effects, subtitle size, repeat and shuffle.
     fn new(p: &Prefs) -> Tab {
         let shared = Arc::new(Shared::new());
         let device = (!p.device.is_empty()).then_some(p.device.as_str());
@@ -1368,9 +1494,11 @@ impl Tab {
             aspect: 0,
             crop: 0,
             embedded: None,
+            fonts: ass::Fonts::default(),
             external: Vec::new(),
             external_selected: None,
             sub_delay: 0.0,
+            sub_size: p.sub_size,
             sub_speed: 1.0,
             sub_duration: 0.0,
             reverse: None,
@@ -1420,6 +1548,7 @@ impl Tab {
         }
         self.external.clear();
         self.external_selected = None;
+        self.fonts = ass::Fonts::default();
     }
 
     /// The file's starting subtitles: the embedded track the session picked (a default+forced
@@ -1430,14 +1559,12 @@ impl Tab {
             return;
         };
         // Fonts the file carries, which its styled subtitles ask for by name, unless Settings'
-        // Extensions turned them off. The last file's go first.
+        // Extensions turned them off. They are this file's alone: no other file or tab gets them.
         let fonts = session.take_fonts();
-        ass::clear_fonts();
-        if p.embedded_fonts {
-            for (name, data) in fonts {
-                ass::add_font(&name, &data);
-            }
-        }
+        self.fonts = match p.embedded_fonts {
+            true => ass::Fonts::new(&fonts),
+            false => ass::Fonts::default(),
+        };
         let initial = session.take_initial_subtitles();
         self.external = subs::find_external(&session.path)
             .into_iter()
@@ -1469,6 +1596,7 @@ impl Tab {
             stream.packets,
             self.shared.clone(),
             self.subtitle_canvas(),
+            &self.fonts,
         );
         if let Some((old, _)) = self.embedded.replace(decoder) {
             _ = old.join();
@@ -1482,7 +1610,7 @@ impl Tab {
             return;
         };
         if cues.is_none() {
-            match subs::load_external(path, canvas) {
+            match subs::load_external(path, canvas, &self.fonts) {
                 Ok(c) => *cues = Some(c),
                 Err(e) => {
                     eprintln!("subtitles: {e}");
@@ -1735,8 +1863,9 @@ fn theme_of(p: &Prefs) -> ui::theme::Theme {
 }
 
 /// The settings window opened at `category`, with the output devices as the tracks panel
-/// lists them.
-fn open_preferences(app: &App, category: Category) {
+/// lists them. It shows the tab on screen's sound, subtitle size and repeat.
+fn open_preferences(app: &mut App, category: Category) {
+    app.sync_prefs();
     UI.with_borrow_mut(|ui| ui.open_preferences(prefs(), app.devices.clone(), category));
 }
 
@@ -1890,9 +2019,14 @@ fn run() -> Result<(), Box<dyn Error>> {
     let mut shown_tabs: Vec<TabInfo> = Vec::new();
     // One pass of the render loop; false ends playback (--play-and-exit). See `run_frames`.
     let mut frame = || -> Result<bool, Box<dyn Error>> {
-        // Nothing to show in the mini player once playback ends.
-        if app.session().is_none() && is_mini() {
-            MINI_REQUEST.set(Some(Some(Page::Library)));
+        // Nothing to show in the mini player once playback ends: the full window comes back,
+        // on the player page while other tabs have something open.
+        if app.session().is_none() && is_mini() && !matches!(MINI_REQUEST.get(), Some(Some(_))) {
+            let page = match app.others_open() {
+                true => Page::Player,
+                false => Page::Library,
+            };
+            MINI_REQUEST.set(Some(Some(page)));
         }
         match MINI_REQUEST.take() {
             Some(None) if app.session().is_some() => enter_mini(win),
@@ -1914,7 +2048,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                     Err(e) => eprintln!("library: cannot add to {name}: {e}"),
                 }
             } else if app.play_file(&path) {
-                UI.with_borrow_mut(|ui| ui.show(Page::Player));
+                show_player();
             }
         }
         let opened = std::mem::take(&mut *OPEN_PLAY.lock().unwrap());
@@ -1925,10 +2059,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                 app.play_file(&first)
             };
             if played {
-                if is_mini() {
-                    MINI_REQUEST.set(Some(Some(Page::Player)));
-                }
-                UI.with_borrow_mut(|ui| ui.show(Page::Player));
+                show_player();
             }
         }
         // What the last file picker was opened for.
@@ -1987,7 +2118,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         fetch_network(&mut app);
         app.take_recordings();
         app.watch_conversion();
-        if app.finish_opening(app.active) {
+        if app.finish_opening(app.active).is_some() {
             UI.with_borrow_mut(|ui| ui.dirty = true);
         }
         // While a dropped stream opens again, the notice says so; it fades once it plays.
@@ -2189,10 +2320,9 @@ fn run() -> Result<(), Box<dyn Error>> {
         let hdr = PREFS.with_borrow(|p| p.hdr);
         renderer.update_display(&win.ns_window(), hdr, DISPLAY_CHANGED.swap(false, Relaxed));
 
-        // Tabs out of sight play on.
-        let active = app.active;
-        for i in (0..app.tabs.len()).filter(|i| *i != active) {
-            app.play_unseen(i);
+        // Tabs out of sight play on, and the last of them all to end may quit, per Settings.
+        if app.play_out_of_sight() && app.quit_at_end() {
+            destroy(win);
         }
         app.tab_mut().step_reverse();
         app.tab_mut().scrub(UI.with_borrow(Ui::scrubbing));
@@ -2223,7 +2353,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         let (w, h) = (w as f32, h as f32);
         let fullscreen = win.is_fullscreen();
         let has_video = app.session().is_some_and(|s| s.video_size.is_some());
-        let card = app.session().is_some();
+        let card = app.has_card();
         let panel_data = app.panel_data();
         let queue_data = UI.with_borrow(|ui| ui.queue.open).then(|| app.queue_data());
         // The title bar's tabs; a change repaints it, a new count lays it out again.
@@ -2240,10 +2370,9 @@ fn run() -> Result<(), Box<dyn Error>> {
         }
         let needs_paint = UI.with_borrow_mut(|ui| {
             // Nothing to show on the player page once playback ends or fails, unless its bars
-            // are being customized. A stream connecting, or the notice saying why it couldn't,
-            // keeps it up.
-            let waiting = app.tab().opening.is_some() || app.notice.is_some();
-            if app.session().is_none() && !waiting && ui.customize.is_none() {
+            // are being customized. A stream connecting, the notice saying why it couldn't, or
+            // another tab with something open keeps it up.
+            if app.nothing_to_show() && ui.customize.is_none() {
                 ui.show(Page::Library);
             }
             ui.menu_tick();
@@ -2384,13 +2513,15 @@ fn run() -> Result<(), Box<dyn Error>> {
                 }
             });
             let stats = app.statistics(shown, dropped);
-            let file = session.map_or(String::new(), |s| {
-                s.path
-                    .file_name()
-                    .unwrap_or_default()
+            let file = match session {
+                Some(s) => (s.path.file_name().unwrap_or_default())
                     .to_string_lossy()
-                    .into_owned()
-            });
+                    .into_owned(),
+                // The library's card for an empty tab names it as the tab strip does.
+                None if card => tab.info().title,
+                None => String::new(),
+            };
+            let caption = app.caption();
             UI.with_borrow(|ui| {
                 let duration = session.map_or(0.0, |s| s.duration);
                 let scene = Scene {
@@ -2434,7 +2565,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                     cues: &cues,
                     sub_marks: &marks,
                     visual: visual.as_deref().map(|v| (visualizer, v)),
-                    caption_style: &app.caption,
+                    caption_style: &caption,
                     stats: stats.as_deref(),
                     notice: app.notice.as_ref().map(|(text, _)| text.as_str()),
                     seek_hover: ui.seek_hover().map(|f| f * duration),
@@ -2482,16 +2613,13 @@ fn run() -> Result<(), Box<dyn Error>> {
             // the sleep timer says, which stops the tabs out of sight too).
             let sleep = app.sleep == SLEEP_END_OF_FILE;
             if sleep || !app.advance(app.active) {
-                // The end of the queue may quit, per Settings, unless other tabs play on.
-                let others = (app.tabs.iter().enumerate())
-                    .any(|(i, tab)| i != app.active && !tab.is_empty());
-                let quit = !sleep && !others && PREFS.with_borrow(|p| p.at_end == 1);
                 if sleep {
                     app.pause_all();
                 }
                 app.sleep = 0;
                 app.stop(app.active);
-                if quit {
+                // The end of the queue may quit, per Settings, unless other tabs play on.
+                if !sleep && app.quit_at_end() {
                     destroy(win);
                 }
             }
@@ -2714,21 +2842,8 @@ fn handle(app: &mut App, win: Window, hit: Hit) {
                     go(place);
                 }
                 Entry::Media { path, .. } => {
-                    if let Place::Playlist(name) = &place {
-                        app.mark_playlist(name);
-                    }
-                    let queue = app.library.media_in(&place);
-                    // Streams have no tags to name them by; the page's names do, for the whole
-                    // queue.
-                    if net::is_url_path(&path) {
-                        for entry in app.library.entries(&place) {
-                            if let Entry::Media { path, label, .. } = entry {
-                                app.stream_titles.insert(path, label);
-                            }
-                        }
-                    }
-                    if app.play(&path, queue) {
-                        UI.with_borrow_mut(|ui| ui.show(Page::Player));
+                    if play_entry(app, &path, &place) {
+                        show_player();
                     }
                 }
                 Entry::Action { action, .. } => match action {
@@ -2782,6 +2897,36 @@ fn handle(app: &mut App, win: Window, hit: Hit) {
         _ => {}
     }
     UI.with_borrow_mut(|ui| ui.dirty = true);
+}
+
+/// Plays `path`, an entry on library page `place`, as a click on it does: the page is the queue,
+/// a playlist counts a play, and streams take the page's names, a station's or an episode's.
+fn play_entry(app: &mut App, path: &Path, place: &Place) -> bool {
+    let mut queue = app.library.media_in(place);
+    if !queue.iter().any(|p| p == path) {
+        queue = vec![path.to_owned()];
+    }
+    if let Place::Playlist(name) = place {
+        app.mark_playlist(name);
+    }
+    // Streams have no tags to name them by; the page's names do, for the whole queue.
+    if net::is_url_path(path) {
+        for entry in app.library.entries(place) {
+            if let Entry::Media { path, label, .. } = entry {
+                app.stream_titles.insert(path, label);
+            }
+        }
+    }
+    app.play(path, queue)
+}
+
+/// Shows the player page; from the mini player, the full window comes back for it.
+fn show_player() {
+    if is_mini() {
+        MINI_REQUEST.set(Some(Some(Page::Player)));
+    } else {
+        UI.with_borrow_mut(|ui| ui.show(Page::Player));
+    }
 }
 
 /// Builds and opens the menu for a click on `hit`.
@@ -2882,11 +3027,12 @@ fn open_menu(app: &mut App, hit: Hit, at: (f32, f32)) {
 
 /// Carries out a menu choice.
 fn menu_action(app: &mut App, win: Window, action: MenuAction) {
-    let show_player = || UI.with_borrow_mut(|ui| ui.show(Page::Player));
+    let place = || UI.with_borrow(|ui| ui.browse.place.clone());
     match action {
         MenuAction::NewTab => app.new_tab(),
+        // As Play, in a tab of its own.
         MenuAction::PlayInNewTab(path) => {
-            if app.in_new_tab(|app| app.play_file(&path)) {
+            if app.in_new_tab(|app| play_entry(app, &path, &place())) {
                 show_player();
             }
         }
@@ -2903,16 +3049,7 @@ fn menu_action(app: &mut App, win: Window, action: MenuAction) {
             }
         }
         MenuAction::Play(path) => {
-            // The page it was on is the queue, as when the entry is clicked.
-            let place = UI.with_borrow(|ui| ui.browse.place.clone());
-            let mut queue = app.library.media_in(&place);
-            if !queue.contains(&path) {
-                queue = vec![path.clone()];
-            }
-            if let Place::Playlist(name) = &place {
-                app.mark_playlist(name);
-            }
-            if app.play(&path, queue) {
+            if play_entry(app, &path, &place()) {
                 show_player();
             }
         }
@@ -3164,7 +3301,7 @@ fn add_subtitle_to(app: &mut App, path: &Path, subs: PathBuf) {
         if !app.play(path, queue) {
             return;
         }
-        UI.with_borrow_mut(|ui| ui.show(Page::Player));
+        show_player();
     }
     app.tab_mut().show_subtitle_file(subs);
 }
@@ -3180,7 +3317,7 @@ fn play_playlist(app: &mut App, name: &str, shuffle: bool) {
     };
     app.mark_playlist(name);
     if app.play(&first, items) {
-        UI.with_borrow_mut(|ui| ui.show(Page::Player));
+        show_player();
     }
 }
 
@@ -3261,7 +3398,7 @@ fn apply_dialog(app: &mut App, win: Window, action: DialogAction) {
                 } else {
                     let path = PathBuf::from(url);
                     if app.play(&path, vec![path.clone()]) {
-                        UI.with_borrow_mut(|ui| ui.show(Page::Player));
+                        show_player();
                     }
                 }
             }
@@ -3488,7 +3625,6 @@ fn run_picker() {
 
 /// Does what the files were picked for; `paths` holds at least one.
 fn use_picked(app: &mut App, then: Picked, mut paths: Vec<PathBuf>) {
-    let show_player = || UI.with_borrow_mut(|ui| ui.show(Page::Player));
     let first = paths[0].clone();
     match then {
         Picked::SubtitleFile => app.tab_mut().show_subtitle_file(first),
@@ -3672,10 +3808,12 @@ fn on_event(event: Event) {
         Event::MouseLeave => UI.with_borrow_mut(Ui::on_leave),
         Event::MouseDown { x, y, clicks } => {
             let hit = UI.with_borrow(|ui| ui.layout.hit(x, y));
+            let caption = hit == Some(Hit::Caption);
+            let after_caption = PRESSED_CAPTION.replace(caption);
             // The design's title bar moves the window, and a double-click zooms it, except the
             // mini player's, which would grow to fill the screen.
-            if hit == Some(Hit::Caption) && !is_fullscreen() {
-                if clicks % 2 == 0 {
+            if caption && !is_fullscreen() {
+                if zooms(clicks, after_caption) {
                     if !is_mini() {
                         win.title_double_click();
                     }
@@ -3845,6 +3983,25 @@ fn on_event(event: Event) {
     }
 }
 
+/// Whether a press on the title bar, the `clicks`th in a row, zooms the window: the second of a
+/// double-click whose first press was on the title bar too. A first click that closed a tab
+/// moves the tabs, and the second press can then land on the bar.
+fn zooms(clicks: isize, after_caption: bool) -> bool {
+    clicks % 2 == 0 && after_caption
+}
+
+/// Whether menu action `a` changes which tab is on screen.
+fn switches_tab(a: &MenuAction) -> bool {
+    matches!(
+        a,
+        MenuAction::CloseTab
+            | MenuAction::NextTab
+            | MenuAction::PreviousTab
+            | MenuAction::SelectTab(_)
+            | MenuAction::PlayInNewTab(_)
+    )
+}
+
 fn act(win: Window, shared: &Shared, action: Option<Action>) {
     let Some(action) = action else { return };
     UI.with_borrow_mut(|ui| {
@@ -3919,7 +4076,13 @@ fn act(win: Window, shared: &Shared, action: Option<Action>) {
             | Hit::Tab(_)
             | Hit::CloseTab(_)
             | Hit::NewTab),
-        ) => PENDING.with_borrow_mut(|p| p.push(hit)),
+        ) => {
+            PENDING.with_borrow_mut(|p| p.push(hit));
+            // The events queued behind a switch wait for it, so keys go to the tab now shown.
+            if matches!(hit, Hit::Tab(_) | Hit::CloseTab(_)) {
+                platform::end_pump();
+            }
+        }
         Action::Click(_) => {}
         Action::SeekTo(fraction) => {
             shared.seek_to(fraction * f64::from_bits(DURATION.load(Relaxed)))
@@ -3927,7 +4090,13 @@ fn act(win: Window, shared: &Shared, action: Option<Action>) {
         Action::SetVolume(volume) => shared.set_volume(volume),
         Action::Panel(a) => PANEL_ACTIONS.with_borrow_mut(|p| p.push(a)),
         Action::Queue(a) => QUEUE_ACTIONS.with_borrow_mut(|q| q.push(a)),
-        Action::Menu(a) => MENU_ACTIONS.with_borrow_mut(|m| m.push(a)),
+        Action::Menu(a) => {
+            let switch = switches_tab(&a);
+            MENU_ACTIONS.with_borrow_mut(|m| m.push(a));
+            if switch {
+                platform::end_pump();
+            }
+        }
         Action::OpenMenu(hit, x, y) => MENU_REQUESTS.with_borrow_mut(|m| m.push((hit, x, y))),
         Action::Dialog(a) => DIALOG_ACTIONS.with_borrow_mut(|p| p.push(a)),
         Action::Preferences(a) => PREFS_ACTIONS.with_borrow_mut(|p| p.push(a)),
@@ -4034,13 +4203,13 @@ fn open_disc(app: &mut App, path: &Path) {
     match disc::address(path) {
         Some(address) => {
             if app.play(&address, vec![address.clone()]) {
-                UI.with_borrow_mut(|ui| ui.show(Page::Player));
+                show_player();
             }
         }
         None => {
             let line = format!("No DVD or Blu-ray video in {}", path.display());
             app.notice = Some((line, Instant::now()));
-            UI.with_borrow_mut(|ui| ui.show(Page::Player));
+            show_player();
         }
     }
 }
@@ -4355,6 +4524,38 @@ mod tests {
         assert!(line("screen://").starts_with("Can't open the capture"));
     }
 
+    /// One App test at a time: they share the window procedure's statics (`SHARED`, `DURATION`,
+    /// `MINI`).
+    static ONE_AT_A_TIME: Mutex<()> = Mutex::new(());
+
+    /// A window-less App with one empty tab, its library and settings in a folder of its own
+    /// named after `test`. The guard keeps other App tests waiting.
+    fn test_app(test: &str) -> (App, PathBuf, std::sync::MutexGuard<'static, ()>) {
+        let one = ONE_AT_A_TIME
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = std::env::temp_dir().join(format!("wushang-{test}-{}", std::process::id()));
+        _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = Prefs::default();
+        PREFS.set(p.clone());
+        let mut app = App::new(Tab::new(&p), None, &p, &dir);
+        app.sync_active();
+        (app, dir, one)
+    }
+
+    /// A file in testdata. Tests play the ones without sound, or mute their tab, to stay silent.
+    fn media(name: &str) -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("testdata")
+            .join(name)
+    }
+
+    /// Whether the window procedure acts on the tab on screen.
+    fn on_screen(app: &App) -> bool {
+        Arc::ptr_eq(SHARED.lock().unwrap().as_ref().unwrap(), &app.tab().shared)
+    }
+
     /// How far tab `i` has played, -1 before its clock starts.
     fn position(app: &App, i: usize) -> f64 {
         let s = app.tabs[i].session.as_ref();
@@ -4366,8 +4567,11 @@ mod tests {
     fn passes(app: &mut App, secs: f64, mut done: impl FnMut(&App) -> bool) -> bool {
         let start = Instant::now();
         while start.elapsed().as_secs_f64() < secs {
-            for i in 0..app.tabs.len() {
+            // A tab can go meanwhile.
+            let mut i = 0;
+            while i < app.tabs.len() {
                 app.play_unseen(i);
+                i += 1;
             }
             if done(app) {
                 return true;
@@ -4381,13 +4585,8 @@ mod tests {
     /// closing. The tab out of sight plays on, silenced, and keeps taking its frames.
     #[test]
     fn tabs_play_side_by_side() {
-        let dir = std::env::temp_dir().join(format!("wushang-tabs-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let data = Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata");
-        let (sound, silent) = (data.join("test_60s.mp4"), data.join("test_60s_noaudio.mp4"));
-        let p = Prefs::default();
-        let mut app = App::new(Tab::new(&p), None, &p, &dir);
-        app.sync_active();
+        let (mut app, dir, _one) = test_app("tabs");
+        let (sound, silent) = (media("test_60s.mp4"), media("test_60s_noaudio.mp4"));
         // Tests play on the real device: mute the first tab, the only one whose file has sound.
         app.tab().shared.toggle_mute();
 
@@ -4408,8 +4607,6 @@ mod tests {
         );
         assert!(app.tabs[0].shared.muted.load(Relaxed));
         assert_eq!(app.tab().shared.volume(), app.tabs[0].shared.volume());
-        let on_screen =
-            |app: &App| Arc::ptr_eq(SHARED.lock().unwrap().as_ref().unwrap(), &app.tab().shared);
         assert!(on_screen(&app));
         let infos: Vec<TabInfo> = app.tabs.iter().map(Tab::info).collect();
         assert_eq!(infos[0].title, "test 60s");
@@ -4459,7 +4656,7 @@ mod tests {
         assert!(passes(&mut app, 5.0, |app| position(app, 0) > at + 0.3));
 
         // A new tab that can't open goes again.
-        assert!(!app.in_new_tab(|app| app.play_file(&data.join("missing.mp4"))));
+        assert!(!app.in_new_tab(|app| app.play_file(&media("missing.mp4"))));
         assert_eq!((app.tabs.len(), app.active), (1, 0));
         assert!(on_screen(&app));
 
@@ -4501,5 +4698,259 @@ mod tests {
         assert!(!has_room(MAX_TABS, false));
         // An empty tab on screen takes what would have opened in a new one.
         assert!(has_room(MAX_TABS, true));
+    }
+
+    /// Presses the seek bar of a window-less player page, which starts a drag of it.
+    fn press_seek_bar() {
+        UI.with_borrow_mut(|ui| {
+            ui.show(Page::Player);
+            ui.layout = Layout::player(1280.0, 720.0, true, false, &ui.toolbar);
+            let points = (0..720).flat_map(|y| (0..1280).step_by(4).map(move |x| (x, y)));
+            let (x, y) = points
+                .map(|(x, y)| (x as f32, y as f32))
+                .find(|&(x, y)| ui.layout.hit(x, y) == Some(Hit::Seek))
+                .unwrap();
+            ui.on_down(x, y);
+        });
+        assert!(UI.with_borrow(Ui::scrubbing).is_some());
+    }
+
+    /// Settings show the tab on screen, and change it alone, however it came on screen: a
+    /// change there never takes one tab's equalizer or repeat to another.
+    #[test]
+    fn settings_change_the_tab_on_screen_alone() {
+        let (mut app, dir, _one) = test_app("settings");
+        app.tabs.push(Tab::new(&prefs()));
+        let rock = EQ_PRESETS.iter().position(|e| e.name == "Rock").unwrap();
+        // Tab 1 gets Rock and Repeat All from the popup and the queue, as the frame loop
+        // applies them; tab 2, shown with its shortcut, keeps neither.
+        app.apply(Window, PanelAction::SetEqPreset(Some(rock)));
+        app.sync_prefs();
+        app.apply_queue(QueueAction::CycleRepeat);
+        app.sync_prefs();
+        menu_action(&mut app, Window, MenuAction::SelectTab(1));
+        app.sync_prefs();
+        // A click on tab 1 in the title bar, then Command+, for Settings.
+        handle(&mut app, Window, Hit::Tab(0));
+        menu_action(
+            &mut app,
+            Window,
+            MenuAction::Preferences(Category::Playback),
+        );
+        app.sync_prefs();
+        let mut shown = UI.with_borrow(|ui| ui.preferences.as_ref().unwrap().prefs.clone());
+        assert_eq!((shown.eq_preset.as_str(), shown.repeat), ("Rock", 1));
+        let state = |app: &App, i: usize| {
+            let tab = &app.tabs[i];
+            (tab.audio.effects().eq().preset, tab.queue.repeat())
+        };
+        let second = (None, Repeat::Off);
+        // Only the clock's format changes there.
+        shown.time_left = !shown.time_left;
+        app.apply_prefs(Window, shown.clone());
+        assert_eq!(state(&app, 0), (Some(rock), Repeat::All));
+        assert_eq!(state(&app, 1), second);
+        // Its repeat, like its sound, is the tab on screen's.
+        shown.repeat = 2;
+        app.apply_prefs(Window, shown);
+        assert_eq!(state(&app, 0), (Some(rock), Repeat::One));
+        assert_eq!(state(&app, 1), second);
+
+        // A drag of the seek bar ends with its tab, and survives a switch to the same one.
+        press_seek_bar();
+        app.show_tab(0);
+        assert!(UI.with_borrow(Ui::scrubbing).is_some());
+        app.show_tab(1);
+        assert!(UI.with_borrow(Ui::scrubbing).is_none());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Each tab has its own subtitle size, which Settings' starts new tabs at; the font and
+    /// colours are the window's.
+    #[test]
+    fn each_tab_has_its_own_subtitle_size() {
+        let (mut app, dir, _one) = test_app("subtitle-size");
+        app.tabs.push(Tab::new(&prefs()));
+        let ratio = CaptionStyle::default().size_ratio;
+        app.apply(Window, PanelAction::SetSubSize(1.5));
+        app.sync_prefs();
+        app.apply(Window, PanelAction::SetSubColor(2));
+        app.sync_prefs();
+        let colour = app.caption().text;
+        assert_eq!(
+            (app.panel_data().sub_size, app.caption().size_ratio),
+            (1.5, ratio * 1.5)
+        );
+        app.show_tab(1);
+        assert_eq!(
+            (app.panel_data().sub_size, app.caption().size_ratio),
+            (1.0, ratio)
+        );
+        assert_eq!(app.caption().text, colour);
+        // Settings' size changes the tab on screen.
+        app.change_prefs(Window, |p| p.sub_size = 0.75);
+        assert_eq!(app.tabs[1].sub_size, 0.75);
+        app.show_tab(0);
+        assert_eq!(app.caption().size_ratio, ratio * 1.5);
+        // A tab opened now starts at Settings' size, which is the one on screen's.
+        assert_eq!(Tab::new(&prefs()).sub_size, 1.5);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A tab out of sight opens its next file on a thread, never holding up the window, and
+    /// when the last file of all ends there, wushang quits if Settings say so.
+    #[test]
+    fn a_tab_out_of_sight_moves_on_by_itself() {
+        let (mut app, dir, _one) = test_app("unseen");
+        let (short, long) = (media("test_subs.mkv"), media("test_60s_noaudio.mp4"));
+        PREFS.with_borrow_mut(|p| p.at_end = 1);
+        assert!(app.play_file(&long));
+        let queue = vec![short.clone(), long.clone()];
+        assert!(app.in_new_tab(|app| app.play(&short, queue)));
+        app.show_tab(0);
+        UI.with_borrow_mut(|ui| ui.browse.stale = false);
+        // The short file ends, and the next one opens in the background, quietly.
+        assert!(passes(&mut app, 15.0, |app| app.tabs[1].opening.is_some()));
+        assert!(app.notice.is_none());
+        assert_eq!(app.tabs[1].info().title, "test 60s noaudio");
+        assert!(UI.with_borrow(|ui| ui.browse.stale), "Recent shows it");
+        let playing = |app: &App| (app.tabs[1].session.as_ref()).is_some_and(|s| s.path == long);
+        assert!(passes(&mut app, 10.0, playing));
+
+        // It plays its queue's last file while the tab on screen has stopped.
+        app.stop(0);
+        assert!(!app.quit_at_end());
+        app.tabs[1].shared.seek_to(58.5);
+        let start = Instant::now();
+        let mut ended = false;
+        while !ended && start.elapsed() < Duration::from_secs(10) {
+            ended = app.play_out_of_sight();
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(ended && app.tabs[1].is_empty());
+        assert!(app.quit_at_end());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// The player page stays while another tab has something open, so the tab strip leads to
+    /// it, and the library's card leads back; with every tab empty, the library shows.
+    #[test]
+    fn an_empty_tab_keeps_the_way_to_the_others() {
+        let (mut app, dir, _one) = test_app("empty");
+        assert!(app.nothing_to_show() && !app.has_card());
+        assert!(app.play_file(&media("test_60s_noaudio.mp4")));
+        assert!(app.in_new_tab(|app| app.play_file(&media("test_subs.mkv"))));
+        // The tab on screen ends.
+        app.stop(1);
+        assert!(!app.nothing_to_show());
+        assert!(app.has_card());
+        // Switched to it from the other tab.
+        app.show_tab(0);
+        app.show_tab(1);
+        assert!(!app.nothing_to_show() && app.has_card());
+        app.stop(0);
+        assert!(app.nothing_to_show() && !app.has_card());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A stream opened in a new tab that fails to connect takes its tab with it, as a file that
+    /// fails at once does, and the tab before shows again.
+    #[test]
+    fn a_new_tab_whose_stream_fails_goes_again() {
+        let (mut app, dir, _one) = test_app("failed-stream");
+        PREFS.with_borrow_mut(|p| {
+            p.net_reconnect = false;
+            p.net_timeout = 2;
+        });
+        // Nothing listens there, so the connection is refused at once.
+        let refused = PathBuf::from("http://127.0.0.1:9/live.ts");
+        assert!(app.play_file(&media("test_60s_noaudio.mp4")));
+        assert!(app.in_new_tab(|app| app.play_file(&refused)));
+        assert_eq!((app.tabs.len(), app.active), (2, 1));
+        assert!(passes(&mut app, 10.0, |app| app.tabs.len() == 1));
+        assert_eq!(app.active, 0);
+        assert!(on_screen(&app));
+        let notice = app.notice.as_ref().map(|(text, _)| text.as_str());
+        assert!(notice.is_some_and(|n| n.starts_with("Can't play the stream")));
+
+        // Switched to another tab meanwhile: the failed one goes, and that one stays.
+        assert!(app.in_new_tab(|app| app.play_file(&refused)));
+        app.tabs.push(Tab::new(&prefs()));
+        app.show_tab(2);
+        let other = app.tab().shared.clone();
+        assert!(passes(&mut app, 10.0, |app| app.tabs.len() == 2));
+        assert!(Arc::ptr_eq(&app.tab().shared, &other) && on_screen(&app));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Closing a tab that recorded doesn't lose the notice saying where the recording went.
+    #[test]
+    fn a_closed_tabs_recording_still_reports() {
+        let (mut app, dir, _one) = test_app("closed-recording");
+        assert!(app.play_file(&media("test_60s_noaudio.mp4")));
+        assert!(app.in_new_tab(|app| app.play_file(&media("test_subs.mkv"))));
+        // What the demuxer leaves once the recording's file is closed, as its session ends.
+        let saved = dir.join("test subs.mkv");
+        let control = record::Control::default();
+        control.lock().unwrap().done.push(Ok(saved.clone()));
+        app.tab_mut().record_control = Some(control);
+        app.close_tab(1);
+        app.take_recordings();
+        let notice = app.notice.as_ref().map(|(text, _)| text.clone());
+        assert_eq!(
+            notice,
+            Some(format!("Recording saved to {}", saved.display()))
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// "Play in New Tab" plays a library entry as Play does, only in a tab of its own: on a
+    /// playlist's page, the playlist is the queue and its name shows.
+    #[test]
+    fn play_in_new_tab_plays_as_play_does() {
+        let (mut app, dir, _one) = test_app("play-in-new-tab");
+        let (short, long) = (media("test_subs.mkv"), media("test_60s_noaudio.mp4"));
+        app.library.create_playlist("Mix").unwrap();
+        for file in [&long, &short] {
+            app.library.add_to_playlist("Mix", file).unwrap();
+        }
+        UI.with_borrow_mut(|ui| ui.browse.go(Place::Playlist("Mix".to_owned())));
+        assert!(app.play_file(&long));
+        menu_action(&mut app, Window, MenuAction::PlayInNewTab(short.clone()));
+        assert_eq!((app.tabs.len(), app.active), (2, 1));
+        let tab = app.tab();
+        assert_eq!(tab.queue.items(), [long, short.clone()]);
+        assert_eq!(tab.queue.current(), Some(1));
+        assert_eq!(tab.playing_playlist.as_deref(), Some("Mix"));
+        assert!(tab.session.as_ref().is_some_and(|s| s.path == short));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Files opened from the mini player bring the full window back for the player, rather
+    /// than showing the player inside the mini one.
+    #[test]
+    fn opening_files_leaves_the_mini_player() {
+        let (mut app, dir, _one) = test_app("mini");
+        UI.with_borrow_mut(|ui| ui.show(Page::Mini));
+        *MINI.lock().unwrap() = Some((Rect::default(), false));
+        use_picked(
+            &mut app,
+            Picked::OpenFiles,
+            vec![media("test_60s_noaudio.mp4")],
+        );
+        use_picked(&mut app, Picked::NewTab, vec![media("test_subs.mkv")]);
+        *MINI.lock().unwrap() = None;
+        assert_eq!(app.tabs.len(), 2);
+        assert_eq!(MINI_REQUEST.take(), Some(Some(Page::Player)));
+        assert_eq!(UI.with_borrow(|ui| ui.page), Page::Mini);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn only_a_double_click_on_the_title_bar_zooms() {
+        assert!(zooms(2, true));
+        assert!(!zooms(1, true));
+        // The first click closed a tab, and the tabs moved from under the pointer.
+        assert!(!zooms(2, false));
     }
 }

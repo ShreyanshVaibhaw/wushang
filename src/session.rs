@@ -190,6 +190,15 @@ fn demuxers_except(excluded: &[&str]) -> String {
     names.join(",")
 }
 
+/// What a file is called on screen: its name without the extension, underscores as spaces
+/// ("The_Wand_S01E04.mp4" is "The Wand S01E04").
+pub fn file_title(path: &Path) -> String {
+    path.file_stem()
+        .unwrap_or(path.as_os_str())
+        .to_string_lossy()
+        .replace('_', " ")
+}
+
 /// Whether `path` is a live stream FFmpeg doesn't reconnect itself (it does http and HLS), so
 /// the demuxer opens it again when it drops.
 fn reopens(path: &Path) -> bool {
@@ -394,11 +403,7 @@ impl Session {
             Some(url) => meta(&input.metadata(), c"icy-name")
                 .or_else(|| meta(&input.metadata(), c"title"))
                 .unwrap_or_else(|| net::url_name(url)),
-            None => path
-                .file_stem()
-                .unwrap_or(path.as_os_str())
-                .to_string_lossy()
-                .replace('_', " "),
+            None => file_title(path),
         };
         let folder = match &url {
             _ if capture || disc => String::new(),

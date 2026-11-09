@@ -286,13 +286,14 @@ fn styled(id: ff::codec::Id) -> bool {
 /// Decodes an embedded subtitle stream's packets as the demuxer routes them. Stops when
 /// `shared.quitting()`. On `Msg::Flush` (seek) it clears the cues, since the demuxer sends the
 /// packets after the new position again. ASS and SSA go to libass, drawn on a `canvas` the
-/// video's size.
+/// video's size with the file's `fonts`.
 pub fn spawn_embedded(
     parameters: ff::codec::Parameters,
     time_base: f64,
     packets: Arc<PacketQueue>,
     shared: Arc<Shared>,
     canvas: impl Into<crate::ass::Canvas>,
+    fonts: &crate::ass::Fonts,
 ) -> (JoinHandle<()>, Arc<Cues>) {
     if styled(parameters.id()) {
         let header = unsafe {
@@ -302,7 +303,7 @@ pub fn spawn_embedded(
                 false => std::slice::from_raw_parts(p.extradata, p.extradata_size as usize),
             }
         };
-        if let Some(track) = crate::ass::Track::new(header, canvas.into()) {
+        if let Some(track) = crate::ass::Track::new(header, canvas.into(), fonts) {
             return spawn_styled(track, time_base, packets, shared);
         }
     }
@@ -363,10 +364,12 @@ fn spawn_styled(
 }
 
 /// Reads external text subtitles up front, with a decoded-size budget. Bitmap formats decode
-/// on a worker around the current playback position. ASS/SSA goes to libass on `canvas`.
+/// on a worker around the current playback position. ASS/SSA goes to libass on `canvas`, with
+/// the `fonts` of the file it is shown on.
 pub fn load_external(
     path: &Path,
     canvas: impl Into<crate::ass::Canvas>,
+    fonts: &crate::ass::Fonts,
 ) -> Result<Arc<Cues>, String> {
     let canvas = canvas.into();
     // Subtitle files run to kilobytes; one this big is not a subtitle file, and reading it
@@ -391,7 +394,7 @@ pub fn load_external(
                 }
             }
         };
-        if let Some(track) = crate::ass::Track::from_file(&text, canvas) {
+        if let Some(track) = crate::ass::Track::from_file(&text, canvas, fonts) {
             return Ok(Arc::new(Cues {
                 ass: Some(track),
                 ..Default::default()
@@ -1010,7 +1013,7 @@ mod tests {
         let data = pgs_file(16);
         assert!(data.len() < 110_000);
         std::fs::write(&path, data).unwrap();
-        let cues = load_external(&path, (1920, 1080)).unwrap();
+        let cues = load_external(&path, (1920, 1080), &crate::ass::Fonts::default()).unwrap();
         // Pictures start every 2 s. Playing through must find each one, including the one that
         // crosses the lookahead; then a jump forward and one back must too.
         let forward = (0..16).map(|i| f64::from(i) * 2.0 + 0.5);
@@ -1056,7 +1059,7 @@ mod tests {
         }
         out.write_trailer().unwrap();
         drop(out);
-        let cues = load_external(&path, (720, 480)).unwrap();
+        let cues = load_external(&path, (720, 480), &crate::ass::Fonts::default()).unwrap();
         for i in 0..12 {
             let (want, time) = (f64::from(i) * 2.0, f64::from(i) * 2.0 + 0.5);
             let deadline = Instant::now() + Duration::from_secs(5);
@@ -1212,7 +1215,7 @@ mod tests {
         // "Привет, мир!" and "До свидания." in Windows-1251.
         let srt = b"1\r\n00:00:01,000 --> 00:00:02,000\r\n\xcf\xf0\xe8\xe2\xe5\xf2, \xec\xe8\xf0!\r\n\r\n2\r\n00:00:03,000 --> 00:00:04,000\r\n\xc4\xee \xf1\xe2\xe8\xe4\xe0\xed\xe8\xff.\r\n\r\n";
         std::fs::write(&path, srt).unwrap();
-        let cues = load_external(&path, (1920, 1080)).unwrap();
+        let cues = load_external(&path, (1920, 1080), &crate::ass::Fonts::default()).unwrap();
         assert_eq!(
             text(&cues.active(1.5)[0]),
             &vec![vec![span("Привет, мир!", false, false)]]
@@ -1230,7 +1233,7 @@ mod tests {
         // Windows-1252 bytes (0x92 is a curly apostrophe), as many old .srt files are.
         let srt = b"1\r\n00:00:01,000 --> 00:00:02,500\r\nIt\x92s <i>fine</i>\r\n\r\n2\r\n00:00:03,000 --> 00:00:04,000\r\nTwo\r\n<b>lines</b>\r\n\r\n";
         std::fs::write(&path, srt).unwrap();
-        let cues = load_external(&path, (1920, 1080)).unwrap();
+        let cues = load_external(&path, (1920, 1080), &crate::ass::Fonts::default()).unwrap();
         assert_eq!(cues.len(), 2);
         let first = &cues.active(1.0)[0];
         assert!(
@@ -1271,7 +1274,7 @@ mod tests {
             Dialogue: 0,0:00:01.25,0:00:03.00,Default,,0,0,0,,{\\i1}Leaning{\\i0} in\\Nnext line\n";
         std::fs::write(&path, ass).unwrap();
         // libass draws the file, one picture per moment on the video-sized canvas.
-        let cues = load_external(&path, (1920, 1080)).unwrap();
+        let cues = load_external(&path, (1920, 1080), &crate::ass::Fonts::default()).unwrap();
         let shown = |t: f64| match cues.active(t).as_slice() {
             [
                 Cue {
@@ -1308,7 +1311,7 @@ mod tests {
         let path = temp_dir("vtt").join("movie.en.vtt");
         let vtt = "WEBVTT\n\n00:00.500 --> 00:02.000\n<i>Over</i> here\n\n00:03.000 --> 00:04.000 align:start\nThere\n";
         std::fs::write(&path, vtt).unwrap();
-        let cues = load_external(&path, (1920, 1080)).unwrap();
+        let cues = load_external(&path, (1920, 1080), &crate::ass::Fonts::default()).unwrap();
         assert_eq!(cues.len(), 2);
         let first = &cues.active(1.0)[0];
         assert!(
@@ -1402,6 +1405,7 @@ mod tests {
             queue.clone(),
             shared.clone(),
             (1920, 1080),
+            &crate::ass::Fonts::default(),
         );
         for (s, packet) in input.packets() {
             if s.index() == index {
@@ -1441,6 +1445,7 @@ mod tests {
             queue.clone(),
             shared.clone(),
             (1920, 1080),
+            &crate::ass::Fonts::default(),
         );
         for (s, packet) in input.packets() {
             if s.index() == index {
@@ -1545,6 +1550,7 @@ mod tests {
             queue.clone(),
             shared.clone(),
             (720, 480),
+            &crate::ass::Fonts::default(),
         );
         for (pts, x) in [(90000, 100), (3 * 90000, 300)] {
             let mut packet = ff::Packet::copy(&dvd_packet(x, 400, 64, 20, 1000));

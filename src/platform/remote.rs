@@ -55,6 +55,10 @@ pub(super) fn run() {
         if let Err(e) = command(&line) {
             eprintln!("remote: {line:?}: {e}");
         }
+        // As the event pump does: the rest waits for the render loop to act on this one.
+        if super::app::pump_ended() {
+            return;
+        }
     }
 }
 

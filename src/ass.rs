@@ -55,15 +55,13 @@ struct Api {
         unsafe extern "C" fn(*mut c_void, *mut c_char, usize, *const c_char) -> *mut c_void,
 }
 
-/// The loaded dylib, and the ASS_Library new tracks are made from, which holds the fonts the
-/// playing file brings along.
+/// The loaded dylib.
 struct Lib {
     api: Api,
-    library: Mutex<Arc<Library>>,
 }
 
-/// An ASS_Library. Each file gets its own, as libass reads added fonts in place: a renderer keeps
-/// pointing into the library's copy, so the fonts can only go with the last track made from it.
+/// An ASS_Library, with the fonts added to it. libass reads them in place, from the library's
+/// copies, so every track and renderer made from one keeps it alive.
 struct Library(*mut c_void);
 
 impl Library {
@@ -87,7 +85,7 @@ impl Drop for Library {
     }
 }
 
-// libass objects are only touched under the mutexes here and in `Track`.
+// A library is only read once its fonts are in, and a track is only touched under its mutex.
 unsafe impl Send for Library {}
 unsafe impl Sync for Library {}
 
@@ -144,11 +142,7 @@ fn lib() -> Option<&'static Lib> {
             process_chunk: load!("ass_process_chunk"),
             read_memory: load!("ass_read_memory"),
         };
-        let library = Library::new(&api)?;
-        Some(Lib {
-            api,
-            library: Mutex::new(library),
-        })
+        Some(Lib { api })
     })
     .as_ref()
 }
@@ -165,26 +159,42 @@ pub fn styling() -> bool {
     STYLES.load(std::sync::atomic::Ordering::Relaxed) && available()
 }
 
-/// Starts the fonts over for a new file, so it doesn't get the fonts of the one played before it.
-/// Tracks made earlier keep the fonts they have.
-pub fn clear_fonts() {
-    if let Some(lib) = lib()
-        && let Some(fresh) = Library::new(&lib.api)
-    {
-        *lib.library.lock().unwrap() = fresh;
-    }
-}
+/// The fonts styled subtitles are drawn with: the system's, and those a file carries (Matroska
+/// attachments), which its subtitles ask for by name. Each file playing has a set of its own, so
+/// one tab's fonts never reach another tab's tracks. Clones share the set; the default one is
+/// the system's fonts alone.
+#[derive(Clone, Default)]
+pub struct Fonts(Option<Arc<Library>>);
 
-/// Makes a font a file carries (a Matroska attachment) available to the tracks made after.
-pub fn add_font(name: &str, data: &[u8]) {
-    let (Some(lib), Ok(name)) = (lib(), CString::new(name)) else {
-        return;
-    };
-    let Ok(size) = c_int::try_from(data.len()) else {
-        return;
-    };
-    let library = lib.library.lock().unwrap();
-    unsafe { (lib.api.add_font)(library.0, name.as_ptr(), data.as_ptr().cast(), size) };
+impl Fonts {
+    /// The system's fonts and `fonts`, each a file name and its contents. The set is fixed once
+    /// made, since the tracks made from it read it as they draw.
+    pub fn new(fonts: &[(String, Vec<u8>)]) -> Fonts {
+        // Without any, libass needn't even load yet.
+        if fonts.is_empty() {
+            return Fonts::default();
+        }
+        let library = lib().and_then(|lib| {
+            let library = Library::new(&lib.api)?;
+            for (name, data) in fonts {
+                let (Ok(name), Ok(size)) =
+                    (CString::new(name.as_str()), c_int::try_from(data.len()))
+                else {
+                    continue;
+                };
+                // libass keeps a copy of the data.
+                unsafe { (lib.api.add_font)(library.0, name.as_ptr(), data.as_ptr().cast(), size) };
+            }
+            Some(library)
+        });
+        Fonts(library)
+    }
+
+    /// The library a new track is made from: the set's own, or for the system's fonts alone, a
+    /// fresh one.
+    fn library(&self, lib: &Lib) -> Option<Arc<Library>> {
+        self.0.clone().or_else(|| Library::new(&lib.api))
+    }
 }
 
 /// The picture styled subtitles are drawn for: the video's stored size, and the size it shows
@@ -222,10 +232,10 @@ unsafe impl Send for Inner {}
 
 impl Track {
     /// A track to feed event by event, with `header` (the codec private data: script info and
-    /// styles) up front.
-    pub fn new(header: &[u8], canvas: Canvas) -> Option<Track> {
+    /// styles) up front, drawn with `fonts`.
+    pub fn new(header: &[u8], canvas: Canvas, fonts: &Fonts) -> Option<Track> {
         let lib = lib()?;
-        let library = lib.library.lock().unwrap().clone();
+        let library = fonts.library(lib)?;
         let track = unsafe { (lib.api.new_track)(library.0) };
         if track.is_null() {
             return None;
@@ -236,11 +246,11 @@ impl Track {
         Track::with(track, library, canvas)
     }
 
-    /// A whole .ass or .ssa file.
-    pub fn from_file(text: &[u8], canvas: Canvas) -> Option<Track> {
+    /// A whole .ass or .ssa file, drawn with `fonts`.
+    pub fn from_file(text: &[u8], canvas: Canvas, fonts: &Fonts) -> Option<Track> {
         let lib = lib()?;
         let mut copy = text.to_vec();
-        let library = lib.library.lock().unwrap().clone();
+        let library = fonts.library(lib)?;
         let track = unsafe {
             (lib.api.read_memory)(
                 library.0,
@@ -432,7 +442,7 @@ mod tests {
         );
         let file =
             std::fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/testdata/styled.ass")).unwrap();
-        let track = Track::from_file(&file, (1920, 1080).into()).unwrap();
+        let track = Track::from_file(&file, (1920, 1080).into(), &Fonts::default()).unwrap();
         assert!(
             track.render(0.2).is_none(),
             "nothing before the first event"
@@ -467,7 +477,7 @@ mod tests {
             Style: Default,Arial,40,&H00FFFFFF,&H00FFFFFF,&H00000000,&H00000000,0,0,0,0,100,100,\
             0,0,1,2,0,2,10,10,10,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, \
             MarginR, MarginV, Effect, Text\n";
-        let track = Track::new(header, (1280, 720).into()).unwrap();
+        let track = Track::new(header, (1280, 720).into(), &Fonts::default()).unwrap();
         track.add_event(b"0,0,Default,,0,0,0,,Hello", 1.0, 2.0);
         // Sent again after a seek: still one line.
         track.add_event(b"0,0,Default,,0,0,0,,Hello", 1.0, 2.0);
@@ -476,10 +486,11 @@ mod tests {
         assert!(track.render(3.5).is_none());
     }
 
-    /// A file's fonts serve its tracks, and are gone for the tracks of the file after it. Inter,
-    /// which wushang bundles and macOS doesn't have, stands in for an attached font.
+    /// A file's fonts serve its tracks and no one else's, even tracks made after another file
+    /// started with fonts of its own, as in two tabs. Inter, which wushang bundles and macOS
+    /// doesn't have, stands in for an attached font.
     #[test]
-    fn a_files_fonts_go_with_it() {
+    fn each_files_fonts_are_its_own() {
         let header = b"[Script Info]\nPlayResX: 640\nPlayResY: 360\n\n[V4+ Styles]\n\
             Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, \
             BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, \
@@ -487,8 +498,8 @@ mod tests {
             Style: Default,Inter,40,&H00FFFFFF,&H00FFFFFF,&H00000000,&H00000000,0,0,0,0,100,100,\
             0,0,1,0,0,2,10,10,10,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, \
             MarginR, MarginV, Effect, Text\n";
-        let width = || {
-            let track = Track::new(header, (1280, 720).into()).unwrap();
+        let width = |fonts: &Fonts| {
+            let track = Track::new(header, (1280, 720).into(), fonts).unwrap();
             track.add_event(
                 b"0,0,Default,,0,0,0,,Wide wavy windows 0123456789",
                 1.0,
@@ -496,11 +507,21 @@ mod tests {
             );
             track.render(1.5).unwrap().1.w
         };
-        let inter = include_bytes!("../assets/fonts/Inter-Regular.ttf");
-        add_font("Inter-Regular.ttf", inter);
-        let with = width();
-        clear_fonts();
-        let without = width();
+        let font = |name: &str, data: &[u8]| Fonts::new(&[(name.to_owned(), data.to_vec())]);
+        let regular = font(
+            "Inter-Regular.ttf",
+            include_bytes!("../assets/fonts/Inter-Regular.ttf"),
+        );
+        let with = width(&regular);
+        // Another file starts, carrying a font of its own.
+        let semibold = font(
+            "Inter-SemiBold.ttf",
+            include_bytes!("../assets/fonts/Inter-SemiBold.ttf"),
+        );
+        let other = width(&semibold);
+        let without = width(&Fonts::default());
+        assert_eq!(width(&regular), with, "the first file keeps its font");
+        assert_ne!(other, with, "the second file hasn't the first one's");
         let ratio = with as f32 / without as f32;
         assert!(
             !(0.98..=1.02).contains(&ratio),
@@ -528,7 +549,7 @@ mod tests {
         let laid_out = header("LayoutResX: 1024\nLayoutResY: 576\n");
         // A line's width over its height, drawn on `canvas`.
         let shape = |header: &str, canvas: Canvas| {
-            let track = Track::new(header.as_bytes(), canvas).unwrap();
+            let track = Track::new(header.as_bytes(), canvas, &Fonts::default()).unwrap();
             track.add_event(b"0,0,Default,,0,0,0,,Hello there", 1.0, 2.0);
             let (_, p) = track.render(1.5).unwrap();
             f64::from(p.w) / f64::from(p.h)

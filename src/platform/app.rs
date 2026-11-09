@@ -67,6 +67,8 @@ thread_local! {
     static LAUNCHED: Cell<bool> = const { Cell::new(false) };
     /// The window closed for good: the pump says so, as WM_QUIT did.
     pub(super) static CLOSED: Cell<bool> = const { Cell::new(false) };
+    /// The pass's events stop here, as `end_pump` asked.
+    static END_PUMP: Cell<bool> = const { Cell::new(false) };
     /// The system is logging out or shutting down, which can't wait for wushang to save.
     static POWER_OFF: Cell<bool> = const { Cell::new(false) };
     /// Whether the menu bar's commands are on; off while the window's own dialogs have the keys.
@@ -231,9 +233,14 @@ define_class!(
 
         /// Greys out the menu bar's commands while a dialog, Settings, the welcome, Customize
         /// or a menu of the window's own is open; Hide and Quit's neighbours stay AppKit's.
+        /// Closing and switching tabs also wait for the window to be on screen: minimized, it
+        /// isn't the key window, so their keys come here and would act on tabs out of sight.
         #[unsafe(method(validateMenuItem:))]
         fn validate_menu_item(&self, item: &NSMenuItem) -> bool {
-            item.action() != Some(sel!(wushangMenu:)) || MENU_ENABLED.get()
+            let tabs = [Command::CloseTab, Command::NextTab, Command::PreviousTab];
+            let on_tabs = tabs.into_iter().any(|c| c as isize == item.tag());
+            item.action() != Some(sel!(wushangMenu:))
+                || (MENU_ENABLED.get() && (!on_tabs || self.window_on_screen()))
         }
 
         #[unsafe(method(willPowerOff:))]
@@ -248,6 +255,19 @@ impl Delegate {
         let this = Self::alloc(mtm).set_ivars(());
         // SAFETY: NSObject's init.
         unsafe { msg_send![super(this), init] }
+    }
+
+    /// Whether the player's window, the one this is the delegate of, is shown and not
+    /// minimized. Before it exists, it isn't.
+    fn window_on_screen(&self) -> bool {
+        let ours = |w: &NSWindow| {
+            w.delegate()
+                .is_some_and(|d| std::ptr::addr_eq(Retained::as_ptr(&d), std::ptr::from_ref(self)))
+        };
+        NSApplication::sharedApplication(mtm())
+            .windows()
+            .iter()
+            .any(|w| ours(&w) && w.isVisible() && !w.isMiniaturized())
     }
 }
 
@@ -334,10 +354,22 @@ pub fn raise_thread_priority() {
     }
 }
 
+/// Leaves the events after this one for the next pass, so the render loop acts on what this
+/// one asked for first: after a tab switch, keys go to the tab now on screen.
+pub fn end_pump() {
+    END_PUMP.set(true);
+}
+
+/// Whether `end_pump` was asked for in this pass.
+pub(super) fn pump_ended() -> bool {
+    END_PUMP.get()
+}
+
 /// Handles pending events. Returns false once the window is gone.
 pub fn pump_messages() -> bool {
     let app = NSApplication::sharedApplication(mtm());
     autoreleasepool(|_| {
+        END_PUMP.set(false);
         let past = NSDate::distantPast();
         // SAFETY: the default mode is a valid run loop mode.
         while let Some(event) = unsafe {
@@ -349,12 +381,12 @@ pub fn pump_messages() -> bool {
             )
         } {
             app.sendEvent(&event);
-            if CLOSED.get() {
+            if CLOSED.get() || END_PUMP.get() {
                 break;
             }
         }
         #[cfg(debug_assertions)]
-        if !CLOSED.get() {
+        if !CLOSED.get() && !END_PUMP.get() {
             super::remote::run();
         }
     });

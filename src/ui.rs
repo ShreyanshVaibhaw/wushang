@@ -969,6 +969,15 @@ impl Ui {
         self.relayout = true;
     }
 
+    /// The tab on screen changed under the pointer: a seek bar drag, its preview and a pressed
+    /// button belonged to the tab before, so they end without acting.
+    pub fn end_pointer(&mut self) {
+        self.pressed = None;
+        self.drag = None;
+        self.seek_preview = None;
+        self.dirty = true;
+    }
+
     pub fn on_leave(&mut self) {
         self.pointer = (f32::NAN, f32::NAN);
         if self.hover.take().is_some() {

@@ -18,8 +18,8 @@ use std::cell::{Cell, RefCell};
 use std::path::PathBuf;
 
 pub use app::{
-    Command, autoreleasepool, finish, init, launched_hidden, pump_messages, raise_thread_priority,
-    set_menu_enabled, set_modal_tick, wait_for_event,
+    Command, autoreleasepool, end_pump, finish, init, launched_hidden, pump_messages,
+    raise_thread_priority, set_menu_enabled, set_modal_tick, wait_for_event,
 };
 pub use keys::VIRTUAL_KEY;
 pub use services::*;
