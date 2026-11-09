@@ -37,10 +37,14 @@ pub enum Command {
     PlayPause,
     Minimize,
     MiniPlayer,
+    NewTab,
+    CloseTab,
+    NextTab,
+    PreviousTab,
 }
 
 impl Command {
-    pub(super) const ALL: [Command; 9] = [
+    pub(super) const ALL: [Command; 13] = [
         Command::About,
         Command::Settings,
         Command::Quit,
@@ -50,6 +54,10 @@ impl Command {
         Command::PlayPause,
         Command::Minimize,
         Command::MiniPlayer,
+        Command::NewTab,
+        Command::CloseTab,
+        Command::NextTab,
+        Command::PreviousTab,
     ];
 }
 
@@ -445,20 +453,34 @@ fn build_menu(mtm: MainThreadMarker, app: &NSApplication, delegate: &Delegate) {
     submenu(
         "File",
         vec![
+            command("New Tab", Command::NewTab, "t"),
             command("Open File\u{2026}", Command::Open, "o"),
             command("Open Folder\u{2026}", Command::OpenFolder, "f"),
             command("Open Network Stream\u{2026}", Command::OpenNetwork, "n"),
+            separator(),
+            command("Close Tab", Command::CloseTab, "w"),
         ],
     );
     submenu(
         "Playback",
         vec![command("Play/Pause", Command::PlayPause, "")],
     );
+    // Shift+Command+[ and ], as Safari and Finder have them.
+    let tab_command = |title: &str, which: Command, key: &str| {
+        let item = command(title, which, key);
+        item.setKeyEquivalentModifierMask(
+            NSEventModifierFlags::Command | NSEventModifierFlags::Shift,
+        );
+        item
+    };
     let window_menu = submenu(
         "Window",
         vec![
             command("Minimize", Command::Minimize, ""),
             command("Mini Player", Command::MiniPlayer, "m"),
+            separator(),
+            tab_command("Show Previous Tab", Command::PreviousTab, "["),
+            tab_command("Show Next Tab", Command::NextTab, "]"),
             separator(),
         ],
     );

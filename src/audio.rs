@@ -144,9 +144,10 @@ enum Output {
     },
 }
 
-/// The audio device, opened once for the whole run and shared by every file played. Opening a
-/// device can take a while (a Bluetooth headset wakes up first), so it opens on a background
-/// thread at startup, and switching files only clears the ring.
+/// The audio device, opened once for a tab's whole life and shared by every file it plays.
+/// Opening a device can take a while (a Bluetooth headset wakes up first), so it opens on a
+/// background thread, and switching files only clears the ring. Each tab has its own, and the
+/// system mixes them.
 pub struct Device {
     shared: Arc<Shared>,
     effects: Arc<Effects>,
@@ -159,7 +160,8 @@ pub struct Device {
 }
 
 impl Device {
-    pub fn open(shared: Arc<Shared>) -> Arc<Device> {
+    /// Opens the output named as in `output_devices`, or the system default for None.
+    pub fn open(shared: Arc<Shared>, name: Option<&str>) -> Arc<Device> {
         let device = Arc::new_cyclic(|me| Device {
             shared,
             effects: Arc::new(Effects::new()),
@@ -177,7 +179,7 @@ impl Device {
             opening: Mutex::new(()),
             me: me.clone(),
         });
-        device.reopen(None);
+        device.reopen(name.map(str::to_owned));
         device
     }
 
@@ -734,7 +736,7 @@ mod tests {
         eprintln!("output devices: {:?}", output_devices());
         let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("testdata/test_60s.mp4");
         let shared = Arc::new(Shared::new());
-        let device = Device::open(shared.clone());
+        let device = Device::open(shared.clone(), None);
         device.effects().set_speed(1.5);
         let threads = play(&path, &shared, &device);
 

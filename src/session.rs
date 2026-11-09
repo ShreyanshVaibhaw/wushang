@@ -1127,7 +1127,7 @@ mod tests {
             let shared = Arc::new(Shared::new());
             // Tests play on the real device; keep them silent.
             shared.toggle_mute();
-            let audio = audio::Device::open(shared.clone());
+            let audio = audio::Device::open(shared.clone(), None);
             let session = Session::open(
                 &clip(),
                 None,
@@ -1240,6 +1240,42 @@ mod tests {
         })
     }
 
+    /// Two tabs: two sessions at once, each on its own clock and sound output. Both play on;
+    /// the one out of sight is silenced, the other heard, here at -120 dB so the test stays
+    /// silent while the samples it sends aren't zero. Then they swap.
+    #[test]
+    fn two_sessions_play_at_once_and_only_one_is_heard() {
+        let heard = Player::start();
+        let unseen = Player::start();
+        // `start` mutes; setting a volume unmutes.
+        heard.shared.set_volume(1e-6);
+        unseen.shared.set_volume(1e-6);
+        unseen.shared.silenced.store(true, Relaxed);
+        if !heard.has_audio_device() || !unseen.has_audio_device() {
+            return;
+        }
+        // The clip is 5 s long, so measure in short spans.
+        assert!(heard.advances(0.5), "the tab on screen plays");
+        assert!(unseen.advances(0.5), "the tab out of sight plays on");
+        // What the callback last sent to the device, after the gain.
+        let sounding = |p: &Player| (p.shared.scope.lock().unwrap().1.iter()).any(|s| *s != 0.0);
+        assert!(sounding(&heard));
+        assert!(!sounding(&unseen));
+        assert_eq!(unseen.shared.gain(), 0.0);
+        assert!(
+            !unseen.shared.muted.load(Relaxed),
+            "the user's mute is untouched"
+        );
+
+        heard.shared.silenced.store(true, Relaxed);
+        unseen.shared.silenced.store(false, Relaxed);
+        // The scope holds about 20 ms; give the callbacks time to replace it.
+        thread::sleep(Duration::from_millis(300));
+        assert!(heard.advances(0.3) && unseen.advances(0.3));
+        assert!(!sounding(&heard));
+        assert!(sounding(&unseen));
+    }
+
     #[test]
     fn lists_tracks_like_vlc() {
         let mut p = Player::start();
@@ -1281,7 +1317,7 @@ mod tests {
     fn lists_chapters() {
         let shared = Arc::new(Shared::new());
         shared.toggle_mute();
-        let audio = audio::Device::open(shared.clone());
+        let audio = audio::Device::open(shared.clone(), None);
         // test_tracks.mkv remuxed with three chapters, the middle one without a title.
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/test_chapters.mkv");
         let s = Session::open(&path, None, &TrackChoice::default(), &shared, None, &audio).unwrap();

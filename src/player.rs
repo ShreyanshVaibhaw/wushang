@@ -122,6 +122,9 @@ pub struct Shared {
     exact: AtomicBool,
     volume: AtomicU32,
     pub muted: AtomicBool,
+    /// Set while this playback's tab is out of sight: its sound goes on silently, so its clock
+    /// keeps running, apart from the user's own mute.
+    pub silenced: AtomicBool,
     seek: Mutex<Seek>,
     pub video_done: AtomicBool,
     /// True when audio is playing or about to, so the audio callback owns the clock.
@@ -210,6 +213,7 @@ impl Shared {
             exact: AtomicBool::new(true),
             volume: AtomicU32::new(1.0f32.to_bits()),
             muted: AtomicBool::new(false),
+            silenced: AtomicBool::new(false),
             seek: Mutex::default(),
             video_done: AtomicBool::new(false),
             audio_master: AtomicBool::new(false),
@@ -258,9 +262,9 @@ impl Shared {
         self.muted.store(false, Relaxed);
     }
 
-    /// The gain the audio callback applies: zero while muted.
+    /// The gain the audio callback applies: zero while muted or silenced.
     pub fn gain(&self) -> f32 {
-        if self.muted.load(Relaxed) {
+        if self.muted.load(Relaxed) || self.silenced.load(Relaxed) {
             0.0
         } else {
             self.volume()
