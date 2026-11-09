@@ -1442,8 +1442,10 @@ mod tests {
         // A seek reaches the external file's demuxer too, and both play on from there.
         p.shared.seek_to(1.5);
         assert!(p.advances(0.3), "stalled after seeking");
-        // Audio restarts with the whole frame holding the target, a few ms early.
-        assert!(p.position() >= 1.4, "seek went to {:.2}", p.position());
+        // Audio restarts with the whole frame holding the target, a few ms early. The clock is
+        // what is heard, so it trails that by the output's latency: a few ms on the built-in
+        // speakers, up to about 300 ms on Bluetooth headphones.
+        assert!(p.position() >= 1.15, "seek went to {:.2}", p.position());
 
         p.session().select(TrackKind::Audio, Some(ENGLISH)).unwrap();
         assert!(p.advances(0.3), "stalled after switching back");
