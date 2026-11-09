@@ -70,8 +70,12 @@ indevs=(dshow gdigrab)
 parsers=(h264 hevc av1 vp8 vp9 mpeg4video mpegvideo vc1 mjpeg
          aac aac_latm ac3 mpegaudio opus vorbis flac dca mlp
          dvdsub dvbsub)
+# All of Windows Media: a .wmv or .asf can hold WMV 7 or 8 or MS-MPEG-4 v1 or v2 rather than
+# WMV 9, and WMA 1, Pro, Lossless or Voice rather than WMA 2.
 decoders=(h264 hevc av1 libdav1d vp8 vp9 mpeg4 mpeg2video mpeg1video vc1 wmv3 msmpeg4v3 mjpeg theora rawvideo
+          wmv1 wmv2 vc1image wmv3image msmpeg4v1 msmpeg4v2
           aac aac_latm mp3float mp2float ac3 eac3 opus vorbis flac alac dca truehd wmav2
+          wmav1 wmapro wmalossless wmavoice
           pcm_s16le pcm_s16be pcm_s24le pcm_s32le pcm_f32le pcm_u8 pcm_alaw pcm_mulaw pcm_bluray pcm_dvd
           subrip srt ass ssa webvtt movtext text microdvd subviewer sami dvdsub dvbsub pgssub)
 # wushang uses the *_d3d11va2 hwaccels, which decode into AV_PIX_FMT_D3D11 textures it presents
