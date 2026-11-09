@@ -207,6 +207,20 @@ The progress bar seeks with a click or a drag.
 The queue button opens the queue above the video, in the design's style, with sort, remove and add; the window grows upward to make room.
 Esc or ⌘M also leaves the mini player window.
 
+### Tabs
+
+Up to 8 files can play at once, each in a tab of its own.
+⌘T (File > New Tab, or the + by the window buttons) picks files to play in a new tab, and "Play in New Tab" in a library entry's right-click menu plays that file in one, with its folder as the tab's queue.
+Opening a file any other way plays it in the tab on screen, as before.
+With two or more tabs open, they take the title's place in the player's title bar.
+Click a tab to show it, or use ⇧⌘] and ⇧⌘[ (or ⌃Tab and ⌃⇧Tab) for the next and previous tab, ⌘1 to ⌘8 for that tab and ⌘9 for the last.
+
+Only the tab on screen is heard.
+The others play on silently, marked with a small play sign, so switching to one shows its picture at once and brings its sound back.
+Each tab keeps its own queue, position, tracks, subtitles and picture settings; the volume, mute, output device and sound effects are the window's.
+⌘W (File > Close Tab, or a tab's ×) closes a tab and keeps its place, as Stop does, and closing the last tab stops playback.
+When the tabs get narrow they drop their × and then show only their number; ⌘W still closes them.
+
 ### Network
 
 ⌘N, "Open Network Stream" in the "..." menu or the File menu, or "Add Network Stream" on the Network page asks for an address and plays it: http, https, HLS (`.m3u8`), RTSP, UDP or RTP.
@@ -382,9 +396,10 @@ thumbnailers     two threads decode one still per visible file, newest request f
 prober           one thread reads music tags for Songs, Albums, Artists and Genres
 ```
 
-The window, the Metal device and the audio device live for the whole run.
-Opening a file starts a session ([src/session.rs](src/session.rs)): its demux and decoder threads, which stop when the next file opens.
-The audio device opens once, on a thread of its own at startup, because opening one can take a while (a Bluetooth headset wakes up first); switching files only clears the ring.
+The window and the Metal device live for the whole run, and each tab has an audio device of its own for as long as it is open.
+Opening a file starts a session ([src/session.rs](src/session.rs)): its demux and decoder threads, which stop when the next file opens in that tab or the tab closes.
+A tab's audio device opens once, on a thread of its own, because opening one can take a while (a Bluetooth headset wakes up first); switching files only clears the ring.
+macOS mixes the tabs' outputs, and the tabs out of sight send silence, so their clocks keep running and the render loop keeps taking their frames as they come due.
 [src/library.rs](src/library.rs) lists folders, keeps recent files and positions, and reads and writes the M3U playlists; it doesn't touch FFmpeg.
 [src/thumbs.rs](src/thumbs.rs) makes thumbnails and reads tags with FFmpeg in software, so it never competes with playback for the GPU decoder.
 The library page ([src/ui/browse.rs](src/ui/browse.rs)) is painted inside a layer masked to everything but the mini player's video, so the grid can sit under the card while the live video shows through.
@@ -503,6 +518,7 @@ The macOS app has the same features and interface; these behave differently, mos
 - The subtitle fonts offer Helvetica Neue and Menlo where Windows offers Segoe UI and Consolas.
 - Streaming to other devices may bring up macOS's local network prompt instead of the Windows firewall's.
 - Starting hidden is `open -j`, which stands for Windows' "Run: Minimized" shortcuts.
+- Tabs, for several files playing at once, are on macOS only so far; the Windows version plays one file at a time.
 
 ## Licence
 
