@@ -1542,6 +1542,8 @@ impl Tab {
         }
         self.current = None;
         self.session = None;
+        // The clock stops with it, so the bars of a tab left empty don't count on.
+        self.shared.clock.invalidate();
         // The session's stop flag ends the subtitle decoder too.
         if let Some((thread, _)) = self.embedded.take() {
             _ = thread.join();
@@ -2484,6 +2486,9 @@ fn run() -> Result<(), Box<dyn Error>> {
             last_position = f.pts;
         } else if let Some(t) = now {
             last_position = t;
+        } else if app.session().is_none() {
+            // A tab left empty, or one whose stream is connecting, is at the start.
+            last_position = 0.0;
         }
         // The mini player's progress bar moves while the library shows.
         let tick = card && now.is_some() && !paused && last_position.fract() < 0.02;
@@ -2531,8 +2536,8 @@ fn run() -> Result<(), Box<dyn Error>> {
                     duration,
                     live: duration <= 0.0 && session.is_some_and(|s| net::is_address(&s.path)),
                     time_left: PREFS.with_borrow(|p| p.time_left),
-                    // Reverse playback pauses underneath, but it is playing.
-                    paused: paused && tab.reverse.is_none(),
+                    // Reverse playback pauses underneath, but it is playing; an empty tab isn't.
+                    paused: (paused && tab.reverse.is_none()) || tab.session.is_none(),
                     volume: shared.volume(),
                     muted: shared.muted.load(Relaxed),
                     title: session.map_or("", |s| &s.title),
@@ -4832,6 +4837,32 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    /// A tab out of sight plays each file of its queue through at its own pace, not racing to
+    /// the end: files with sound as much as those without.
+    #[test]
+    fn a_tab_out_of_sight_plays_each_file_through() {
+        let (mut app, dir, _one) = test_app("unseen-pace");
+        // Silent, though most of these files have sound; new tabs take this volume.
+        app.tab().shared.set_volume(0.0);
+        let queue: Vec<PathBuf> = ["test_60s_noaudio.mp4", "test_h264.mp4", "test_hevc.mkv"]
+            .into_iter()
+            .map(media)
+            .collect();
+        // The first tab plays the end of a file without sound, then goes out of sight.
+        assert!(app.play(&queue[0], queue.clone()));
+        let path = |app: &App| app.tabs[0].session.as_ref().map(|s| s.path.clone());
+        assert!(passes(&mut app, 5.0, |app| position(app, 0) > 0.2));
+        app.tab().shared.seek_to(58.5);
+        assert!(app.in_new_tab(|app| app.play_file(&media("test_60s_noaudio.mp4"))));
+        assert!(passes(&mut app, 20.0, |app| path(app).as_ref() == Some(&queue[1])));
+        let start = Instant::now();
+        // Each file is 6 s long: the next can't start before about 5 s have gone by.
+        assert!(passes(&mut app, 20.0, |app| path(app).as_ref() != Some(&queue[1])));
+        let first = start.elapsed().as_secs_f64();
+        assert!(first > 5.0, "the file with sound ended after {first:.2} s");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     /// The player page stays while another tab has something open, so the tab strip leads to
     /// it, and the library's card leads back; with every tab empty, the library shows.
     #[test]
@@ -4840,8 +4871,9 @@ mod tests {
         assert!(app.nothing_to_show() && !app.has_card());
         assert!(app.play_file(&media("test_60s_noaudio.mp4")));
         assert!(app.in_new_tab(|app| app.play_file(&media("test_subs.mkv"))));
-        // The tab on screen ends.
+        // The tab on screen ends, and its clock with it, so its bars stand at the start.
         app.stop(1);
+        assert!(app.tabs[1].shared.clock.get().is_none());
         assert!(!app.nothing_to_show());
         assert!(app.has_card());
         // Switched to it from the other tab.
