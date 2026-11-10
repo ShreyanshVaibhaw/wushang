@@ -89,6 +89,8 @@ thread_local! {
     static HANDLER: Cell<Option<fn(Event)>> = const { Cell::new(None) };
     /// Files opened before the window existed, for `init` to hand back.
     static EARLY_OPEN: RefCell<Vec<PathBuf>> = const { RefCell::new(Vec::new()) };
+    /// Quit was asked for before the window existed; the event pump passes it on.
+    static EARLY_CLOSE: Cell<bool> = const { Cell::new(false) };
 }
 
 /// Where events go from now on.
@@ -100,6 +102,7 @@ fn dispatch(event: Event) {
     match (HANDLER.get(), event) {
         (Some(handler), event) => handler(event),
         (None, Event::Open(paths)) => EARLY_OPEN.with_borrow_mut(|o| o.extend(paths)),
+        (None, Event::Close) => EARLY_CLOSE.set(true),
         (None, _) => {}
     }
 }

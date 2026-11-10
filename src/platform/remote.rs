@@ -9,7 +9,8 @@
 //! - `scroll <x> <y> <dy> [px]`: wheel lines, or a trackpad's pixels
 //! - `frame <x> <y> <w> <h>`: moves and sizes the window (top-left points)
 //! - `menu <n>`: the menu bar's command `n` (1 = About ...), `open <path>`, `drop <path>`
-//! - `cancel`: closes the open file picker; `terminate`: quits as the Dock does
+//! - `cancel`: closes the open file picker; `terminate`: quits as the menu bar's Quit does;
+//!   `logout`: the quit Apple event the system sends as the user logs out
 //! - `menukey <code> <chars>`: a Command shortcut given to the menu bar alone
 //! - `track <secs>`: holds a menu open (AppKit's own loop); `appearance dark|light|system`
 
@@ -18,6 +19,8 @@ use std::io::BufRead;
 use std::path::PathBuf;
 use std::sync::Mutex;
 
+use objc2::rc::Retained;
+use objc2::{ClassType, msg_send};
 use objc2_app_kit::{NSApplication, NSEvent, NSEventModifierFlags, NSEventType};
 use objc2_core_graphics::{CGEvent, CGScrollEventUnit};
 use objc2_foundation::{NSPoint, NSString};
@@ -209,11 +212,13 @@ fn command(line: &str) -> Result<(), String> {
             app.abortModal();
             Ok(())
         }
-        // Quit as the Dock's menu asks it.
+        // Quit as the menu bar's Quit asks it.
         "terminate" => {
             app.terminate(None);
             Ok(())
         }
+        // The quit Apple event loginwindow sends every app as the user logs out.
+        "logout" => logout(),
         // Holds an open menu for `secs`: AppKit's tracking loop, as a live resize runs one.
         "track" => {
             let secs = num(1)?;
@@ -303,4 +308,39 @@ fn mouse(kind: NSEventType, x: f64, y: f64, clicks: isize) -> Option<objc2::rc::
         clicks,
         1.0,
     )
+}
+
+/// Sends this process the quit Apple event loginwindow sends each app as the user logs out,
+/// with the reason it gives.
+fn logout() -> Result<(), String> {
+    use objc2_foundation::{NSAppleEventDescriptor, NSAppleEventSendOptions};
+    // kCoreEventClass, kAEQuitApplication, keyAEQuitReason and kAEReallyLogOut.
+    const CORE: u32 = u32::from_be_bytes(*b"aevt");
+    const QUIT: u32 = u32::from_be_bytes(*b"quit");
+    const REASON: u32 = u32::from_be_bytes(*b"why?");
+    const LOG_OUT: u32 = u32::from_be_bytes(*b"rlgo");
+    let class = NSAppleEventDescriptor::class();
+    let pid = std::process::id() as i32;
+    // SAFETY: the types are the methods' own: pid_t, AEEventClass and AEEventID (UInt32),
+    // AEReturnID (SInt16, -1 is kAutoGenerateReturnID), AETransactionID (SInt32, 0 is
+    // kAnyTransactionID) and AEKeyword (UInt32).
+    let event: Retained<NSAppleEventDescriptor> = unsafe {
+        let target: Retained<NSAppleEventDescriptor> =
+            msg_send![class, descriptorWithProcessIdentifier: pid];
+        let event: Retained<NSAppleEventDescriptor> = msg_send![
+            class,
+            appleEventWithEventClass: CORE,
+            eventID: QUIT,
+            targetDescriptor: &*target,
+            returnID: -1i16,
+            transactionID: 0i32
+        ];
+        let reason = NSAppleEventDescriptor::descriptorWithTypeCode(LOG_OUT);
+        let () = msg_send![&event, setAttributeDescriptor: &*reason, forKeyword: REASON];
+        event
+    };
+    event
+        .sendEventWithOptions_timeout_error(NSAppleEventSendOptions::NoReply, 5.0)
+        .map(drop)
+        .map_err(|e| e.to_string())
 }

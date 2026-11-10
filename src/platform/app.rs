@@ -1,7 +1,7 @@
 //! The application: AppKit's start-up, the delegate that hears about opened files, quitting
 //! and the window's changes, the menu bar, and the event pump the render loop runs.
 
-use std::cell::{Cell, OnceCell};
+use std::cell::{Cell, OnceCell, RefCell};
 use std::path::PathBuf;
 use std::ptr::NonNull;
 use std::time::{Duration, Instant};
@@ -14,11 +14,11 @@ use objc2_app_kit::{
     NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate,
     NSApplicationPresentationOptions, NSApplicationTerminateReply, NSEventMask,
     NSEventModifierFlags, NSEventTrackingRunLoopMode, NSMenu, NSMenuItem, NSModalPanelRunLoopMode,
-    NSWindow, NSWindowDelegate, NSWorkspace, NSWorkspaceWillPowerOffNotification,
+    NSWindow, NSWindowDelegate,
 };
 use objc2_foundation::{
-    NSArray, NSDate, NSDefaultRunLoopMode, NSNotification, NSObject, NSRunLoop, NSString, NSTimer,
-    NSURL,
+    NSAppleEventDescriptor, NSAppleEventManager, NSAppleEventManagerSuspensionID, NSArray, NSDate,
+    NSDefaultRunLoopMode, NSNotification, NSObject, NSRunLoop, NSString, NSTimer, NSURL,
 };
 
 use super::{Event, dispatch, window};
@@ -69,8 +69,10 @@ thread_local! {
     pub(super) static CLOSED: Cell<bool> = const { Cell::new(false) };
     /// The pass's events stop here, as `end_pump` asked.
     static END_PUMP: Cell<bool> = const { Cell::new(false) };
-    /// The system is logging out or shutting down, which can't wait for wushang to save.
-    static POWER_OFF: Cell<bool> = const { Cell::new(false) };
+    /// Quit Apple events waiting for their answer until wushang has saved: logging out waits
+    /// for it, where AppKit's own handler would end the process at once.
+    static QUIT_EVENTS: RefCell<Vec<NSAppleEventManagerSuspensionID>> =
+        const { RefCell::new(Vec::new()) };
     /// Whether the menu bar's commands are on; off while the window's own dialogs have the keys.
     static MENU_ENABLED: Cell<bool> = const { Cell::new(true) };
     /// A pass runs from the timer inside AppKit's own loop, which mustn't be waited in.
@@ -88,6 +90,26 @@ define_class!(
     unsafe impl NSObjectProtocol for Delegate {}
 
     unsafe impl NSApplicationDelegate for Delegate {
+        /// Takes the quit Apple event over from AppKit: its handler is in place by now, and
+        /// this one replaces it.
+        #[unsafe(method(applicationWillFinishLaunching:))]
+        fn will_finish_launching(&self, _: &NSNotification) {
+            // kCoreEventClass and kAEQuitApplication.
+            let (core, quit) = (u32::from_be_bytes(*b"aevt"), u32::from_be_bytes(*b"quit"));
+            let manager = NSAppleEventManager::sharedAppleEventManager();
+            // SAFETY: the delegate lives as long as the app and answers the selector, whose
+            // event class and ID are AEEventClass and AEEventID (UInt32).
+            let () = unsafe {
+                msg_send![
+                    &manager,
+                    setEventHandler: self,
+                    andSelector: sel!(handleQuit:withReplyEvent:),
+                    forEventClass: core,
+                    andEventID: quit
+                ]
+            };
+        }
+
         #[unsafe(method(applicationDidFinishLaunching:))]
         fn did_finish_launching(&self, _: &NSNotification) {
             LAUNCHED.set(true);
@@ -115,15 +137,14 @@ define_class!(
             }
         }
 
-        /// Quit from the Dock or the menu bar's own Quit: the render loop ends and saves as
-        /// it does for the window's close button, so AppKit isn't let to exit the process
-        /// under it. Logging out doesn't wait, as it doesn't on Windows.
+        /// The menu bar's own Quit: the render loop ends and saves as it does for the
+        /// window's close button, so AppKit isn't let to exit the process under it.
         #[unsafe(method(applicationShouldTerminate:))]
         fn should_terminate(&self, _: &NSApplication) -> NSApplicationTerminateReply {
-            if POWER_OFF.get() || CLOSED.get() {
+            if CLOSED.get() {
                 return NSApplicationTerminateReply::TerminateNow;
             }
-            dispatch(Event::Close);
+            quit();
             NSApplicationTerminateReply::TerminateCancel
         }
 
@@ -243,12 +264,29 @@ define_class!(
                 || (MENU_ENABLED.get() && (!on_tabs || self.window_on_screen()))
         }
 
-        #[unsafe(method(willPowerOff:))]
-        fn will_power_off(&self, _: &NSNotification) {
-            POWER_OFF.set(true);
+        /// Quit from the Dock, Activity Monitor or a script, and the system's as it logs out,
+        /// restarts or shuts down: the render loop ends and saves as for Quit, and the event
+        /// is answered once it has, in `finish`.
+        #[unsafe(method(handleQuit:withReplyEvent:))]
+        fn handle_quit(&self, _: &NSAppleEventDescriptor, _: &NSAppleEventDescriptor) {
+            if CLOSED.get() {
+                return;
+            }
+            let manager = NSAppleEventManager::sharedAppleEventManager();
+            QUIT_EVENTS.with_borrow_mut(|q| q.push(manager.suspendCurrentAppleEvent()));
+            quit();
         }
     }
 );
+
+/// Asks the render loop to end and save, closing a file picker that would hold it up.
+fn quit() {
+    let app = NSApplication::sharedApplication(mtm());
+    if app.modalWindow().is_some() {
+        app.abortModal();
+    }
+    dispatch(Event::Close);
+}
 
 impl Delegate {
     fn new(mtm: MainThreadMarker) -> Retained<Self> {
@@ -293,17 +331,6 @@ pub fn init() -> Vec<PathBuf> {
     app.setActivationPolicy(NSApplicationActivationPolicy::Regular);
     let delegate = Delegate::new(mtm);
     app.setDelegate(Some(ProtocolObject::from_ref(&*delegate)));
-    // SAFETY: the delegate lives as long as the app, and the selector takes a notification.
-    unsafe {
-        NSWorkspace::sharedWorkspace()
-            .notificationCenter()
-            .addObserver_selector_name_object(
-                &delegate,
-                sel!(willPowerOff:),
-                Some(NSWorkspaceWillPowerOffNotification),
-                None,
-            );
-    }
     DELEGATE.with(|d| _ = d.set(delegate.clone()));
     build_menu(mtm, &app, &delegate);
     app.finishLaunching();
@@ -371,6 +398,9 @@ pub fn pump_messages() -> bool {
     let app = NSApplication::sharedApplication(mtm());
     autoreleasepool(|_| {
         END_PUMP.set(false);
+        if super::EARLY_CLOSE.take() {
+            dispatch(Event::Close);
+        }
         let past = NSDate::distantPast();
         // SAFETY: the default mode is a valid run loop mode.
         while let Some(event) = unsafe {
@@ -439,9 +469,15 @@ pub fn set_modal_tick(tick: fn()) {
     }
 }
 
-/// The last thing `main` does: the process may now end.
+/// The last thing `main` does: the process may now end, and the quit events waiting on it
+/// are answered.
 pub fn finish() {
     CLOSED.set(true);
+    let manager = NSAppleEventManager::sharedAppleEventManager();
+    for id in QUIT_EVENTS.take() {
+        // SAFETY: each came from suspendCurrentAppleEvent, and is resumed once.
+        unsafe { manager.resumeWithSuspensionID(id) };
+    }
 }
 
 /// The menu bar: the app menu, File, Playback and Window, each item doing what the design's
