@@ -27,15 +27,19 @@ pub fn shift_down() -> bool {
 /// else by the character the layout types without modifiers, so Ctrl+Z is the key marked Z
 /// on an AZERTY keyboard too. Layouts without Latin letters fall back to the ANSI position,
 /// as Windows' virtual keys do, and so does the top row unless it types a letter or digit.
+/// With Command down it is what the layout types with Command, as the menu bar reads it:
+/// "Dvorak - QWERTY ⌘" types QWERTY's letters then, so Command+W isn't Command+,.
 pub(super) fn from_event(event: &NSEvent) -> Option<VIRTUAL_KEY> {
+    // Without Shift, so Shift+Command+] is still ].
+    let layer = event.modifierFlags() & NSEventModifierFlags::Command;
     let typed = event
-        .charactersByApplyingModifiers(NSEventModifierFlags::empty())
+        .charactersByApplyingModifiers(layer)
         .map(|s| s.to_string())
         .unwrap_or_default();
     virtual_key(event.keyCode(), &typed)
 }
 
-/// `from_event` for the key with macOS key code `code`, which types `typed` without modifiers.
+/// `from_event` for the key with macOS key code `code`, which types `typed`.
 fn virtual_key(code: u16, typed: &str) -> Option<VIRTUAL_KEY> {
     if let Some(key) = by_position(code) {
         return Some(key);

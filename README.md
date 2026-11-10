@@ -169,6 +169,7 @@ Switching tracks and seeking land on the exact moment: the decoders read from th
 Control works in place of ⌘ for every shortcut, as Ctrl did on Windows, except where macOS keeps the key for itself (Control with the arrows switches Spaces unless that is turned off in System Settings > Keyboard > Keyboard Shortcuts).
 In a text field ⌥← and ⌥→ move by word, ⌘← and ⌘→ go to the start and end, ⌥⌫ deletes a word and ⌘⌫ deletes back to the start, as in other Mac apps.
 Letter shortcuts follow the key's letter on your keyboard layout, so ⌘M is the key marked M on an AZERTY keyboard too.
+On a layout that turns to QWERTY while ⌘ is held, such as Dvorak - QWERTY ⌘, the ⌘ shortcuts take the QWERTY letter, as the menu bar does.
 
 Started hidden (`open -j -a wushang`), the window stays hidden and doesn't take focus.
 
