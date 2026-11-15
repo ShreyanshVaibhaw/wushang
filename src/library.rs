@@ -12,7 +12,7 @@ use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering::Relaxed;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::{env, fs, io};
 
 use crate::net::{self, Feed, NetKind, Station};
@@ -287,6 +287,57 @@ pub fn write_replacing(file: &Path, bytes: &[u8]) -> io::Result<()> {
     fs::rename(tmp, file)
 }
 
+/// Files handed to [`write_later`] that aren't on disk yet, and whether a thread is writing them.
+struct Writes {
+    pending: VecDeque<(PathBuf, Vec<u8>)>,
+    running: bool,
+}
+
+static WRITES: Mutex<Writes> = Mutex::new(Writes {
+    pending: VecDeque::new(),
+    running: false,
+});
+/// Signalled when the writer thread runs out of files.
+static WRITTEN: Condvar = Condvar::new();
+
+/// Replaces `file` with `bytes` as [`write_replacing`] does, but on a background thread, so the
+/// caller doesn't wait for the flush to disk (a full flush on macOS, which can take long enough
+/// to drop frames). Bytes still waiting from an earlier call for the same file are replaced, so
+/// only the newest are written. A write that fails is reported on stderr.
+pub fn write_later(file: PathBuf, bytes: Vec<u8>) {
+    let mut w = WRITES.lock().unwrap();
+    match w.pending.iter_mut().find(|(f, _)| *f == file) {
+        Some(waiting) => waiting.1 = bytes,
+        None => w.pending.push_back((file, bytes)),
+    }
+    if !w.running {
+        w.running = true;
+        std::thread::spawn(write_pending);
+    }
+}
+
+/// The writer thread: writes the files handed to [`write_later`] in order until none are left.
+fn write_pending() {
+    let mut w = WRITES.lock().unwrap();
+    while let Some((file, bytes)) = w.pending.pop_front() {
+        drop(w);
+        if let Err(e) = write_replacing(&file, &bytes) {
+            eprintln!("wushang: can't save {}: {e}", file.display());
+        }
+        w = WRITES.lock().unwrap();
+    }
+    w.running = false;
+    WRITTEN.notify_all();
+}
+
+/// Waits until every file handed to [`write_later`] so far is on disk.
+pub fn finish_writes() {
+    let mut w = WRITES.lock().unwrap();
+    while w.running {
+        w = WRITTEN.wait(w).unwrap();
+    }
+}
+
 /// The file or address a playlist line lists, if it lists one: comments, blank lines and
 /// other protocols list nothing. Relative lines resolve against the playlists folder `dir`.
 fn playlist_entry(line: &str, dir: &Path) -> Option<PathBuf> {
@@ -325,6 +376,8 @@ impl Library {
     }
 
     fn open(dir: &Path, seed: bool) -> Library {
+        // A library saved just before is read as saved.
+        finish_writes();
         let mut lib = Library {
             dir: dir.to_path_buf(),
             video_roots: Vec::new(),
@@ -447,8 +500,10 @@ impl Library {
         }
     }
 
-    /// Writes state.txt through a temporary file, so a crash mid-write keeps the old state.
-    /// Paths that are not valid Unicode are left out.
+    /// Writes state.txt through a temporary file, so a crash mid-write keeps the old state. The
+    /// render loop saves every 30 seconds during playback, so the writing happens in the
+    /// background ([`write_later`]); dropping the library waits for it. Paths that are not valid
+    /// Unicode are left out.
     pub fn save(&self) -> io::Result<()> {
         if self.unreadable {
             return Ok(());
@@ -505,7 +560,8 @@ impl Library {
             put(&["address", a.kind.key(), &a.url, &name]);
         }
         fs::create_dir_all(&self.dir)?;
-        write_replacing(&self.dir.join(STATE_FILE), out.as_bytes())
+        write_later(self.dir.join(STATE_FILE), out.into_bytes());
+        Ok(())
     }
 
     fn root_list(&self, section: Section) -> &[PathBuf] {
@@ -1297,6 +1353,13 @@ impl Library {
     }
 }
 
+/// The last save before quitting is on disk before the process ends.
+impl Drop for Library {
+    fn drop(&mut self) {
+        finish_writes();
+    }
+}
+
 /// Video or audio, by extension, ignoring case.
 pub fn media_kind(path: &Path) -> Option<MediaKind> {
     let ext = path.extension()?.to_str()?.to_ascii_lowercase();
@@ -1873,6 +1936,7 @@ mod tests {
         a.visit_folder(&videos);
         a.record_playlist_play("Road Trip");
         a.save().unwrap();
+        finish_writes();
 
         // Damage the file the way a crash or a hand edit might.
         let state = tmp.0.join(STATE_FILE);
@@ -1998,6 +2062,40 @@ mod tests {
         assert_eq!(recent, [PathBuf::from(r"/Videos/ok.mp4")]);
     }
 
+    /// Saving hands the file to a background writer, since the flush to disk can stall the
+    /// render loop, and dropping the library waits for that write.
+    #[test]
+    fn saving_does_not_wait_for_the_disk() {
+        let tmp = TempDir::new();
+        let mut lib = Library::open(&tmp.0, false);
+        lib.record_position(Path::new("/v/a.mp4"), 5.0, 60.0);
+        // A pipe where the temporary file goes: writing into it waits until something reads.
+        let pipe = tmp.0.join(format!("{STATE_FILE}.tmp"));
+        let c = std::ffi::CString::new(pipe.as_os_str().as_encoded_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        let (done, saved) = std::sync::mpsc::channel();
+        let lib = std::thread::spawn(move || {
+            lib.save().unwrap();
+            _ = done.send(());
+            lib
+        });
+        let returned = saved.recv_timeout(std::time::Duration::from_secs(2));
+        // Read what went into the pipe, which lets the write finish either way.
+        let written = fs::read_to_string(&pipe).unwrap();
+        let mut lib = lib.join().unwrap();
+        assert!(returned.is_ok(), "save waited for the write");
+        assert!(written.contains("recent\t/v/a.mp4\t5\t60\n"), "{written:?}");
+
+        // The pipe may have been renamed to state.txt; the next save replaces it either way.
+        finish_writes();
+        _ = fs::remove_file(&pipe);
+        lib.record_position(Path::new("/v/b.mp4"), 6.0, 60.0);
+        lib.save().unwrap();
+        drop(lib);
+        let state = fs::read_to_string(tmp.0.join(STATE_FILE)).unwrap();
+        assert!(state.contains("recent\t/v/b.mp4\t6\t60\n"), "{state:?}");
+    }
+
     #[test]
     fn an_unreadable_library_is_not_overwritten() {
         let tmp = TempDir::new();
@@ -2044,6 +2142,7 @@ mod tests {
 
         // Thumbnails and favourites survive a save, and a damaged record is skipped.
         lib.save().unwrap();
+        finish_writes();
         let state = tmp.0.join(STATE_FILE);
         let mut text = fs::read_to_string(&state).unwrap();
         text.push_str("thumb\tbad/name\t/x.png\nthumb\tOther\t\nfavorite\t\nfavorite\n");
