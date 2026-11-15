@@ -187,12 +187,14 @@ impl Effects {
         );
     }
 
-    /// Custom bands in dB (clamped to -20..20, VLC's range) and preamp on VLC's scale.
+    /// Custom bands in dB (clamped to -20..20, VLC's range) and preamp on VLC's scale, clamped
+    /// to 20 dB either side of unity, the range the panel shows around 0. VLC's own slider runs
+    /// -20..20 on that scale, which stops 8 dB above unity.
     pub fn set_eq_bands(&self, bands: [f32; 10], preamp: f32) {
         self.update_eq(|eq| {
             eq.enabled = true;
             eq.preset = None;
-            eq.preamp = preamp.clamp(-20.0, 20.0);
+            eq.preamp = preamp.clamp(PREAMP_UNITY_DB - 20.0, PREAMP_UNITY_DB + 20.0);
             eq.bands = bands.map(|b| b.clamp(-20.0, 20.0));
         });
     }
@@ -940,6 +942,23 @@ mod tests {
         let mut out = vec![1.0f32; 16];
         eq.process(&mut out);
         assert!((out[0] - 10f32.powf(-6.0 / 20.0)).abs() < 1e-6);
+    }
+
+    /// The panel's preamp runs 20 dB either side of unity, all of which reaches the equalizer;
+    /// past that it stops.
+    #[test]
+    fn preamp_takes_the_panels_whole_range() {
+        let effects = Effects::new();
+        for (asked, set) in [
+            (20.0, 20.0),
+            (-20.0, -20.0),
+            (9.5, 9.5),
+            (25.0, 20.0),
+            (-30.0, -20.0),
+        ] {
+            effects.set_eq_bands([0.0; 10], PREAMP_UNITY_DB + asked);
+            assert_eq!(effects.eq().preamp, PREAMP_UNITY_DB + set, "{asked} dB");
+        }
     }
 
     #[test]
