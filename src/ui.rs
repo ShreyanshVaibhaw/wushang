@@ -967,11 +967,14 @@ impl Ui {
         self.sync_menu();
     }
 
-    /// Hide UI: the bars, the popup and the sidebar panel go until the mouse moves.
+    /// Hide UI: the bars, the popup, the queue and the sidebar panel go until the mouse moves.
     pub fn hide_bars(&mut self) {
         self.hidden = true;
         self.overlay = false;
         self.panels.show(None, None);
+        if self.queue.open {
+            self.toggle_queue();
+        }
         self.relayout = true;
     }
 
@@ -2287,6 +2290,31 @@ mod tests {
         assert!(ui.over_menu(x, r.t - 8.0), "the menu stands on the button");
         // The button stays clear, so a second click on it closes the menu.
         assert_eq!(ui.layout.hit(x, y), Some(Hit::More));
+    }
+
+    /// Lays the player page out as the render loop does: the queue only while it's open.
+    fn relayout(ui: &mut Ui) {
+        let bars = ui.bars_visible(false, false);
+        let mut layout = Layout::player(1280.0, 720.0, bars, false, &ui.toolbar);
+        if ui.queue.open {
+            layout.add_queue(&ui.queue, &QueueData::default());
+        }
+        ui.layout = layout;
+    }
+
+    #[test]
+    fn hide_ui_closes_the_queue() {
+        let mut ui = Ui::new();
+        ui.page = Page::Player;
+        ui.toggle_queue();
+        relayout(&mut ui);
+        let (x, y) = (1100.0, 300.0);
+        assert!(matches!(ui.layout.hit(x, y), Some(Hit::Queue(_))));
+        ui.hide_bars();
+        relayout(&mut ui);
+        assert!(!ui.layout.bars);
+        // Hidden with the bars, it mustn't take clicks unseen.
+        assert_eq!(ui.layout.hit(x, y), Some(Hit::Video));
     }
 
     #[test]
