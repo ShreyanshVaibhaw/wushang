@@ -17,6 +17,7 @@ mod disc;
 mod dsp;
 mod hdr;
 mod library;
+mod music;
 mod net;
 mod nv12;
 mod platform;
@@ -58,7 +59,7 @@ use platform::{Event, Rect, Window};
 use bookmarks::Bookmarks;
 use captions::CaptionStyle;
 use dsp::{EQ_PRESETS, StereoMode};
-use library::{Entry, Library, MediaKind, Place, Section, Track};
+use library::{Entry, Library, MediaKind, Place, Section};
 use net::NetKind;
 use player::{HwDevice, Shared, VideoFrame};
 use prefs::Prefs;
@@ -195,6 +196,8 @@ struct App {
     /// Lengths of the queues' files, probed in the background.
     durations: HashMap<PathBuf, f64>,
     queue_prober: thumbs::Prober,
+    /// Songs, Albums, Artists and Genres' files and their tags.
+    music: music::Music,
     bookmarks: Bookmarks,
     /// Settings' subtitle look; each tab has its own size.
     caption: CaptionStyle,
@@ -365,6 +368,7 @@ impl App {
             downloading: None,
             durations: HashMap::new(),
             queue_prober: thumbs::Prober::new(),
+            music: music::Music::new(dir),
             bookmarks: Bookmarks::load(dir),
             caption: settings.caption(),
             devices: audio::output_devices(),
@@ -2089,16 +2093,11 @@ fn run() -> Result<(), Box<dyn Error>> {
     let previewer = thumbs::SeekPreviewer::new(SEEK_STILL_WIDTH);
     let mut preview_asked: Option<(PathBuf, f64)> = None;
     let mut still_for: Option<PathBuf> = None;
-    // Tags for Songs, Albums, Artists and Genres come from probing every music file once; the
-    // index on disk covers the files that haven't changed since.
-    let prober = thumbs::Prober::new();
-    let mut tracks: HashMap<PathBuf, (tags::Stamp, Track)> = HashMap::new();
-    let mut music_scan = (!play_and_exit).then(|| scan_music(app.library.roots(Section::Music)));
+    if !play_and_exit {
+        app.music.scan(app.library.roots(Section::Music));
+    }
     let mut update_check = (!play_and_exit && prefs().check_updates).then(update::check);
     let mut update_offer: Option<update::Release> = None;
-    let mut tracks_changed = false;
-    let mut tags_unsaved = false;
-    let mut tracks_set = Instant::now();
     let mut saved = Instant::now();
 
     let (mut shown, mut dropped) = (0u64, 0u64);
@@ -2298,24 +2297,8 @@ fn run() -> Result<(), Box<dyn Error>> {
             );
             UI.with_borrow_mut(|ui| ui.dirty = true);
         }
-        if let Some(scan) = &music_scan
-            && let Ok((known, changed)) = scan.try_recv()
-        {
-            music_scan = None;
-            tracks.extend(known);
-            // Files still to probe show by name until their tags come; the empty stamp has
-            // them probed again next run if this one ends first.
-            for path in &changed {
-                let track = Track {
-                    path: path.clone(),
-                    ..Default::default()
-                };
-                tracks.insert(path.clone(), (tags::Stamp::default(), track));
-            }
-            prober.request_all(changed);
-            app.library
-                .set_tracks(tracks.values().map(|(_, t)| t.clone()).collect());
-            tracks_set = Instant::now();
+        // Songs, Albums, Artists and Genres follow the scan and the tags probed since.
+        if app.music.poll(&mut app.library) {
             UI.with_borrow_mut(|ui| {
                 if ui.browse.place.section() == Section::Music || ui.browse.place == Place::Home {
                     ui.browse.stale = true;
@@ -2346,31 +2329,6 @@ fn run() -> Result<(), Box<dyn Error>> {
                 Err(e) => UI.with_borrow_mut(|ui| ui.dialog_error(e)),
             }
         }
-        for (path, info) in prober.take_ready() {
-            let info = info.unwrap_or_default();
-            // A file that can't be read gets no stamp, so it is probed again next time.
-            let stamp = tags::stamp(&path).unwrap_or_default();
-            let track = Track {
-                path: path.clone(),
-                title: info.title,
-                artist: info.artist,
-                album: info.album,
-                genre: info.genre,
-                duration: info.duration,
-            };
-            tracks.insert(path, (stamp, track));
-            (tracks_changed, tags_unsaved) = (true, true);
-        }
-        if tracks_changed && tracks_set.elapsed() > Duration::from_secs(1) {
-            app.library
-                .set_tracks(tracks.values().map(|(_, t)| t.clone()).collect());
-            (tracks_changed, tracks_set) = (false, Instant::now());
-            UI.with_borrow_mut(|ui| {
-                if ui.browse.place.section() == Section::Music || ui.browse.place == Place::Home {
-                    ui.browse.stale = true;
-                }
-            });
-        }
         for i in 0..app.tabs.len() {
             let tab = &app.tabs[i];
             if tab.session.is_some() && tab.recorded.elapsed() > RECORD_EVERY {
@@ -2379,9 +2337,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         }
         if saved.elapsed() > SAVE_EVERY {
             app.save();
-            if std::mem::take(&mut tags_unsaved) {
-                save_tags(&tracks);
-            }
+            app.music.save();
             saved = Instant::now();
         }
 
@@ -2724,9 +2680,7 @@ fn run() -> Result<(), Box<dyn Error>> {
             app.stop(i);
         }
         app.save();
-        if tags_unsaved {
-            save_tags(&tracks);
-        }
+        app.music.save();
         PREFS.with_borrow_mut(|p| p.volume = app.tab().shared.volume());
         if let Err(e) = prefs().save(&Library::default_dir()) {
             eprintln!("settings: cannot save ({e})");
@@ -2857,32 +2811,6 @@ fn modal_frame() {
 /// Walks the Music folders `roots` on a thread, since a big library or a slow drive would hold
 /// up the window. Sends the files whose saved tags still match (by size and time) with those
 /// tags, and the files to probe.
-fn scan_music(roots: Vec<PathBuf>) -> mpsc::Receiver<MusicScan> {
-    let (tx, rx) = mpsc::channel();
-    thread::spawn(move || {
-        let mut saved = tags::load(&Library::default_dir());
-        let (mut known, mut changed) = (HashMap::new(), Vec::new());
-        for path in library::music_files(&roots) {
-            match saved.remove(&path) {
-                Some((stamp, track)) if tags::stamp(&path) == Some(stamp) => {
-                    known.insert(path, (stamp, track));
-                }
-                _ => changed.push(path),
-            }
-        }
-        _ = tx.send((known, changed));
-    });
-    rx
-}
-
-type MusicScan = (HashMap<PathBuf, (tags::Stamp, Track)>, Vec<PathBuf>);
-
-fn save_tags(tracks: &HashMap<PathBuf, (tags::Stamp, Track)>) {
-    if let Err(e) = tags::save(&Library::default_dir(), tracks) {
-        eprintln!("tags: cannot save ({e})");
-    }
-}
-
 /// A click that needs the library or opens files.
 fn handle(app: &mut App, win: Window, hit: Hit) {
     let go = |place: Place| UI.with_borrow_mut(|ui| ui.browse.go(place));
@@ -3282,6 +3210,7 @@ fn menu_action(app: &mut App, win: Window, action: MenuAction) {
         MenuAction::AddFolder(section) => add_folder(section),
         MenuAction::Resync => {
             app.library.forget_media_folders();
+            app.music.scan(app.library.roots(Section::Music));
             UI.with_borrow_mut(|ui| ui.browse.stale = true);
         }
         MenuAction::PlayPlaylist(name) => play_playlist(app, &name, false),
@@ -3752,6 +3681,9 @@ fn use_picked(app: &mut App, then: Picked, mut paths: Vec<PathBuf>) {
         }
         Picked::Folder(section) => {
             app.library.add_root(section, first);
+            if section == Section::Music {
+                app.music.scan(app.library.roots(Section::Music));
+            }
             app.library_changed = true;
             app.save();
             UI.with_borrow_mut(|ui| ui.browse.stale = true);

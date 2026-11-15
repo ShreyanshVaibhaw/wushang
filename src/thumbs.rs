@@ -519,6 +519,11 @@ impl Prober {
     pub fn take_ready(&self) -> Vec<(PathBuf, Option<MediaInfo>)> {
         self.0.take_ready()
     }
+
+    /// Lets `path` be probed again, as a file changed since it was.
+    pub fn forget(&self, path: &Path) {
+        self.0.forget(path);
+    }
 }
 
 impl Default for Prober {

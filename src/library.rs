@@ -375,7 +375,7 @@ impl Library {
         Self::open(dir, env::var_os("WUSHANG_HOME").is_none())
     }
 
-    fn open(dir: &Path, seed: bool) -> Library {
+    pub(crate) fn open(dir: &Path, seed: bool) -> Library {
         // A library saved just before is read as saved.
         finish_writes();
         let mut lib = Library {
