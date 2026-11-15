@@ -196,7 +196,8 @@ pub struct Browse {
     pub stale: bool,
     /// The entry whose context menu is open; it stays highlighted under the menu.
     pub context: Option<usize>,
-    /// Modification times for the time sorts, read once per refresh.
+    /// Modification times for the time sorts, which the library reads off this thread at each
+    /// refresh; empty until they come.
     times: HashMap<PathBuf, Option<std::time::SystemTime>>,
 }
 
@@ -255,6 +256,15 @@ impl Browse {
         self.stale = false;
         self.context = None;
         self.times.clear();
+        if self.place != Place::Home && self.sort.uses_time() {
+            let paths: Vec<PathBuf> = (self.all.iter())
+                .filter_map(entry_path)
+                .map(std::path::Path::to_path_buf)
+                .collect();
+            if let Some(times) = library.modified_times(&paths) {
+                self.times = paths.into_iter().zip(times).collect();
+            }
+        }
         self.apply();
     }
 
@@ -275,14 +285,6 @@ impl Browse {
             .partition(|e| matches!(e, Entry::Action { .. }));
         // Home is ordered by section; elsewhere "Add" stays first and the rest is sorted.
         if self.place != Place::Home {
-            if self.sort.uses_time() {
-                for path in rest.iter().filter_map(entry_path) {
-                    if !self.times.contains_key(path) {
-                        let t = std::fs::metadata(path).and_then(|m| m.modified()).ok();
-                        self.times.insert(path.to_owned(), t);
-                    }
-                }
-            }
             let times = &self.times;
             sort_entries(&mut rest, self.sort, |e| {
                 entry_path(e).and_then(|p| times.get(p).copied().flatten())
@@ -300,8 +302,10 @@ impl Browse {
             .count()
     }
 
+    /// A time sort has the next refresh read the times it needs.
     pub fn set_sort(&mut self, mode: SortMode) {
         self.sort = mode;
+        self.stale |= mode.uses_time() && self.times.is_empty();
         self.apply();
     }
 

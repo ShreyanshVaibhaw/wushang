@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering::Relaxed;
 use std::sync::{Arc, Condvar, Mutex};
+use std::time::SystemTime;
 use std::{env, fs, io};
 
 use crate::net::{self, Feed, NetKind, Station};
@@ -1344,6 +1345,14 @@ impl Library {
         self.media_dirs.take_changed()
     }
 
+    /// When each of `paths` was last modified, for the date sorts. They are read off the
+    /// caller's thread, as a folder's listing is: the last times read, or those read within a
+    /// moment the first time. None until then; the page is redone when they come (see
+    /// [`Library::media_folders_changed`]).
+    pub fn modified_times(&self, paths: &[PathBuf]) -> Option<Vec<Option<SystemTime>>> {
+        self.media_dirs.times(paths, LOOKUP_WAIT)
+    }
+
     /// Lists every folder and searches it for media again the next time it shows (Resync).
     pub fn forget_media_folders(&self) {
         self.media_dirs.forget();
@@ -1578,6 +1587,13 @@ fn found_at(path: &Path) -> Found {
     }
 }
 
+/// When `path` was last modified, following links; None when it can't be read.
+fn modified_at(path: &Path) -> Option<SystemTime> {
+    #[cfg(test)]
+    tests::stall(path);
+    fs::metadata(path).and_then(|m| m.modified()).ok()
+}
+
 /// The visible subfolders and files of `dir`, each sorted by name in natural order.
 fn list_dir(dir: &Path) -> (Named, Named) {
     list_dir_as(dir, SHOW_HIDDEN.load(Relaxed))
@@ -1622,7 +1638,7 @@ fn list_dir_as(dir: &Path, show_hidden: bool) -> (Named, Named) {
 /// media shows or goes the next time its parent is opened. `forget` (Resync) drops them all.
 ///
 /// The pages' own file system calls (a folder's listing, Home's checks that what it shows is
-/// still there) are made off the caller's thread too, each [`Ask`] on a thread of its own, since
+/// still there, the date sorts' modification times) are made off the caller's thread too, each [`Ask`] on a thread of its own, since
 /// a share that doesn't answer holds a call up for the network timeout. See [`MediaDirs::look`].
 #[derive(Default)]
 struct MediaDirs(Arc<(Mutex<DirSearch>, Condvar)>);
@@ -1652,12 +1668,15 @@ enum Ask {
     List(PathBuf, bool),
     /// What is at a path, as [`found_at`] tells.
     Kind(PathBuf),
+    /// When each of a page's files and folders was last modified, all in one go.
+    Times(Vec<PathBuf>),
 }
 
 #[derive(Clone, PartialEq, Debug)]
 enum Answer {
     List(Named, Named),
     Kind(Found),
+    Times(Vec<Option<SystemTime>>),
 }
 
 #[derive(Default)]
@@ -1728,21 +1747,42 @@ impl MediaDirs {
     fn found(&self, path: &Path, asked: &mut Vec<Ask>) -> Option<Found> {
         match self.look(&Ask::Kind(path.to_owned()), asked)? {
             Answer::Kind(found) => Some(found),
-            Answer::List(..) => None,
+            _ => None,
         }
     }
 
-    /// `dir`'s listing: the last one, or if there is none yet, the one that comes within `wait`.
+    /// The answer to `ask`: the last one, or if there is none yet, the one that comes within
+    /// `wait`.
+    fn answer_within(&self, ask: &Ask, wait: std::time::Duration) -> Option<Answer> {
+        let mut asked = Vec::new();
+        let known = self.look(ask, &mut asked);
+        if known.is_none() && self.wait_for(asked, wait) {
+            return self.state().answers.get(ask).map(|(a, _)| a.clone());
+        }
+        known
+    }
+
+    /// `dir`'s listing; see [`MediaDirs::answer_within`].
     fn listing(&self, dir: &Path, wait: std::time::Duration) -> Option<(Named, Named)> {
         let ask = Ask::List(dir.to_owned(), SHOW_HIDDEN.load(Relaxed));
-        let mut asked = Vec::new();
-        let mut known = self.look(&ask, &mut asked);
-        if known.is_none() && self.wait_for(asked, wait) {
-            known = self.state().answers.get(&ask).map(|(a, _)| a.clone());
-        }
-        match known? {
+        match self.answer_within(&ask, wait)? {
             Answer::List(dirs, files) => Some((dirs, files)),
-            Answer::Kind(_) => None,
+            _ => None,
+        }
+    }
+
+    /// When each of `paths` was last modified; see [`MediaDirs::answer_within`].
+    fn times(
+        &self,
+        paths: &[PathBuf],
+        wait: std::time::Duration,
+    ) -> Option<Vec<Option<SystemTime>>> {
+        if paths.is_empty() {
+            return Some(Vec::new());
+        }
+        match self.answer_within(&Ask::Times(paths.to_vec()), wait)? {
+            Answer::Times(times) => Some(times),
+            _ => None,
         }
     }
 
@@ -1826,6 +1866,7 @@ fn answer(shared: &(Mutex<DirSearch>, Condvar), ask: Ask) {
             Answer::List(dirs, files)
         }
         Ask::Kind(path) => Answer::Kind(found_at(path)),
+        Ask::Times(paths) => Answer::Times(paths.iter().map(|p| modified_at(p)).collect()),
     };
     let mut s = shared.0.lock().unwrap();
     s.asking.remove(&ask);
@@ -2142,6 +2183,35 @@ mod tests {
         lib.media_dirs.settle();
         assert!(lib.media_folders_changed());
         assert_eq!(labels(&lib.entries(&place)), "Sub|film.mkv");
+    }
+
+    /// The date sorts' modification times are read off the caller's thread too.
+    #[test]
+    fn modification_times_wait_for_no_share() {
+        let tmp = TempDir::new();
+        let share = tmp.0.join("Share");
+        let film = tmp.touch("Share/film.mkv");
+        let gone = share.join("gone.mkv");
+        let lib = Library::open(&tmp.0.join("state"), false);
+        let paths = [film.clone(), gone];
+
+        STALLED.lock().unwrap().push(share.clone());
+        let shown = std::thread::scope(|s| {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let (lib, paths) = (&lib, &paths);
+            s.spawn(move || _ = tx.send(lib.modified_times(paths)));
+            let shown = rx.recv_timeout(std::time::Duration::from_secs(10));
+            STALLED.lock().unwrap().retain(|p| *p != share);
+            shown
+        });
+        assert_eq!(shown.expect("the sort waited for the share"), None);
+
+        // Once the share answers, the page is redone with the times.
+        lib.media_dirs.settle();
+        assert!(lib.media_folders_changed());
+        let modified = fs::metadata(&film).unwrap().modified().ok();
+        assert_eq!(lib.modified_times(&paths), Some(vec![modified, None]));
+        assert_eq!(lib.modified_times(&[]), Some(Vec::new()));
     }
 
     #[test]
