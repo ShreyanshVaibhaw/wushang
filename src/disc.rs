@@ -237,6 +237,21 @@ pub struct Title {
     pub chapters: Vec<f64>,
 }
 
+/// A title set IFO is at most a few hundred kilobytes; this is far past any real one.
+const MAX_IFO: u64 = 16 << 20;
+/// A playlist is a few kilobytes; a bigger file is no playlist worth reading.
+const MAX_PLAYLIST: u64 = 1 << 20;
+
+/// The file at `path`, None when it can't be read or holds more than `limit` bytes. It reads
+/// no more than that, so a huge file (or a pipe) in a disc folder can't fill memory.
+fn read_capped(path: &Path, limit: u64) -> Option<Vec<u8>> {
+    use std::io::Read;
+    let mut bytes = Vec::new();
+    let file = std::fs::File::open(path).ok()?;
+    file.take(limit + 1).read_to_end(&mut bytes).ok()?;
+    (bytes.len() as u64 <= limit).then_some(bytes)
+}
+
 /// The longest title of the DVD whose VIDEO_TS is in `root`.
 pub fn dvd(root: &Path) -> Option<Title> {
     let dir = root.join("VIDEO_TS");
@@ -244,7 +259,7 @@ pub fn dvd(root: &Path) -> Option<Title> {
     // Title sets VTS_01 to VTS_99, each with an IFO and VOBs _1 to _9 (_0 holds its menus).
     for set in 1..=99 {
         let ifo = dir.join(format!("VTS_{set:02}_0.IFO"));
-        let Ok(bytes) = std::fs::read(&ifo) else {
+        let Some(bytes) = read_capped(&ifo, MAX_IFO) else {
             if set > 1 && best.is_some() {
                 break;
             }
@@ -335,13 +350,9 @@ pub fn bluray(root: &Path) -> Option<Title> {
     playlists.sort();
     let mut best: Option<Title> = None;
     for playlist in playlists {
-        // A playlist is a few kilobytes; a bigger file is no playlist worth reading.
-        let Ok(bytes) = std::fs::read(&playlist) else {
+        let Some(bytes) = read_capped(&playlist, MAX_PLAYLIST) else {
             continue;
         };
-        if bytes.len() > 1 << 20 {
-            continue;
-        }
         let Some((clips, length, chapters)) = playlist_title(&bytes) else {
             continue;
         };
@@ -773,6 +784,48 @@ mod tests {
         assert!((1.0..=2.05).contains(&landed), "landed at {landed:.2}");
         drop(input);
         std::fs::remove_dir_all(root.parent().unwrap()).unwrap();
+    }
+
+    /// A named pipe at `path` serving `total` bytes; the thread returns how many the reader
+    /// took before it hung up.
+    fn endless(path: &Path, total: usize) -> std::thread::JoinHandle<usize> {
+        use std::io::Write;
+        use std::os::unix::ffi::OsStrExt;
+        let name = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        let path = path.to_owned();
+        std::thread::spawn(move || {
+            let mut pipe = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+            let chunk = vec![0u8; 1 << 16];
+            let mut sent = 0;
+            while sent < total && pipe.write_all(&chunk).is_ok() {
+                sent += chunk.len();
+            }
+            sent
+        })
+    }
+
+    /// IFOs and playlists are kilobytes. A huge file in their place, here a pipe that never
+    /// ends early, must not be read whole into memory.
+    #[test]
+    fn huge_disc_files_are_not_read_whole() {
+        let root = std::env::temp_dir().join(format!("wushang-disc-huge-{}", std::process::id()));
+        _ = std::fs::remove_dir_all(&root);
+        let total = 256 << 20;
+        let video_ts = root.join("dvd/VIDEO_TS");
+        std::fs::create_dir_all(&video_ts).unwrap();
+        let ifo = endless(&video_ts.join("VTS_01_0.IFO"), total);
+        assert!(dvd(&root.join("dvd")).is_none());
+        let sent = ifo.join().unwrap();
+        assert!(sent < 64 << 20, "the IFO reader took {sent} bytes");
+
+        let playlists = root.join("bd/BDMV/PLAYLIST");
+        std::fs::create_dir_all(&playlists).unwrap();
+        let playlist = endless(&playlists.join("00000.mpls"), total);
+        assert!(bluray(&root.join("bd")).is_none());
+        let sent = playlist.join().unwrap();
+        assert!(sent < 64 << 20, "the playlist reader took {sent} bytes");
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
