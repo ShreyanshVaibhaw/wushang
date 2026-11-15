@@ -1382,6 +1382,24 @@ impl Thumbs {
     }
 }
 
+/// A bitmap of a decoded picture: BGRA rows, `width * 4` bytes each. None if it won't make one.
+fn bgra_bitmap(
+    ctx: &ID2D1DeviceContext5,
+    (width, height, bgra): (u32, u32, &[u8]),
+) -> Option<ID2D1Bitmap> {
+    let props = D2D1_BITMAP_PROPERTIES {
+        pixelFormat: D2D1_PIXEL_FORMAT {
+            format: DXGI_FORMAT_B8G8R8A8_UNORM,
+            alphaMode: D2D1_ALPHA_MODE_IGNORE,
+        },
+        dpiX: 96.0,
+        dpiY: 96.0,
+    };
+    let rt: &ID2D1RenderTarget = ctx;
+    let size = D2D_SIZE_U { width, height };
+    unsafe { rt.CreateBitmap(size, Some(bgra.as_ptr().cast()), width * 4, &props) }.ok()
+}
+
 /// Device-bound drawing resources, created once per Direct2D context.
 pub struct Painter {
     factory: ID2D1Factory1,
@@ -1539,47 +1557,13 @@ impl Painter {
         path: PathBuf,
         picture: Option<(u32, u32, &[u8])>,
     ) {
-        let bitmap = picture.and_then(|(width, height, bgra)| unsafe {
-            let props = D2D1_BITMAP_PROPERTIES {
-                pixelFormat: D2D1_PIXEL_FORMAT {
-                    format: DXGI_FORMAT_B8G8R8A8_UNORM,
-                    alphaMode: D2D1_ALPHA_MODE_IGNORE,
-                },
-                dpiX: 96.0,
-                dpiY: 96.0,
-            };
-            let rt: &ID2D1RenderTarget = ctx;
-            rt.CreateBitmap(
-                D2D_SIZE_U { width, height },
-                Some(bgra.as_ptr().cast()),
-                width * 4,
-                &props,
-            )
-            .ok()
-        });
-        self.thumbs.insert(path, bitmap);
+        self.thumbs
+            .insert(path, picture.and_then(|p| bgra_bitmap(ctx, p)));
     }
 
     /// The still the seek bar's preview shows, or None for just the time.
     pub fn set_seek_still(&mut self, ctx: &ID2D1DeviceContext5, still: Option<(u32, u32, &[u8])>) {
-        self.seek_still = still.and_then(|(width, height, bgra)| unsafe {
-            let props = D2D1_BITMAP_PROPERTIES {
-                pixelFormat: D2D1_PIXEL_FORMAT {
-                    format: DXGI_FORMAT_B8G8R8A8_UNORM,
-                    alphaMode: D2D1_ALPHA_MODE_IGNORE,
-                },
-                dpiX: 96.0,
-                dpiY: 96.0,
-            };
-            let rt: &ID2D1RenderTarget = ctx;
-            rt.CreateBitmap(
-                D2D_SIZE_U { width, height },
-                Some(bgra.as_ptr().cast()),
-                width * 4,
-                &props,
-            )
-            .ok()
-        });
+        self.seek_still = still.and_then(|p| bgra_bitmap(ctx, p));
     }
 
     /// Files the last paint showed without a thumbnail.
