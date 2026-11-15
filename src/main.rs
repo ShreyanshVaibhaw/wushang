@@ -162,16 +162,20 @@ fn main() {
     }
 }
 
+/// The host a stream's address names. Disc and capture addresses have "://" too, but no host.
+fn stream_host(path: &Path) -> Option<String> {
+    net::is_url_path(path)
+        .then(|| net::host_of(&path.to_string_lossy()))
+        .flatten()
+}
+
 /// The notice for `path` failing to open, since a launch from Finder has no terminal to read.
 fn cannot_play(path: &Path) -> String {
     if !net::is_address(path) {
         let name = path.file_name().unwrap_or(path.as_os_str());
         return format!("Can't play {}", name.to_string_lossy());
     }
-    let host = net::is_url_path(path)
-        .then(|| net::host_of(&path.to_string_lossy()))
-        .flatten();
-    match host {
+    match stream_host(path) {
         Some(host) => format!("Can't play the stream from {host}"),
         None if disc::is_disc_path(path) => {
             "Can't play the disc (an encrypted one needs AACS or CSS keys)".to_owned()
@@ -445,11 +449,7 @@ impl App {
         let (url, flag) = (path.to_owned(), cancel.clone());
         thread::spawn(move || _ = done.send(session::open_input(&url, options, &flag)));
         if seen {
-            // Disc and capture addresses have "://" too, but no host.
-            let host = net::is_url_path(path)
-                .then(|| net::host_of(&path.to_string_lossy()))
-                .flatten();
-            let line = match host {
+            let line = match stream_host(path) {
                 Some(host) => format!("Connecting to {host}..."),
                 None if disc::is_disc_path(path) => "Opening the disc...".to_owned(),
                 None => "Opening the capture device...".to_owned(),
@@ -2927,6 +2927,20 @@ fn play_entry(app: &mut App, path: &Path, place: &Place) -> bool {
     app.play(path, queue)
 }
 
+/// Makes `path`, an entry on the library page shown, the file open in the tab on screen, as a
+/// click on it does, unless it already is. Returns whether it is open.
+fn open_entry(app: &mut App, path: &Path) -> bool {
+    if app.session().is_some_and(|s| s.path == path) {
+        return true;
+    }
+    let place = UI.with_borrow(|ui| ui.browse.place.clone());
+    if !play_entry(app, path, &place) {
+        return false;
+    }
+    show_player();
+    true
+}
+
 /// Shows the player page; from the mini player, the full window comes back for it.
 fn show_player() {
     if is_mini() {
@@ -3110,16 +3124,8 @@ fn menu_action(app: &mut App, win: Window, action: MenuAction) {
         }
         MenuAction::Stream => app.toggle_stream(),
         MenuAction::StreamFile(path) => {
-            if app.session().is_none_or(|s| s.path != path) {
-                let place = UI.with_borrow(|ui| ui.browse.place.clone());
-                let mut queue = app.library.media_in(&place);
-                if !queue.contains(&path) {
-                    queue = vec![path.clone()];
-                }
-                if !app.play(&path, queue) {
-                    return;
-                }
-                show_player();
+            if !open_entry(app, &path) {
+                return;
             }
             if !app.session().is_some_and(Session::streaming) {
                 app.toggle_stream();
@@ -3184,18 +3190,9 @@ fn menu_action(app: &mut App, win: Window, action: MenuAction) {
         }
         MenuAction::AddSubtitleTo(path) => pick_subtitle_file(Picked::SubtitleFor(path)),
         MenuAction::AddAudioTo(path) => {
-            if app.session().is_none_or(|s| s.path != path) {
-                let place = UI.with_borrow(|ui| ui.browse.place.clone());
-                let mut queue = app.library.media_in(&place);
-                if !queue.contains(&path) {
-                    queue = vec![path.clone()];
-                }
-                if !app.play(&path, queue) {
-                    return;
-                }
-                show_player();
+            if open_entry(app, &path) {
+                pick_audio_file();
             }
-            pick_audio_file();
         }
         MenuAction::ForgetAddress(kind, url) => {
             app.library.remove_address(kind, &url);
@@ -3305,19 +3302,9 @@ fn add_audio_track(app: &mut App, path: &Path) {
 /// Shows the subtitle file `subs` picked for `path`: on the open file, or on `path` once it
 /// plays.
 fn add_subtitle_to(app: &mut App, path: &Path, subs: PathBuf) {
-    let open = app.session().is_some_and(|s| s.path == path);
-    if !open {
-        let place = UI.with_borrow(|ui| ui.browse.place.clone());
-        let mut queue = app.library.media_in(&place);
-        if !queue.iter().any(|p| p == path) {
-            queue = vec![path.to_owned()];
-        }
-        if !app.play(path, queue) {
-            return;
-        }
-        show_player();
+    if open_entry(app, path) {
+        app.tab_mut().show_subtitle_file(subs);
     }
-    app.tab_mut().show_subtitle_file(subs);
 }
 
 /// Plays a playlist from its first file, or in a shuffled order.
@@ -4155,10 +4142,7 @@ fn use_tool(app: &mut App, win: Window, item: ui::ToolItem) {
         }
         T::Favorite => {
             if let Some(path) = app.session().map(|s| s.path.clone()) {
-                let on = !app.library.is_favorite(&path);
-                app.library.set_favorite(&path, on);
-                app.library_changed = true;
-                UI.with_borrow_mut(|ui| ui.browse.stale = true);
+                toggle_favorite(app, &path);
             }
         }
         T::Playlists => UI.with_borrow_mut(|ui| {
