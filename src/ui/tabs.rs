@@ -196,10 +196,7 @@ impl Resources {
     ) -> Result<Self> {
         let brush =
             |rgb: u32, alpha: f32| unsafe { ctx.CreateSolidColorBrush(&color(rgb, alpha), None) };
-        let tint = |bytes: &[u8], rgb: u32| {
-            let text = String::from_utf8_lossy(bytes).replace("#8F8F8F", &format!("#{rgb:06X}"));
-            svg(ctx, text.as_bytes())
-        };
+        let tint = |bytes: &[u8], rgb| recolor(ctx, bytes, FG_A2, rgb);
         let close = include_bytes!("../../assets/icons/close_tab.svg");
         let new = include_bytes!("../../assets/icons/new_tab.svg");
         Ok(Resources {

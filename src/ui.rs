@@ -1233,10 +1233,7 @@ struct ActiveIcons {
 
 impl ActiveIcons {
     fn load(ctx: &ID2D1DeviceContext5) -> Result<Self> {
-        let tint = |bytes: &[u8]| {
-            let text = String::from_utf8_lossy(bytes).replace("#8F8F8F", "#D37918");
-            svg(ctx, text.as_bytes())
-        };
+        let tint = |bytes: &[u8]| recolor(ctx, bytes, FG_A2, ACCENT);
         Ok(ActiveIcons {
             home: tint(include_bytes!("../assets/icons/nav_home.svg"))?,
             videos: tint(include_bytes!("../assets/icons/nav_videos.svg"))?,
@@ -1252,6 +1249,13 @@ impl ActiveIcons {
 fn svg(ctx: &ID2D1DeviceContext5, bytes: &[u8]) -> Result<Svg> {
     let text = std::str::from_utf8(bytes).map_err(|_| Error::from(E_FAIL))?;
     svg_as_is(ctx, theme::svg(text).as_bytes())
+}
+
+/// Parses an icon with the design colour `from` swapped for `to`, for its lit or accent version.
+fn recolor(ctx: &ID2D1DeviceContext5, bytes: &[u8], from: u32, to: u32) -> Result<Svg> {
+    let text =
+        String::from_utf8_lossy(bytes).replace(&format!("#{from:06X}"), &format!("#{to:06X}"));
+    svg(ctx, text.as_bytes())
 }
 
 /// Parses an icon exported from Figma. The viewport is the root element's width and height.
@@ -2261,16 +2265,13 @@ fn tool_icons(ctx: &ID2D1DeviceContext5, lit: bool) -> Result<HashMap<ToolItem, 
         ),
     ];
     let (from, to) = if lit {
-        ("#8F8F8F", "#D37918")
+        (FG_A2, ACCENT)
     } else {
-        ("#D37918", "#8F8F8F")
+        (ACCENT, FG_A2)
     };
     table
         .iter()
-        .map(|(item, bytes)| {
-            let text = String::from_utf8_lossy(bytes).replace(from, to);
-            Ok((*item, svg(ctx, text.as_bytes())?))
-        })
+        .map(|(item, bytes)| Ok((*item, recolor(ctx, bytes, from, to)?)))
         .collect()
 }
 
