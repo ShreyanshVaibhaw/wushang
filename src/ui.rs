@@ -1164,61 +1164,69 @@ struct Svg {
     width: f32,
 }
 
+/// The icons, `as_is` ones in their own colours and `themed` ones in the theme's.
 macro_rules! icons {
-    ($($name:ident = $file:literal),* $(,)?) => {
-        struct Icons { $($name: Svg),* }
+    (
+        as_is: { $($fixed:ident = $fixed_file:literal),* $(,)? }
+        themed: { $($name:ident = $file:literal),* $(,)? }
+    ) => {
+        struct Icons { $($fixed: Svg,)* $($name: Svg),* }
         impl Icons {
             fn load(ctx: &ID2D1DeviceContext5) -> Result<Self> {
-                let mut icons = Icons { $($name: svg(ctx, include_bytes!(concat!("../assets/icons/", $file)))?),* };
-                // The logo keeps its own oranges whatever the accent, and the volume meter's green
-                // to red is a level scale, not the accent.
-                icons.logo = svg_as_is(ctx, include_bytes!("../assets/icons/logo.svg"))?;
-                icons.volume_fill = svg_as_is(ctx, include_bytes!("../assets/icons/volume_fill.svg"))?;
-                Ok(icons)
+                Ok(Icons {
+                    $($fixed: svg_as_is(ctx, include_bytes!(concat!("../assets/icons/", $fixed_file)))?,)*
+                    $($name: svg(ctx, include_bytes!(concat!("../assets/icons/", $file)))?),*
+                })
             }
         }
     };
 }
 
 icons! {
-    logo = "logo.svg",
-    more = "more.svg",
-    sidebar = "sidebar.svg",
-    divider = "divider.svg",
-    folder = "folder.svg",
-    minimize = "minimize.svg",
-    maximize = "maximize.svg",
-    fullscreen = "fullscreen.svg",
-    fullscreen_exit = "fullscreen_exit.svg",
-    close = "close.svg",
-    play = "play.svg",
-    pause = "pause.svg",
-    previous = "previous.svg",
-    next = "next.svg",
-    speaker_high = "speaker.svg",
-    speaker_medium = "speaker_medium.svg",
-    speaker_low = "speaker_low.svg",
-    speaker_muted = "speaker_muted.svg",
-    audio = "audio.svg",
-    subtitles = "subtitles.svg",
-    settings = "playback_settings.svg",
-    playlist = "playlist.svg",
-    volume_track = "volume_track.svg",
-    volume_fill = "volume_fill.svg",
-    home = "nav_home.svg",
-    videos = "nav_videos.svg",
-    music = "nav_music.svg",
-    network = "nav_network.svg",
-    playlists = "nav_playlists.svg",
-    recent = "nav_recent.svg",
-    add = "nav_add.svg",
-    back = "arrow_left.svg",
-    forward = "arrow_right.svg",
-    sort = "sort.svg",
-    view_grid = "view_grid.svg",
-    view_list = "view_list.svg",
-    search = "search.svg",
-    more_panel = "more_panel.svg",
+    // The logo keeps its own oranges whatever the accent, and the volume meter's green to red is
+    // a level scale, not the accent.
+    as_is: {
+        logo = "logo.svg",
+        volume_fill = "volume_fill.svg",
+    }
+    themed: {
+        more = "more.svg",
+        sidebar = "sidebar.svg",
+        divider = "divider.svg",
+        folder = "folder.svg",
+        minimize = "minimize.svg",
+        maximize = "maximize.svg",
+        fullscreen = "fullscreen.svg",
+        fullscreen_exit = "fullscreen_exit.svg",
+        close = "close.svg",
+        play = "play.svg",
+        pause = "pause.svg",
+        previous = "previous.svg",
+        next = "next.svg",
+        speaker_high = "speaker.svg",
+        speaker_medium = "speaker_medium.svg",
+        speaker_low = "speaker_low.svg",
+        speaker_muted = "speaker_muted.svg",
+        audio = "audio.svg",
+        subtitles = "subtitles.svg",
+        settings = "playback_settings.svg",
+        playlist = "playlist.svg",
+        volume_track = "volume_track.svg",
+        home = "nav_home.svg",
+        videos = "nav_videos.svg",
+        music = "nav_music.svg",
+        network = "nav_network.svg",
+        playlists = "nav_playlists.svg",
+        recent = "nav_recent.svg",
+        add = "nav_add.svg",
+        back = "arrow_left.svg",
+        forward = "arrow_right.svg",
+        sort = "sort.svg",
+        view_grid = "view_grid.svg",
+        view_list = "view_list.svg",
+        search = "search.svg",
+        more_panel = "more_panel.svg",
+    }
 }
 
 /// The design's active state: the same glyph in the accent colour.
