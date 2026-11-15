@@ -2328,23 +2328,26 @@ mod tests {
 
     #[test]
     fn a_menu_from_the_control_bar_opens_above_its_button() {
-        let mut ui = Ui::new();
-        ui.page = Page::Player;
-        ui.toolbar.title.retain(|i| *i != ToolItem::More);
-        ui.toolbar.left.insert(0, ToolItem::More);
-        ui.layout = Layout::player(1280.0, 720.0, true, false, &ui.toolbar);
-        let r = ui.layout.button(Hit::More);
-        let (x, y) = ((r.l + r.r) / 2.0, (r.t + r.b) / 2.0);
-        ui.on_down(x, y);
-        let Some(Action::OpenMenu(hit, mx, my)) = ui.on_up(x, y) else {
-            panic!("the button opens its menu");
-        };
-        let profiles = ["Default".to_owned()];
-        let items = menu::main_menu(&[], &profiles, "Default", &[], menu::Converting::Nothing);
-        ui.open_menu(menu::Kind::Main, items, (mx, my), hit);
-        assert!(ui.over_menu(x, r.t - 8.0), "the menu stands on the button");
-        // The button stays clear, so a second click on it closes the menu.
-        assert_eq!(ui.layout.hit(x, y), Some(Hit::More));
+        // Room above for the whole menu, and at the smallest window not even that.
+        for height in [720.0, 450.0] {
+            let mut ui = Ui::new();
+            ui.page = Page::Player;
+            ui.toolbar.title.retain(|i| *i != ToolItem::More);
+            ui.toolbar.left.insert(0, ToolItem::More);
+            ui.layout = Layout::player(1280.0, height, true, false, &ui.toolbar);
+            let r = ui.layout.button(Hit::More);
+            let (x, y) = ((r.l + r.r) / 2.0, (r.t + r.b) / 2.0);
+            ui.on_down(x, y);
+            let Some(Action::OpenMenu(hit, mx, my)) = ui.on_up(x, y) else {
+                panic!("the button opens its menu");
+            };
+            let profiles = ["Default".to_owned()];
+            let items = menu::main_menu(&[], &profiles, "Default", &[], menu::Converting::Nothing);
+            ui.open_menu(menu::Kind::Main, items, (mx, my), hit);
+            assert!(ui.over_menu(x, r.t - 8.0), "the menu stands on the button");
+            // The button stays clear, so a second click on it closes the menu.
+            assert_eq!(ui.layout.hit(x, y), Some(Hit::More), "{height}");
+        }
     }
 
     /// Lays the player page out as the render loop does: the queue only while it's open.

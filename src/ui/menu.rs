@@ -632,11 +632,11 @@ impl State {
 }
 
 /// Where a `w` x `h` menu opened at (x, y) goes: right of and below the point, flipped left or up
-/// where it would leave `bounds`, and pushed inside when it fits neither way. Flipped up, its
-/// bottom is at `up`: `y` for a point, above the button for a button's menu. A menu taller than
-/// `bounds` gets their height and scrolls.
+/// where it would leave `bounds`. Flipped up, its bottom is at `up`: `y` for a point, above the
+/// button for a button's menu. A point's menu that fits neither way is pushed inside, over the
+/// point; a button's takes the roomier side, never covering the button. A menu that ends up
+/// shorter than its rows scrolls.
 pub fn place(x: f32, (y, up): (f32, f32), w: f32, h: f32, bounds: Rect) -> Rect {
-    let h = h.min(bounds.h());
     let l = if x + w <= bounds.r {
         x
     } else if x - w >= bounds.l {
@@ -644,12 +644,18 @@ pub fn place(x: f32, (y, up): (f32, f32), w: f32, h: f32, bounds: Rect) -> Rect 
     } else {
         (bounds.r - w).max(bounds.l)
     };
-    let t = if y + h <= bounds.b {
-        y
-    } else if up - h >= bounds.t {
-        up - h
+    let (below, above) = (bounds.b - y, up - bounds.t);
+    let (t, h) = if h <= below {
+        (y, h)
+    } else if h <= above {
+        (up - h, h)
+    } else if up >= y {
+        let h = h.min(bounds.h());
+        ((bounds.b - h).max(bounds.t), h)
+    } else if below >= above {
+        (y, below)
     } else {
-        (bounds.b - h).max(bounds.t)
+        (bounds.t, above)
     };
     Rect::new(l, t, l + w, t + h)
 }
@@ -1495,10 +1501,19 @@ mod tests {
             place(200.0, (350.0, 350.0), 265.0, 500.0, WINDOW),
             Rect::new(200.0, 200.0, 465.0, 700.0)
         );
-        // A button's menu that can't open below stands on the button instead of covering it.
+        // A button's menu that can't open below stands on the button instead of covering it,
+        // and one that fits neither way takes the roomier side and scrolls.
         assert_eq!(
             place(100.0, (640.0, 600.0), 265.0, 300.0, WINDOW),
             Rect::new(100.0, 300.0, 365.0, 600.0)
+        );
+        assert_eq!(
+            place(100.0, (640.0, 600.0), 265.0, 650.0, WINDOW),
+            Rect::new(100.0, 0.0, 365.0, 600.0)
+        );
+        assert_eq!(
+            place(100.0, (100.0, 60.0), 265.0, 650.0, WINDOW),
+            Rect::new(100.0, 100.0, 365.0, 700.0)
         );
         // Taller than the window: as tall as the window, scrolling.
         assert_eq!(place(10.0, (10.0, 10.0), 290.0, 900.0, WINDOW).h(), 700.0);
