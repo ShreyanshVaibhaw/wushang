@@ -7,7 +7,6 @@
 
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::fmt::Write as _;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
@@ -1121,19 +1120,21 @@ impl Library {
             .ok_or_else(|| {
                 io::Error::new(ErrorKind::InvalidInput, "path can't go in a playlist")
             })?;
-        let mut text = match fs::read_to_string(&file) {
-            Ok(text) => text,
-            Err(e) if e.kind() == ErrorKind::NotFound => String::new(),
+        // As bytes: a playlist from another program may not be UTF-8, and its lines stay as
+        // they are.
+        let mut bytes = match fs::read(&file) {
+            Ok(bytes) => bytes,
+            Err(e) if e.kind() == ErrorKind::NotFound => Vec::new(),
             Err(e) => return Err(e),
         };
-        if text.is_empty() {
-            text = format!("{M3U_HEADER}\n");
-        } else if !text.ends_with('\n') {
-            text.push('\n');
+        if bytes.is_empty() {
+            bytes = format!("{M3U_HEADER}\n").into_bytes();
+        } else if !bytes.ends_with(b"\n") {
+            bytes.push(b'\n');
         }
-        writeln!(text, "{line}").unwrap();
+        bytes.extend_from_slice(format!("{line}\n").as_bytes());
         fs::create_dir_all(self.playlist_dir())?;
-        write_replacing(&file, text.as_bytes())
+        write_replacing(&file, &bytes)
     }
 
     /// The files of a playlist in order. Relative lines resolve against the playlists folder.
@@ -1210,15 +1211,23 @@ impl Library {
     }
 
     /// Removes item `index` (as [`Library::playlist_items`] counts) and its `#EXTINF` line,
-    /// keeping every other line of the file as it was.
+    /// keeping every other line of the file byte for byte as it was, line end and encoding too.
     pub fn remove_from_playlist(&mut self, name: &str, index: usize) -> io::Result<()> {
         let file = self.playlist_file(name)?;
-        let text = String::from_utf8_lossy(&fs::read(&file)?).into_owned();
-        let lines: Vec<&str> = text.lines().collect();
+        let bytes = fs::read(&file)?;
+        // Each line with its line end, and as `playlist_items` reads it.
+        let raw: Vec<&[u8]> = bytes.split_inclusive(|&b| b == b'\n').collect();
+        let text: Vec<String> = (raw.iter())
+            .map(|l| {
+                let l = l.strip_suffix(b"\n").unwrap_or(l);
+                let l = l.strip_suffix(b"\r").unwrap_or(l);
+                String::from_utf8_lossy(l).into_owned()
+            })
+            .collect();
         let dir = self.playlist_dir();
         let is_item = |l: &str| playlist_entry(l, &dir).is_some();
-        let at = (0..lines.len())
-            .filter(|&i| is_item(lines[i]))
+        let at = (0..text.len())
+            .filter(|&i| is_item(&text[i]))
             .nth(index)
             .ok_or_else(|| {
                 io::Error::new(
@@ -1227,14 +1236,10 @@ impl Library {
                 )
             })?;
         let mut start = at;
-        while start > 0 && lines[start - 1].trim().starts_with("#EXTINF") {
+        while start > 0 && text[start - 1].trim().starts_with("#EXTINF") {
             start -= 1;
         }
-        let mut out = String::new();
-        for line in lines[..start].iter().chain(&lines[at + 1..]) {
-            writeln!(out, "{line}").unwrap();
-        }
-        write_replacing(&file, out.as_bytes())
+        write_replacing(&file, &[&raw[..start], &raw[at + 1..]].concat().concat())
     }
 
     pub fn playlist_thumbnail(&self, name: &str) -> Option<&Path> {
@@ -2430,6 +2435,25 @@ mod tests {
         let err = lib.remove_from_playlist("P", 1).unwrap_err();
         assert_eq!(err.kind(), ErrorKind::InvalidInput);
         assert!(lib.remove_from_playlist("Nope", 0).is_err());
+    }
+
+    /// A playlist saved by another program in Latin-1 (or with Windows line ends) can still be
+    /// added to and taken from, and its other lines stay byte for byte as they were.
+    #[test]
+    fn playlists_that_are_not_utf8_are_edited_as_they_are() {
+        let tmp = TempDir::new();
+        let mut lib = Library::open(&tmp.0, false);
+        lib.create_playlist("P").unwrap();
+        let file = lib.playlist_file("P").unwrap();
+        fs::write(&file, b"#EXTM3U\r\n/M\xfasica/a.mp3\r\n/b.mp3\n/c\xe9.mp3").unwrap();
+
+        lib.add_to_playlist("P", Path::new("/d.mp3")).unwrap();
+        let added = b"#EXTM3U\r\n/M\xfasica/a.mp3\r\n/b.mp3\n/c\xe9.mp3\n/d.mp3\n";
+        assert_eq!(fs::read(&file).unwrap(), added);
+        lib.remove_from_playlist("P", 1).unwrap();
+        let removed = b"#EXTM3U\r\n/M\xfasica/a.mp3\r\n/c\xe9.mp3\n/d.mp3\n";
+        assert_eq!(fs::read(&file).unwrap(), removed);
+        assert_eq!(lib.playlist_items("P")[2], PathBuf::from("/d.mp3"));
     }
 
     /// Lines the list leaves out (other protocols, broken addresses) don't count toward the
