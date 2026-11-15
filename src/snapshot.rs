@@ -39,16 +39,16 @@ pub fn file_name(stem: &str, seconds: f64) -> String {
 }
 
 /// What names a file made from `path`: a file's own name, else (a stream address) its `title`,
-/// without the characters Windows file names can't hold, so the file can go to any disk.
+/// without the characters exFAT and FAT file names can't hold, so the file can go to any disk.
 pub fn stem(path: &Path, title: &str) -> String {
     if !crate::net::is_address(path)
         && let Some(stem) = path.file_stem()
     {
         return stem.to_string_lossy().into_owned();
     }
-    // A stream names itself, so its title is made safe as a file name: no characters Windows
-    // forbids, no control characters (a NUL from `%00` would cut the name short where Windows
-    // reads it), no trailing dots or spaces, no device names like CON, and not too long.
+    // A stream names itself, so its title is made safe as a file name: no characters exFAT
+    // forbids (a "/" would also split the path), no control characters (a NUL from `%00` makes
+    // the path unusable), no trailing dots or spaces, and not too long.
     let name: String = title
         .chars()
         .map(|c| match c {
@@ -59,17 +59,7 @@ pub fn stem(path: &Path, title: &str) -> String {
         .take(120)
         .collect();
     let name = name.trim_end_matches(['.', ' ']).trim_start();
-    let device = name
-        .split('.')
-        .next()
-        .unwrap_or("")
-        .trim_end()
-        .to_ascii_uppercase();
-    let reserved = ["CON", "PRN", "AUX", "NUL"].contains(&device.as_str())
-        || (device.len() == 4
-            && (device.starts_with("COM") || device.starts_with("LPT"))
-            && device.as_bytes()[3].is_ascii_digit());
-    if name.is_empty() || reserved {
+    if name.is_empty() {
         "stream".into()
     } else {
         name.to_owned()
@@ -181,8 +171,8 @@ mod tests {
         let stream = Path::new("https://x.example/live");
         assert_eq!(stem(stream, "report.docx\0"), "report.docx_");
         assert_eq!(stem(stream, "line\nbreak. . "), "line_break");
-        assert_eq!(stem(stream, "con.txt"), "stream");
-        assert_eq!(stem(stream, "COM1"), "stream");
+        assert_eq!(stem(stream, "con.txt"), "con.txt");
+        assert_eq!(stem(stream, "COM1"), "COM1");
         assert_eq!(stem(stream, "Combo"), "Combo");
         assert_eq!(stem(stream, " ..."), "stream");
         assert_eq!(stem(stream, &"x".repeat(500)).len(), 120);
