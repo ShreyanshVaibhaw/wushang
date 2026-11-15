@@ -1320,15 +1320,15 @@ impl App {
     /// stream, or in a tab out of sight) carries the rest of the tries, for `finish_opening`.
     fn open_from_queue(&mut self, i: usize, mut path: Option<PathBuf>, mut tries: usize) -> bool {
         while let Some(p) = path {
-            if self.open(i, &p) {
-                if let Some(o) = self.tabs[i].opening.as_mut() {
-                    o.skips = Some(tries.saturating_sub(1));
-                }
-                return true;
-            }
-            tries = tries.saturating_sub(1);
             if tries == 0 {
                 return false;
+            }
+            tries -= 1;
+            if self.open(i, &p) {
+                if let Some(o) = self.tabs[i].opening.as_mut() {
+                    o.skips = Some(tries);
+                }
+                return true;
             }
             path = self.tabs[i].queue.next();
         }
@@ -2808,9 +2808,6 @@ fn modal_frame() {
     }
 }
 
-/// Walks the Music folders `roots` on a thread, since a big library or a slow drive would hold
-/// up the window. Sends the files whose saved tags still match (by size and time) with those
-/// tags, and the files to probe.
 /// A click that needs the library or opens files.
 fn handle(app: &mut App, win: Window, hit: Hit) {
     let go = |place: Place| UI.with_borrow_mut(|ui| ui.browse.go(place));
@@ -4910,8 +4907,6 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
-    /// A tab out of sight opens its next file on a thread, never holding up the window, and
-    /// when the last file of all ends there, wushang quits if Settings say so.
     /// A file of the queue that can't open (moved or deleted) is passed over, on screen and out
     /// of sight, as in VLC's playlist; a queue with nothing left that opens ends.
     #[test]
@@ -4947,10 +4942,13 @@ mod tests {
 
         // Out of sight with every file left gone, the background opens fail one by one, and
         // that is its queue's end too.
+        // Under Repeat All too, where the queue wraps round to them again.
+        let gone_too = dir.join("gone 2.mp4");
         app.tabs[0].queue = Queue::new(
-            vec![short.clone(), gone.clone(), dir.join("gone 2.mp4")],
-            Some(&short),
+            vec![gone_too.clone(), gone.clone(), dir.join("gone 3.mp4")],
+            Some(&gone_too),
         );
+        app.tabs[0].queue.set_repeat(Repeat::All);
         assert!(app.advance(0));
         let start = Instant::now();
         let mut ended = false;
@@ -4962,6 +4960,8 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    /// A tab out of sight opens its next file on a thread, never holding up the window, and
+    /// when the last file of all ends there, wushang quits if Settings say so.
     #[test]
     fn a_tab_out_of_sight_moves_on_by_itself() {
         let (mut app, dir, _one) = test_app("unseen");
