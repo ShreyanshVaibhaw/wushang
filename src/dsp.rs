@@ -334,17 +334,19 @@ pub fn spectrum(samples: &[f32], rate: u32, bands: usize) -> Vec<f32> {
         return vec![0.0; bands];
     }
     let (lo, hi) = (50.0f32, 16_000.0f32.min(rate as f32 / 2.0));
+    // The samples through a Hann window, once for every band.
+    let windowed: Vec<f32> = (samples.iter().enumerate())
+        .map(|(i, s)| s * (0.5 - 0.5 * (std::f32::consts::TAU * i as f32 / (n - 1) as f32).cos()))
+        .collect();
     (0..bands)
         .map(|b| {
             let f = lo * (hi / lo).powf((b as f32 + 0.5) / bands as f32);
             let w = std::f32::consts::TAU * f / rate as f32;
             let (mut re, mut im) = (0.0f32, 0.0f32);
-            for (i, s) in samples.iter().enumerate() {
-                // Hann window.
-                let hann = 0.5 - 0.5 * (std::f32::consts::TAU * i as f32 / (n - 1) as f32).cos();
+            for (i, s) in windowed.iter().enumerate() {
                 let (sin, cos) = (w * i as f32).sin_cos();
-                re += s * hann * cos;
-                im += s * hann * sin;
+                re += s * cos;
+                im += s * sin;
             }
             // A full-scale sine reads about n / 4 through the window.
             let level = (re * re + im * im).sqrt() / (n as f32 / 4.0);
