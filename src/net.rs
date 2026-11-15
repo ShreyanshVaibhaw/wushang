@@ -14,6 +14,9 @@ use std::time::Duration;
 const RADIO_DIRECTORY: &str = "https://de1.api.radio-browser.info/xml/stations/topvote/100";
 /// Feeds and directories bigger than this are not worth parsing.
 const MAX_FETCH: usize = 4 << 20;
+/// How long a feed, the radio directory or the release check may take in all. One thread
+/// serves them in turn, so a server trickling its answer must not hold it for longer.
+const FETCH_DEADLINE: Duration = Duration::from_secs(180);
 
 /// The schemes FFmpeg can open as a stream here, the same as the Windows build's slim FFmpeg
 /// (`scripts/build-ffmpeg.sh`) carries protocols for, so a saved library means the same on both.
@@ -451,13 +454,21 @@ fn resolve(base: &str, href: &str) -> String {
 }
 
 /// Fetches `url` (http or https) and returns the body as text. Follows redirects,
-/// honours the proxy in the environment, and gives up after `timeout` per stage.
+/// honours the proxy in the environment, and gives up after `timeout` per stage or
+/// [`FETCH_DEADLINE`] in all.
 pub fn fetch_text(url: &str, timeout: Duration) -> Result<String, String> {
-    fetch(url, timeout, MAX_FETCH).map(|body| String::from_utf8_lossy(&body).into_owned())
+    fetch(url, timeout, FETCH_DEADLINE, MAX_FETCH)
+        .map(|body| String::from_utf8_lossy(&body).into_owned())
 }
 
-/// Fetches `url` (http or https) as bytes, up to `max` of them, like [`fetch_text`].
-pub fn fetch(url: &str, timeout: Duration, max: usize) -> Result<Vec<u8>, String> {
+/// Fetches `url` (http or https) as bytes, up to `max` of them, like [`fetch_text`], giving up
+/// after `deadline` from the first lookup to the body's last byte.
+pub fn fetch(
+    url: &str,
+    timeout: Duration,
+    deadline: Duration,
+    max: usize,
+) -> Result<Vec<u8>, String> {
     let (scheme, rest) = url
         .split_once("://")
         .ok_or_else(|| format!("{} is not a web address", redact(url)))?;
@@ -493,6 +504,8 @@ pub fn fetch(url: &str, timeout: Duration, max: usize) -> Result<Vec<u8>, String
         .timeout_recv_response(stage)
         // Per read, as WinHTTP's receive timeout was: a slow but steady download goes on.
         .timeout_per_read(stage)
+        // A byte sent just inside every read timeout must still end.
+        .timeout_global(Some(deadline))
         .build()
         .into();
     let mut response = agent
@@ -516,6 +529,7 @@ pub fn fetch(url: &str, timeout: Duration, max: usize) -> Result<Vec<u8>, String
         .read_to_vec()
         .map_err(|e| match e {
             ureq::Error::BodyExceedsLimit(_) => "that download is too large".to_owned(),
+            ureq::Error::Timeout(_) => format!("{host} took too long to send it"),
             e => format!("network: {e}"),
         })?;
     if body.len() > max {
@@ -861,17 +875,46 @@ mod tests {
             Err("the server at 127.0.0.1 answered HTTP 404".into())
         );
         assert_eq!(
-            fetch(&format!("{base}/big"), second, 1000),
+            fetch(&format!("{base}/big"), second, FETCH_DEADLINE, 1000),
             Err("that download is too large".into())
         );
         assert_eq!(
-            fetch(&format!("{base}/big"), second, 2000).map(|b| b.len()),
+            fetch(&format!("{base}/big"), second, FETCH_DEADLINE, 2000).map(|b| b.len()),
             Ok(2000)
         );
         let stalled = fetch_text(&format!("{base}/stall"), second).unwrap_err();
         assert!(stalled.starts_with("cannot reach 127.0.0.1"), "{stalled}");
         assert!(fetch_text("ftp://example.com/x", second).is_err());
         assert!(fetch_text("not an address", second).is_err());
+    }
+
+    /// A server sending a byte just inside every read timeout must not hold the one fetch
+    /// thread for hours: the whole fetch has a deadline.
+    #[test]
+    fn a_trickling_server_is_given_up_on() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/feed", listener.local_addr().unwrap());
+        thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            _ = socket.read(&mut [0; 1024]);
+            _ = write!(socket, "HTTP/1.1 200 OK\r\nContent-Length: 100000\r\n\r\n");
+            for _ in 0..8000 / 300 {
+                thread::sleep(Duration::from_millis(300));
+                if socket.write_all(b"x").is_err() {
+                    break;
+                }
+            }
+        });
+        let started = std::time::Instant::now();
+        let result = fetch(
+            &url,
+            Duration::from_secs(1),
+            Duration::from_secs(2),
+            1 << 20,
+        );
+        assert!(started.elapsed() < Duration::from_secs(4), "{result:?}");
+        assert_eq!(result, Err("127.0.0.1 took too long to send it".into()));
     }
 
     /// The real podcast directory and radio directory, and GitHub's release answer. Needs the

@@ -22,6 +22,9 @@ const DMG_SUFFIX: &str = "-macos-arm64.dmg";
 const ZIP_SUFFIX: &str = "-macos-arm64.zip";
 /// Largest download accepted; a release is about 40 MB.
 const MAX_DOWNLOAD: usize = 200 << 20;
+/// How long the download may take in all: 200 MB at about 1 Mbit/s. It runs on a thread of
+/// its own, so a slow one holds up nothing else.
+const DOWNLOAD_DEADLINE: Duration = Duration::from_secs(30 * 60);
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Release {
@@ -139,7 +142,8 @@ fn save(release: &Release) -> Result<Saved, String> {
     };
     let dir = snapshot::known_folder(snapshot::Folder::Downloads)
         .map_err(|e| format!("Can't find your Downloads folder: {e}"))?;
-    let bytes = net::fetch(&release.zip, Duration::from_secs(60), MAX_DOWNLOAD)
+    let timeout = Duration::from_secs(60);
+    let bytes = net::fetch(&release.zip, timeout, DOWNLOAD_DEADLINE, MAX_DOWNLOAD)
         .map_err(|e| format!("Can't download the update: {e}"))?;
     fs::create_dir_all(&dir).map_err(|e| format!("Can't save the update: {e}"))?;
     // Named from the version, which is only digits and dots, never from the address.
