@@ -503,10 +503,11 @@ impl Ui {
         }
     }
 
-    /// Switches pages; the pointer may now be over something else.
+    /// Switches pages; the pointer may now be over something else, so a drag ends.
     pub fn show(&mut self, page: Page) {
         if self.page != page {
             self.page = page;
+            self.end_pointer();
             self.close_menu();
             self.panels.show(None, None);
             self.queue.open = false;
@@ -975,11 +976,13 @@ impl Ui {
         if self.queue.open {
             self.toggle_queue();
         }
+        // The seek bar and volume wedge go with the bars, so a drag on them ends.
+        self.end_pointer();
         self.relayout = true;
     }
 
-    /// The tab on screen changed under the pointer: a seek bar drag, its preview and a pressed
-    /// button belonged to the tab before, so they end without acting.
+    /// What was under the pointer went away (another tab, page or the bars hiding): a drag, the
+    /// seek preview and a pressed button belonged to it, so they end without acting.
     pub fn end_pointer(&mut self) {
         self.pressed = None;
         self.drag = None;
@@ -2315,6 +2318,40 @@ mod tests {
         assert!(!ui.layout.bars);
         // Hidden with the bars, it mustn't take clicks unseen.
         assert_eq!(ui.layout.hit(x, y), Some(Hit::Video));
+    }
+
+    /// A volume drag in progress on the player page, the wedge at (x, y).
+    fn dragging_volume() -> (Ui, f32, f32) {
+        let mut ui = Ui::new();
+        ui.page = Page::Player;
+        relayout(&mut ui);
+        let v = ui.layout.volume;
+        let (x, y) = (v.l + 30.0, (v.t + v.b) / 2.0);
+        assert!(matches!(ui.on_down(x, y), Some(Action::SetVolume(_))));
+        (ui, x, y)
+    }
+
+    #[test]
+    fn a_page_switch_ends_a_volume_drag() {
+        let (mut ui, x, y) = dragging_volume();
+        // The last file ends mid-drag: the library has no volume wedge to measure from.
+        ui.show(Page::Library);
+        ui.layout = Layout {
+            page: Page::Library,
+            width: 1280.0,
+            height: 720.0,
+            ..Default::default()
+        };
+        assert!(ui.on_move(x + 1.0, y).is_none(), "the volume stays put");
+        assert!(ui.on_up(x + 1.0, y).is_none());
+    }
+
+    #[test]
+    fn hide_ui_ends_a_volume_drag() {
+        let (mut ui, x, y) = dragging_volume();
+        ui.hide_bars();
+        relayout(&mut ui);
+        assert!(ui.on_move(x + 1.0, y).is_none(), "the volume stays put");
     }
 
     #[test]
