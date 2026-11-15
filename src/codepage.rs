@@ -98,15 +98,6 @@ pub fn detect(text: &[u8], language: Option<&str>) -> u32 {
         Some((e, _)) if e == encoding_rs::UTF_16BE => return UTF16BE,
         _ => {}
     }
-    if let Some(cp) = language.and_then(for_language)
-        && decode(text, cp, true).is_some()
-    {
-        return cp;
-    }
-    // The system's own code page goes first, so it wins ties.
-    let system = system_code_page();
-    let mut order: Vec<(u32, Script)> = CANDIDATES.to_vec();
-    order.sort_by_key(|&(cp, _)| cp != system);
     let score = |cp: u32, script: Script| {
         let text = decode(text, cp, true)?;
         Some(match script {
@@ -114,6 +105,23 @@ pub fn detect(text: &[u8], language: Option<&str>) -> u32 {
             _ => plausibility(&text, script),
         })
     };
+    // A tag settles it unless the text reads wrong in its code page: file names end in words
+    // that are also language codes ("Let_It_Be.srt" isn't Belarusian). Thai and Vietnamese
+    // have no script check, so their tags only need the text to be valid.
+    if let Some(cp) = language.and_then(for_language) {
+        let script = CANDIDATES.iter().find(|&&(c, _)| c == cp).map(|&(_, s)| s);
+        let fits = match script {
+            Some(script) => score(cp, script).is_some_and(|s| s >= 0),
+            None => decode(text, cp, true).is_some(),
+        };
+        if fits {
+            return cp;
+        }
+    }
+    // The system's own code page goes first, so it wins ties.
+    let system = system_code_page();
+    let mut order: Vec<(u32, Script)> = CANDIDATES.to_vec();
+    order.sort_by_key(|&(cp, _)| cp != system);
     let best = (order.into_iter())
         .filter_map(|(cp, script)| Some((cp, score(cp, script)?)))
         .fold(None, |best: Option<(u32, i32)>, (cp, score)| match best {
@@ -347,6 +355,20 @@ mod tests {
         let path = std::path::Path::new("/Users/me/Movies/Film.2020.ru.srt");
         assert_eq!(language_of(path).as_deref(), Some("ru"));
         assert_eq!(language_of(std::path::Path::new("Film.2020.srt")), None);
+    }
+
+    /// File names end in words that are also language codes: "Be", "He", "El", "Sr". Such a
+    /// tag must not override text that clearly reads in another code page.
+    #[test]
+    fn a_tag_that_does_not_fit_the_text_is_ignored() {
+        let path = std::path::Path::new("Let_It_Be.srt");
+        assert_eq!(language_of(path).as_deref(), Some("Be"));
+        let bytes = encode("Café, ça va très bien.", 1252);
+        for tag in ["Be", "He", "El", "Sr", "ru"] {
+            assert_eq!(detect(&bytes, Some(tag)), 1252, "{tag}");
+        }
+        let russian = encode("Привет, как дела?", 1251);
+        assert_eq!(detect(&russian, Some("Be")), 1251);
     }
 
     #[test]

@@ -1269,6 +1269,22 @@ mod tests {
         );
     }
 
+    /// "Be" ends the name but is no Belarusian tag: the text reads as Windows-1252.
+    #[test]
+    fn a_name_ending_in_a_language_code_keeps_its_text() {
+        let path = temp_dir("srt-be").join("Let_It_Be.srt");
+        std::fs::write(
+            &path,
+            b"1\r\n00:00:01,000 --> 00:00:02,000\r\nCaf\xe9 au lait\r\n\r\n",
+        )
+        .unwrap();
+        let cues = load_external(&path, (1920, 1080), &crate::ass::Fonts::default()).unwrap();
+        assert_eq!(
+            text(&cues.active(1.5)[0]),
+            &vec![vec![span("Café au lait", false, false)]]
+        );
+    }
+
     #[test]
     fn loads_srt() {
         let dir = temp_dir("srt");
