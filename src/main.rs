@@ -1341,9 +1341,12 @@ impl App {
         if !paths.is_empty() {
             let tab = self.tab_mut();
             tab.queue.add(paths);
-            // A stream still connecting moves on to them if it fails.
+            // A stream still connecting moves on to them if it fails, with tries enough for the
+            // whole queue, and a tab made for it stays for them.
             if let Some(o) = tab.opening.as_mut() {
-                o.skips.get_or_insert(tab.queue.items().len());
+                let n = tab.queue.items().len();
+                o.skips = Some(o.skips.map_or(n, |s| s.max(n)));
+                o.back = None;
             }
             self.queue_changed();
         }
@@ -4803,6 +4806,24 @@ mod tests {
         menu_action(&mut app, Window, MenuAction::AddToQueue(vec![file.clone()]));
         let on = |app: &App| app.session().is_some_and(|s| s.path == file);
         assert!(passes(&mut app, 10.0, on), "{:?}", app.notice);
+
+        // So does one in a tab made for it, which stays for what was added.
+        let refused = PathBuf::from("http://127.0.0.1:9/live.ts");
+        assert!(app.in_new_tab(|app| app.play_file(&refused)));
+        let (tabs, new) = (app.tabs.len(), app.active);
+        menu_action(&mut app, Window, MenuAction::AddToQueue(vec![file.clone()]));
+        let on_new = |app: &App| {
+            app.tabs.len() == tabs
+                && (app.tabs[new].session.as_ref()).is_some_and(|s| s.path == file)
+        };
+        assert!(passes(&mut app, 10.0, on_new), "{:?}", app.notice);
+
+        // And one moving on through its queue with no tries left gets more for what was added.
+        assert!(app.play_file(Path::new("http://10.255.255.1/live.ts")));
+        app.tab_mut().opening.as_mut().unwrap().skips = Some(0);
+        menu_action(&mut app, Window, MenuAction::AddToQueue(vec![file.clone()]));
+        let n = app.tab().queue.items().len();
+        assert_eq!(app.tab().opening.as_ref().unwrap().skips, Some(n));
         std::fs::remove_dir_all(dir).unwrap();
     }
 
