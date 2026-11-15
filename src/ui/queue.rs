@@ -552,10 +552,7 @@ impl Resources {
             |rgb: u32, alpha: f32| unsafe { ctx.CreateSolidColorBrush(&color(rgb, alpha), None) };
         let format =
             |size: f32, align| text_format(dwrite, fonts, size, DWRITE_FONT_WEIGHT_REGULAR, align);
-        let tint = |bytes: &[u8], rgb: u32| {
-            let text = String::from_utf8_lossy(bytes).replace("#8F8F8F", &format!("#{rgb:06X}"));
-            svg(ctx, text.as_bytes())
-        };
+        let tint = |bytes: &[u8], rgb: u32| recolor(ctx, bytes, 0x8F8F8F, rgb);
         let tab = |bytes: &[u8]| -> Result<(Svg, Svg)> {
             Ok((tint(bytes, FG_DIM)?, tint(bytes, ACCENT)?))
         };
@@ -568,8 +565,7 @@ impl Resources {
             };
             svg(ctx, text.as_bytes())?
         };
-        let more = String::from_utf8_lossy(include_bytes!("../../assets/icons/more_panel.svg"))
-            .replace("#6B6B6B", &format!("#{FG_A2:06X}"));
+        let more = include_bytes!("../../assets/icons/more_panel.svg");
         let repeat = include_bytes!("../../assets/icons/repeat.svg");
         let shuffle = include_bytes!("../../assets/icons/shuffle.svg");
         let minus = include_bytes!("../../assets/icons/minus.svg");
@@ -605,7 +601,7 @@ impl Resources {
             plus: tint(include_bytes!("../../assets/icons/nav_add.svg"), FG_DIM)?,
             handle: svg(ctx, handle)?,
             handle_dim: tint(handle, FG_DIM)?,
-            more: svg(ctx, more.as_bytes())?,
+            more: recolor(ctx, more, 0x6B6B6B, FG_A2)?,
             bookmark: tint(include_bytes!("../../assets/icons/bookmark.svg"), FG_DIM)?,
             playlist_on: tint(include_bytes!("../../assets/icons/playlist.svg"), ACCENT)?,
         })

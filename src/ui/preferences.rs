@@ -1431,10 +1431,7 @@ impl Resources {
             DWRITE_TEXT_ALIGNMENT_CENTER,
             DWRITE_TEXT_ALIGNMENT_TRAILING,
         );
-        let tint = |bytes: &[u8], rgb: u32| {
-            let text = String::from_utf8_lossy(bytes).replace("#8F8F8F", &format!("#{rgb:06X}"));
-            svg(ctx, text.as_bytes())
-        };
+        let tint = |bytes: &[u8], rgb: u32| recolor(ctx, bytes, 0x8F8F8F, rgb);
         let icon = |bytes: &[u8]| -> Result<(Svg, Svg)> {
             Ok((tint(bytes, FG_LABEL)?, tint(bytes, ACCENT)?))
         };

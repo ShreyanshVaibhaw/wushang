@@ -75,13 +75,12 @@ impl ID2D1DeviceContext5 {
 pub type Device = objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2_metal::MTLDevice>>;
 pub fn create_device() -> Result<Device, Box<dyn std::error::Error>>;
 impl Renderer {
-    pub fn new(layer: Retained<objc2_quartz_core::CAMetalLayer>, size: (u32, u32), device: Device, lock: Option<DeviceLock>) -> Result<Self, ...>;
+    pub fn new(layer: Retained<objc2_quartz_core::CAMetalLayer>, size: (u32, u32), device: Device) -> Result<Self, ...>;
     pub fn resize(&mut self, width: u32, height: u32) -> Result<...>;          // pixels
-    pub fn update_display(&mut self, window: &objc2_app_kit::NSWindow, allowed: bool, force: bool);
+    pub fn update_display(&mut self, window: &objc2_app_kit::NSWindow, allowed: bool, force: bool) -> bool; // true: paint again
     pub fn present(&mut self, frame: Option<&ff::frame::Video>, scene: &Scene, dpi: f32, adjust: &VideoAdjust) -> Result<...>;
     // library_layout, add_overlay, add_dialog, add_thumbnail, set_seek_still, take_wanted, snapshot: unchanged
 }
-pub struct DeviceLock; // a no-op on Metal; DeviceLock::from_hw(&HwDevice) -> Option<Self>
 ```
 
 `dpi` is still `96 * backingScaleFactor`, so the interface keeps working in DIPs.
@@ -130,10 +129,10 @@ pub fn system_dark_mode() -> bool;                   // NSApp effectiveAppearanc
 - **gfx**: `ui::theme::system_light()` calls `crate::platform::system_dark_mode()` (from the contract above) and negates it.
 - **video**: renderer, decoding and snapshots.
   - `snapshot::Folder { Pictures, Desktop, Videos, Music, Downloads }` replaces the `FOLDERID_*` GUIDs, by value: `known_folder(Folder) -> std::io::Result<PathBuf>` (~/Pictures, ~/Desktop, ~/Movies, ~/Music, ~/Downloads) and `output_dir(key, Folder, &Path) -> std::io::Result<PathBuf>`. Errors print with `{e}`, not `e.message()`.
-  - `Renderer::update_display(&NSWindow, allowed, force)` reads the screen's EDR headroom and the window's occlusion on every call (a few property reads), so call it every pass; `force` adds nothing. While the window is occluded `present` returns at once without drawing, so a hidden window never waits on `nextDrawable`.
+  - `Renderer::update_display(&NSWindow, allowed, force)` reads the screen's EDR headroom and the window's occlusion on every call (a few property reads), so call it every pass. While the window is occluded `present` returns at once without drawing, so a hidden window never waits on `nextDrawable`. It returns true when what is on screen is out of date: the window came back into view, the last present got no drawable, the screen or its headroom changed under an HDR frame, or `force` (a display change) asked; the shell then paints again.
   - The shell sets the layer's `contentsScale` (backingScaleFactor) and frame; the renderer sets device, pixel format (BGR10A2Unorm, or RGBA16Float in EDR), colour space (sRGB, or extended linear Display P3), `wantsExtendedDynamicRangeContent`, vsync, three drawables and `drawableSize` (from `new` and `resize`, in pixels).
   - EDR switches on only while an HDR10 or HLG frame is shown with HDR "Auto" on a screen whose potential headroom is above 1; the interface stays at SDR white. SDR video and the library never ask the screen for headroom.
-  - `DeviceLock::from_hw(&HwDevice)` returns None: nothing needs locking on Metal. `HwDevice` is `Send`.
+  - Nothing needs locking on Metal, so Windows' `DeviceLock` is gone and `Renderer::new` takes none. `HwDevice` is `Send`.
   - `render::takes(&frame) -> bool` says whether a VideoToolbox frame is shown straight from its pixel buffer; the decoder thread copies the others (one-plane formats such as ProRes 4444) back and repacks them.
   - Never `.clone()` a decoded frame: ffmpeg-next's `Clone` copies pixel data, which drops a VideoToolbox frame's pixel buffer. Move frames instead.
   - The interface bitmap is a Metal buffer's memory (shared on Apple silicon) wrapped in a `CGBitmapContext`, rather than an IOSurface: also no copy, and no IOSurface locking. `d2d.begin(&cg, size, scale)` gets a bitmap cleared to transparent each frame.
