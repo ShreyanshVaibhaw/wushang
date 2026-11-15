@@ -3227,8 +3227,6 @@ fn menu_action(app: &mut App, win: Window, action: MenuAction) {
                 ui.toggle_queue();
             }
         }),
-        MenuAction::ToggleRepeat => app.tab_mut().queue.cycle_repeat(),
-        MenuAction::ToggleShuffle => app.tab_mut().queue.toggle_shuffle(),
         MenuAction::ShowShortcuts => open_dialog(app, Dialog::Shortcuts),
         MenuAction::ShowAbout => open_dialog(app, Dialog::About),
         MenuAction::NewPlaylist(files) => open_dialog(app, Dialog::NewPlaylist { files }),

@@ -115,8 +115,6 @@ pub enum MenuAction {
     /// A change the queue panel also makes.
     Queue(crate::ui::queue::QueueAction),
     ShowQueue,
-    ToggleRepeat,
-    ToggleShuffle,
     /// A library file: plays it with the page it is on as the queue.
     Play(PathBuf),
     AddToQueue(Vec<PathBuf>),
@@ -990,8 +988,8 @@ pub fn player_menu(d: &PanelData, paused: bool) -> Vec<Item> {
         .collect();
     let playlist = vec![
         Item::new("Show Queue", MenuAction::ShowQueue).icon(Icon::Queue),
-        Item::new("Repeat", MenuAction::ToggleRepeat).icon(Icon::Resync),
-        Item::new("Shuffle", MenuAction::ToggleShuffle).icon(Icon::Shuffle),
+        Item::new("Repeat", MenuAction::Queue(QueueAction::CycleRepeat)).icon(Icon::Resync),
+        Item::new("Shuffle", MenuAction::Queue(QueueAction::ToggleShuffle)).icon(Icon::Shuffle),
     ];
     let open = vec![
         Item::new("Open File(s)", MenuAction::OpenFiles)
