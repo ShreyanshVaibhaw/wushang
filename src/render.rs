@@ -428,8 +428,6 @@ struct Gpu {
     /// The video and interface pipelines for each target format seen.
     pipelines: Vec<(MTLPixelFormat, Pipeline, Pipeline)>,
     cache: CFRetained<CVMetalTextureCache>,
-    /// For a software frame that reaches the renderer in another format than NV12 or P010.
-    nv12: crate::nv12::Nv12,
 }
 
 impl Gpu {
@@ -460,7 +458,6 @@ impl Gpu {
             library,
             sampler,
             pipelines: Vec::new(),
-            nv12: Default::default(),
         })
     }
 
@@ -516,18 +513,13 @@ impl Gpu {
         let Some(place) = geometry(w, h, sample_aspect(frame), adjust, area) else {
             return Ok(None);
         };
-        let (planes, colors) = if frame.format() == Pixel::VIDEOTOOLBOX {
-            (self.wrap(frame)?, colors(frame))
-        } else {
-            let converted;
-            let nv12 = if matches!(frame.format(), Pixel::NV12 | Pixel::P010LE) {
-                frame
-            } else {
-                converted = self.nv12.convert(frame)?;
-                &converted
-            };
-            (self.upload(nv12, upload)?, colors(nv12))
+        // The decoder thread repacks every software frame (see `nv12`).
+        let planes = match frame.format() {
+            Pixel::VIDEOTOOLBOX => self.wrap(frame)?,
+            Pixel::NV12 | Pixel::P010LE => self.upload(frame, upload)?,
+            f => return Err(format!("no shader for {f:?} frames").into()),
         };
+        let colors = colors(frame);
         Ok(Some(Prepared {
             params: params(&colors, &planes, adjust),
             planes,
@@ -2053,10 +2045,17 @@ mod tests {
         let hard = first(Some(&hw));
         assert_eq!(hard.format(), Pixel::VIDEOTOOLBOX);
         assert!(takes(&hard));
-        let soft = first(None);
         let mut gpu = gpu();
         let adjust = VideoAdjust::default();
         let size = (hard.width(), hard.height());
+        // Software frames reach the renderer repacked, as the decoder thread repacks them.
+        let soft = first(None);
+        assert!(
+            (gpu.render(&soft, &adjust, size, MTLPixelFormat::BGRA8Unorm, None)).is_err(),
+            "{:?} frames are the decoder thread's to repack",
+            soft.format()
+        );
+        let soft = crate::nv12::Nv12::default().convert(&soft).unwrap();
         let a = gpu
             .render(&hard, &adjust, size, MTLPixelFormat::BGRA8Unorm, None)
             .unwrap();
