@@ -129,6 +129,12 @@ fn run(
         .flags()
         .contains(ff::format::Flags::GLOBAL_HEADER);
     let length = (ictx.duration() as f64 / f64::from(ff::ffi::AV_TIME_BASE)).max(0.0);
+    // Input seconds that land on output 0, the same for the picture and the sound so they keep
+    // in step: the file's start, 1.4 s in FFmpeg's MPEG-TS files and anything in a broadcast.
+    let origin = match unsafe { (*ictx.as_ptr()).start_time } {
+        ff::ffi::AV_NOPTS_VALUE => 0.0,
+        t => t as f64 / f64::from(ff::ffi::AV_TIME_BASE),
+    };
 
     let video_stream = (target == Target::Mp4)
         .then(|| {
@@ -150,6 +156,7 @@ fn run(
         Some(i) => Some(VideoPath::new(
             &ictx.stream(i).unwrap(),
             &mut octx,
+            origin,
             global_header,
         )?),
         None => None,
@@ -159,6 +166,7 @@ fn run(
             &ictx.stream(i).unwrap(),
             &mut octx,
             target.audio_encoders(),
+            origin,
             global_header,
         )?),
         None => None,
@@ -264,6 +272,8 @@ fn drain(
 struct VideoPath {
     index: usize,
     in_base: f64,
+    /// Input seconds that land on output 0.
+    origin: f64,
     decoder: decoder::Video,
     encoder: encoder::Video,
     /// Made from the first frame, whose format the decoder only knows then.
@@ -280,6 +290,7 @@ impl VideoPath {
     fn new(
         stream: &ff::Stream,
         octx: &mut ff::format::context::Output,
+        origin: f64,
         global_header: bool,
     ) -> Result<VideoPath, String> {
         let decoder = open_decoder(stream)?
@@ -335,6 +346,7 @@ impl VideoPath {
         Ok(VideoPath {
             index: stream.index(),
             in_base: f64::from(stream.time_base()),
+            origin,
             decoder,
             encoder,
             scaler: None,
@@ -379,7 +391,9 @@ impl VideoPath {
                 .run(&decoded, &mut nv12)
                 .map_err(|e| format!("can't convert the picture: {e}"))?;
             // Frame numbers from the timestamps, kept rising for files with uneven frame times.
-            let seconds = decoded.timestamp().unwrap_or(0) as f64 * self.in_base;
+            let seconds = decoded
+                .timestamp()
+                .map_or(0.0, |t| t as f64 * self.in_base - self.origin);
             let mut pts = (seconds / f64::from(self.base)).round() as i64;
             if let Some(last) = self.last_pts
                 && pts <= last
@@ -406,6 +420,9 @@ impl VideoPath {
 
 struct AudioPath {
     index: usize,
+    in_base: f64,
+    /// Input seconds that land on output 0.
+    origin: f64,
     decoder: decoder::Audio,
     encoder: encoder::Audio,
     /// Made from the first frame, whose layout the decoder only knows then.
@@ -418,8 +435,9 @@ struct AudioPath {
     frame_size: usize,
     /// Converted samples waiting to fill a frame.
     pending: Fifo,
-    /// The next frame's first sample, counted from the start.
-    next: i64,
+    /// The next frame's first sample, counted from output 0; set by the first decoded sound,
+    /// which can come after the picture's start.
+    next: Option<i64>,
     out: usize,
     out_base: ff::Rational,
 }
@@ -441,6 +459,7 @@ impl AudioPath {
         stream: &ff::Stream,
         octx: &mut ff::format::context::Output,
         names: &[&str],
+        origin: f64,
         global_header: bool,
     ) -> Result<AudioPath, String> {
         let decoder = open_decoder(stream)?
@@ -498,6 +517,8 @@ impl AudioPath {
         }
         Ok(AudioPath {
             index: stream.index(),
+            in_base: f64::from(stream.time_base()),
+            origin,
             decoder,
             encoder,
             resampler: None,
@@ -506,7 +527,7 @@ impl AudioPath {
             format,
             frame_size,
             pending: Fifo(fifo),
-            next: 0,
+            next: None,
             out,
             out_base: ff::Rational(1, 1),
         })
@@ -527,6 +548,12 @@ impl AudioPath {
             // Plain PCM (a WAV) decodes with no channel layout, which swresample refuses.
             let layout = crate::audio::label_layout(&mut decoded);
             let (format, rate) = (decoded.format(), decoded.rate());
+            if self.next.is_none() {
+                let seconds = decoded
+                    .timestamp()
+                    .map_or(0.0, |t| t as f64 * self.in_base - self.origin);
+                self.next = Some((seconds * f64::from(self.rate)).round() as i64);
+            }
             // Made for the first frame, and again when the sound's shape changes midway (a
             // broadcast moving to another programme), after the old one's last samples.
             let fits = |r: &software::resampling::Context| {
@@ -605,7 +632,8 @@ impl AudioPath {
             }
             let mut f = frame::Audio::new(self.format, self.frame_size, self.layout);
             f.set_rate(self.rate);
-            f.set_pts(Some(self.next));
+            let next = self.next.unwrap_or(0);
+            f.set_pts(Some(next));
             unsafe {
                 let data = (*f.as_mut_ptr()).extended_data;
                 let channels = self.layout.channels();
@@ -619,7 +647,7 @@ impl AudioPath {
                 let size = self.frame_size as i32;
                 ff::ffi::av_audio_fifo_read(self.pending.0, data as *const *mut c_void, size);
             }
-            self.next += self.frame_size as i64;
+            self.next = Some(next + self.frame_size as i64);
             self.encoder
                 .send_frame(&f)
                 .map_err(|e| format!("the audio encoder failed: {e}"))?;
@@ -730,6 +758,76 @@ mod tests {
         assert!((3.0..3.2).contains(&got), "{got} s of sound");
         std::fs::remove_file(&mp3).unwrap();
         std::fs::remove_file(&clip).unwrap();
+    }
+
+    /// The first time in each of `file`'s streams, in seconds.
+    fn first_times(file: &Path) -> Vec<f64> {
+        let mut input = ff::format::input(file).unwrap();
+        let mut first = vec![None; input.streams().count()];
+        for (stream, packet) in input.packets() {
+            let slot = &mut first[stream.index()];
+            if slot.is_none() {
+                *slot = packet
+                    .pts()
+                    .map(|t| t as f64 * f64::from(stream.time_base()));
+            }
+        }
+        first.into_iter().map(Option::unwrap).collect()
+    }
+
+    /// The test clip copied into MPEG-TS starting at 1.4 s, as broadcasts and FFmpeg's own TS
+    /// files do, with the sound a second later than the picture, as some MKVs have it.
+    fn late_sound_ts() -> PathBuf {
+        let clip = Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/test_h264.mp4");
+        let ts = std::env::temp_dir().join(format!("wushang-late-{}.ts", std::process::id()));
+        let mut input = ff::format::input(&clip).unwrap();
+        let mut output = ff::format::output_as(&ts, "mpegts").unwrap();
+        let mut bases = Vec::new();
+        for stream in input.streams() {
+            let mut out = output.add_stream(encoder::find(codec::Id::None)).unwrap();
+            out.set_parameters(stream.parameters());
+            unsafe { (*out.parameters().as_mut_ptr()).codec_tag = 0 };
+            bases.push(stream.time_base());
+        }
+        output.write_header().unwrap();
+        for (stream, mut packet) in input.packets() {
+            let i = stream.index();
+            let late = if stream.parameters().medium() == Type::Audio {
+                2.4
+            } else {
+                1.4
+            };
+            let late = (late / f64::from(bases[i])).round() as i64;
+            packet.set_pts(packet.pts().map(|t| t + late));
+            packet.set_dts(packet.dts().map(|t| t + late));
+            packet.rescale_ts(bases[i], output.stream(i).unwrap().time_base());
+            packet.set_position(-1);
+            packet.write_interleaved(&mut output).unwrap();
+        }
+        output.write_trailer().unwrap();
+        ts
+    }
+
+    /// The picture and the sound keep their places against each other, and the copy starts at 0.
+    #[test]
+    fn keeps_the_sound_in_step_with_the_picture() {
+        let ts = late_sound_ts();
+        let before = first_times(&ts);
+        assert!(before[0] > 1.0, "the TS starts at {:.2} s", before[0]);
+        let mp4 = convert_file(&ts, Target::Mp4);
+        let after = first_times(&mp4);
+        assert!(
+            after[0].abs() < 0.1,
+            "the picture starts at {:.3} s",
+            after[0]
+        );
+        let gap = after[1] - after[0];
+        assert!(
+            (gap - 1.0).abs() < 0.1,
+            "the sound starts {gap:.3} s after the picture"
+        );
+        std::fs::remove_file(&mp4).unwrap();
+        std::fs::remove_file(&ts).unwrap();
     }
 
     #[test]
