@@ -277,13 +277,11 @@ impl Layout {
         }
         let w = width;
         let tools = toolbar::layout(t, w, height);
-        let top = |x: f32, size: f32| Rect::new(x, 6.0, x + size, 34.0);
-        let mut buttons = vec![
-            (Hit::Minimize, top(w - 150.0, 36.0)),
-            (Hit::Maximize, top(w - 114.0, 36.0)),
-            (Hit::Fullscreen, top(w - 78.0, 36.0)),
-            (Hit::Close, top(w - 42.0, 36.0)),
-        ];
+        // The player's "..." is a bar item, wherever Customize Player put it.
+        let mut buttons: Vec<(Hit, Rect)> = Layout::window_buttons(w)
+            .into_iter()
+            .filter(|(hit, _)| *hit != Hit::More)
+            .collect();
         let mut volume = Rect::default();
         for p in &tools.placed {
             let r = p.r;
