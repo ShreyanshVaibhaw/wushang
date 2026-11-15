@@ -1,9 +1,9 @@
-//! Geometries: rectangles, rounded rectangles, ellipses and path geometries built with a sink.
+//! Geometries: rectangles, rounded rectangles and path geometries built with a sink.
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
-use objc2_core_foundation::{CFRetained, CGPoint};
+use objc2_core_foundation::CFRetained;
 use objc2_core_graphics::{CGMutablePath, CGPath};
 
 use super::*;
@@ -22,11 +22,9 @@ struct Geometry {
 /// `ID2D1PathGeometry1`, `ID2D1RoundedRectangleGeometry` and the rest are this type.
 #[derive(Clone)]
 pub struct ID2D1Geometry(Rc<Geometry>);
-pub type ID2D1PathGeometry = ID2D1Geometry;
 pub type ID2D1PathGeometry1 = ID2D1Geometry;
 pub type ID2D1RectangleGeometry = ID2D1Geometry;
 pub type ID2D1RoundedRectangleGeometry = ID2D1Geometry;
-pub type ID2D1EllipseGeometry = ID2D1Geometry;
 
 impl Interface for ID2D1Geometry {}
 
@@ -55,7 +53,6 @@ impl ID2D1Geometry {
             fill: CGMutablePath::new(),
             stroke: CGMutablePath::new(),
             filled: Cell::new(true),
-            mode: Cell::new(D2D1_FILL_MODE_ALTERNATE),
         })))
     }
 
@@ -95,46 +92,6 @@ impl ID2D1Geometry {
         sink.add_path(&out);
         Ok(())
     }
-
-    /// The bounds of the filled area, under `transform`.
-    pub unsafe fn GetBounds(&self, transform: Option<&Matrix3x2>) -> Result<D2D_RECT_F> {
-        let Some((path, _)) = self.fill_path() else {
-            return Ok(D2D_RECT_F::default());
-        };
-        let path = match transform {
-            Some(m) => unsafe { CGPath::new_copy_by_transforming_path(Some(&path), &m.cg()) }
-                .unwrap_or(path),
-            None => path,
-        };
-        let b = CGPath::path_bounding_box(Some(&path));
-        Ok(D2D_RECT_F {
-            left: b.origin.x as f32,
-            top: b.origin.y as f32,
-            right: (b.origin.x + b.size.width) as f32,
-            bottom: (b.origin.y + b.size.height) as f32,
-        })
-    }
-
-    pub unsafe fn FillContainsPoint(
-        &self,
-        point: Vector2,
-        transform: Option<&Matrix3x2>,
-        _flatteningtolerance: f32,
-    ) -> Result<BOOL> {
-        let Some((path, even_odd)) = self.fill_path() else {
-            return Ok(BOOL(0));
-        };
-        let m = transform.map(Matrix3x2::cg);
-        let inside = unsafe {
-            CGPath::contains_point(
-                Some(&path),
-                m.as_ref().map_or(std::ptr::null(), |m| m as *const _),
-                CGPoint::new(point.X.into(), point.Y.into()),
-                even_odd,
-            )
-        };
-        Ok(BOOL::from(inside))
-    }
 }
 
 impl ID2D1Factory1 {
@@ -163,19 +120,13 @@ impl ID2D1Factory1 {
         });
         Ok(ID2D1Geometry::shape(path))
     }
-
-    pub unsafe fn CreateEllipseGeometry(
-        &self,
-        ellipse: &D2D1_ELLIPSE,
-    ) -> Result<ID2D1EllipseGeometry> {
-        Ok(ID2D1Geometry::shape(ellipse_path(ellipse)))
-    }
 }
 
 /// The Win32 BOOL.
 #[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
 pub struct BOOL(pub i32);
 
+#[cfg(test)]
 impl BOOL {
     pub fn as_bool(self) -> bool {
         self.0 != 0
@@ -188,32 +139,17 @@ impl From<bool> for BOOL {
     }
 }
 
-#[derive(Clone, Copy, Default, PartialEq, Debug)]
-pub struct D2D1_BEZIER_SEGMENT {
-    pub point1: Vector2,
-    pub point2: Vector2,
-    pub point3: Vector2,
-}
-
-#[derive(Clone, Copy, Default, PartialEq, Debug)]
-pub struct D2D1_QUADRATIC_BEZIER_SEGMENT {
-    pub point1: Vector2,
-    pub point2: Vector2,
-}
-
 struct Sink {
     target: ID2D1Geometry,
     fill: CFRetained<CGMutablePath>,
     stroke: CFRetained<CGMutablePath>,
     /// The open figure fills.
     filled: Cell<bool>,
-    mode: Cell<D2D1_FILL_MODE>,
 }
 
 /// Collects a path geometry's figures until `Close`.
 #[derive(Clone)]
 pub struct ID2D1GeometrySink(Rc<Sink>);
-pub type ID2D1SimplifiedGeometrySink = ID2D1GeometrySink;
 
 impl ID2D1GeometrySink {
     /// Runs `f` on the stroke path, and on the fill path for a filled figure.
@@ -229,10 +165,6 @@ impl ID2D1GeometrySink {
             CGMutablePath::add_path(Some(&self.0.fill), std::ptr::null(), Some(path));
             CGMutablePath::add_path(Some(&self.0.stroke), std::ptr::null(), Some(path));
         }
-    }
-
-    pub unsafe fn SetFillMode(&self, fillmode: D2D1_FILL_MODE) {
-        self.0.mode.set(fillmode);
     }
 
     pub unsafe fn BeginFigure(&self, startpoint: Vector2, figurebegin: D2D1_FIGURE_BEGIN) {
@@ -258,42 +190,6 @@ impl ID2D1GeometrySink {
         });
     }
 
-    pub unsafe fn AddLines(&self, points: &[Vector2]) {
-        for &point in points {
-            unsafe { self.AddLine(point) };
-        }
-    }
-
-    pub unsafe fn AddBezier(&self, bezier: &D2D1_BEZIER_SEGMENT) {
-        let b = *bezier;
-        self.each(|p| unsafe {
-            CGMutablePath::add_curve_to_point(
-                Some(p),
-                std::ptr::null(),
-                b.point1.X.into(),
-                b.point1.Y.into(),
-                b.point2.X.into(),
-                b.point2.Y.into(),
-                b.point3.X.into(),
-                b.point3.Y.into(),
-            )
-        });
-    }
-
-    pub unsafe fn AddQuadraticBezier(&self, bezier: &D2D1_QUADRATIC_BEZIER_SEGMENT) {
-        let b = *bezier;
-        self.each(|p| unsafe {
-            CGMutablePath::add_quad_curve_to_point(
-                Some(p),
-                std::ptr::null(),
-                b.point1.X.into(),
-                b.point1.Y.into(),
-                b.point2.X.into(),
-                b.point2.Y.into(),
-            )
-        });
-    }
-
     pub unsafe fn EndFigure(&self, figureend: D2D1_FIGURE_END) {
         if figureend == D2D1_FIGURE_END_CLOSED {
             self.each(|p| CGMutablePath::close_subpath(Some(p)));
@@ -307,7 +203,7 @@ impl ID2D1GeometrySink {
         let copy = |p: &CGMutablePath| CGPath::new_copy(Some(p));
         *g.fill.borrow_mut() = copy(&self.0.fill);
         *g.stroke.borrow_mut() = copy(&self.0.stroke);
-        g.mode.set(self.0.mode.get());
+        g.mode.set(D2D1_FILL_MODE_ALTERNATE);
         Ok(())
     }
 }

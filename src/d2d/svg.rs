@@ -52,10 +52,6 @@ impl ID2D1SvgDocument {
         })))
     }
 
-    pub unsafe fn GetViewportSize(&self) -> D2D_SIZE_F {
-        self.0.viewport
-    }
-
     /// Draws the document's viewport at the target's transform, as DrawSvgDocument does.
     pub(crate) fn draw(&self, t: &DcState) {
         let Some(cg) = t.cg() else { return };

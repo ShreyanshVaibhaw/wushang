@@ -4,14 +4,13 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::ops::Deref;
-use std::ptr::NonNull;
 use std::rc::Rc;
 
 use objc2_core_foundation::{CFData, CFRetained, CGFloat, CGPoint, CGRect, CGSize};
 use objc2_core_graphics::{
-    CGBitmapContextGetColorSpace, CGBitmapInfo, CGBlendMode, CGColorRenderingIntent, CGColorSpace,
-    CGContext, CGDataProvider, CGImage, CGImageAlphaInfo, CGImageByteOrderInfo,
-    CGInterpolationQuality, CGLineCap, CGLineJoin, CGMutablePath, CGPath,
+    CGBitmapContextGetColorSpace, CGBitmapInfo, CGColorRenderingIntent, CGColorSpace, CGContext,
+    CGDataProvider, CGImage, CGImageAlphaInfo, CGImageByteOrderInfo, CGInterpolationQuality,
+    CGLineCap, CGLineJoin, CGMutablePath, CGPath,
 };
 
 use super::*;
@@ -315,16 +314,7 @@ pub struct D2D1_BRUSH_PROPERTIES {
 }
 
 #[derive(Clone, Copy, Default, PartialEq, Debug)]
-pub struct D2D1_BITMAP_BRUSH_PROPERTIES {
-    pub extendModeX: D2D1_EXTEND_MODE,
-    pub extendModeY: D2D1_EXTEND_MODE,
-    pub interpolationMode: D2D1_BITMAP_INTERPOLATION_MODE,
-}
-
-#[derive(Clone, Copy, Default, PartialEq, Debug)]
 pub struct D2D1_BITMAP_BRUSH_PROPERTIES1 {
-    pub extendModeX: D2D1_EXTEND_MODE,
-    pub extendModeY: D2D1_EXTEND_MODE,
     pub interpolationMode: D2D1_INTERPOLATION_MODE,
 }
 
@@ -339,18 +329,6 @@ pub struct ID2D1SolidColorBrush(Rc<SolidBrush>);
 impl ID2D1SolidColorBrush {
     pub unsafe fn SetColor(&self, color: &D2D1_COLOR_F) {
         self.0.color.set(*color);
-    }
-
-    pub unsafe fn GetColor(&self) -> D2D1_COLOR_F {
-        self.0.color.get()
-    }
-
-    pub unsafe fn SetOpacity(&self, opacity: f32) {
-        self.0.opacity.set(opacity);
-    }
-
-    pub unsafe fn GetOpacity(&self) -> f32 {
-        self.0.opacity.get()
     }
 }
 
@@ -370,18 +348,6 @@ impl ID2D1BitmapBrush {
     /// Maps the bitmap's DIPs into the space it paints in.
     pub unsafe fn SetTransform(&self, transform: &Matrix3x2) {
         self.0.transform.set(*transform);
-    }
-
-    pub unsafe fn GetTransform(&self, transform: &mut Matrix3x2) {
-        *transform = self.0.transform.get();
-    }
-
-    pub unsafe fn SetOpacity(&self, opacity: f32) {
-        self.0.opacity.set(opacity);
-    }
-
-    pub unsafe fn SetInterpolationMode1(&self, mode: D2D1_INTERPOLATION_MODE) {
-        self.0.interpolation.set(mode);
     }
 }
 
@@ -453,13 +419,6 @@ impl ID2D1Bitmap {
         }
     }
 
-    pub unsafe fn GetPixelSize(&self) -> D2D_SIZE_U {
-        D2D_SIZE_U {
-            width: self.0.width,
-            height: self.0.height,
-        }
-    }
-
     pub(crate) fn image(&self, space: &CFRetained<CGColorSpace>) -> Option<CFRetained<CGImage>> {
         let b = &self.0;
         let mut slot = b.image.borrow_mut();
@@ -506,7 +465,10 @@ pub struct D2D1_LAYER_PARAMETERS {
     pub maskAntialiasMode: D2D1_ANTIALIAS_MODE,
     pub maskTransform: Matrix3x2,
     pub opacity: f32,
+    // Set by the interface as on Windows; the shim's layers have no use for them.
+    #[allow(dead_code)]
     pub opacityBrush: std::mem::ManuallyDrop<Option<ID2D1Brush>>,
+    #[allow(dead_code)]
     pub layerOptions: D2D1_LAYER_OPTIONS,
 }
 
@@ -517,7 +479,9 @@ pub struct D2D1_LAYER_PARAMETERS1 {
     pub maskAntialiasMode: D2D1_ANTIALIAS_MODE,
     pub maskTransform: Matrix3x2,
     pub opacity: f32,
+    #[allow(dead_code)]
     pub opacityBrush: std::mem::ManuallyDrop<Option<ID2D1Brush>>,
+    #[allow(dead_code)]
     pub layerOptions: D2D1_LAYER_OPTIONS1,
 }
 
@@ -714,9 +678,11 @@ impl ID2D1RenderTarget {
         self.0.borrow()
     }
 
+    #[cfg(test)]
     pub unsafe fn BeginDraw(&self) {}
 
     /// Ends nothing by itself: [`ID2D1DeviceContext5::end`] finishes the frame.
+    #[cfg(test)]
     pub unsafe fn EndDraw(&self, _tag1: Option<&mut u64>, _tag2: Option<&mut u64>) -> Result<()> {
         Ok(())
     }
@@ -725,52 +691,22 @@ impl ID2D1RenderTarget {
         self.0.borrow_mut().world = *transform;
     }
 
-    pub unsafe fn GetTransform(&self, transform: &mut Matrix3x2) {
-        *transform = self.t().world;
-    }
-
-    pub unsafe fn SetDpi(&self, dpix: f32, _dpiy: f32) {
-        self.0.borrow_mut().scale = dpix / 96.0;
-    }
-
-    pub unsafe fn GetDpi(&self, dpix: &mut f32, dpiy: &mut f32) {
-        let s = self.t().scale * 96.0;
-        (*dpix, *dpiy) = (s, s);
-    }
-
-    /// Size in DIPs.
-    pub unsafe fn GetSize(&self) -> D2D_SIZE_F {
-        let t = self.t();
-        D2D_SIZE_F {
-            width: t.size.0 as f32 / t.scale,
-            height: t.size.1 as f32 / t.scale,
-        }
-    }
-
-    pub unsafe fn GetPixelSize(&self) -> D2D_SIZE_U {
-        let t = self.t();
-        D2D_SIZE_U {
-            width: t.size.0,
-            height: t.size.1,
-        }
-    }
-
     pub unsafe fn GetMaximumBitmapSize(&self) -> u32 {
         16384
     }
 
-    /// Core Graphics' antialiasing is always on; grayscale text is all it draws.
-    pub unsafe fn SetAntialiasMode(&self, _mode: D2D1_ANTIALIAS_MODE) {}
-
+    /// Grayscale text is all Core Graphics draws here.
+    #[cfg(test)]
     pub unsafe fn SetTextAntialiasMode(&self, _mode: D2D1_TEXT_ANTIALIAS_MODE) {}
 
     /// Sets every pixel inside the clips to `color`, transparent black for None.
+    #[cfg(test)]
     pub unsafe fn Clear(&self, color: Option<&D2D1_COLOR_F>) {
         let t = self.t();
         let Some(cg) = t.cg() else { return };
         let c = color.copied().unwrap_or_default();
         CGContext::save_g_state(Some(cg));
-        CGContext::set_blend_mode(Some(cg), CGBlendMode::Copy);
+        CGContext::set_blend_mode(Some(cg), objc2_core_graphics::CGBlendMode::Copy);
         t.set_fill(cg, &c, 1.0);
         let all = D2D_RECT_F {
             left: f32::MIN,
@@ -830,21 +766,6 @@ impl ID2D1RenderTarget {
         })))
     }
 
-    pub unsafe fn CreateBitmapBrush(
-        &self,
-        bitmap: &ID2D1Bitmap,
-        bitmapbrushproperties: Option<&D2D1_BITMAP_BRUSH_PROPERTIES1>,
-        brushproperties: Option<&D2D1_BRUSH_PROPERTIES>,
-    ) -> Result<ID2D1BitmapBrush> {
-        unsafe {
-            ID2D1DeviceContext(self.clone()).CreateBitmapBrush(
-                bitmap,
-                bitmapbrushproperties,
-                brushproperties,
-            )
-        }
-    }
-
     pub unsafe fn FillRectangle(&self, rect: &D2D_RECT_F, brush: impl BrushParam) {
         let r = rect.normalized();
         if r.right <= r.left || r.bottom <= r.top {
@@ -852,18 +773,6 @@ impl ID2D1RenderTarget {
         }
         let path = unsafe { CGPath::with_rect(r.cg(), std::ptr::null()) };
         self.t().fill(&path, false, &brush.paint());
-    }
-
-    pub unsafe fn DrawRectangle(
-        &self,
-        rect: &D2D_RECT_F,
-        brush: impl BrushParam,
-        strokewidth: f32,
-        strokestyle: impl StrokeParam,
-    ) {
-        let path = unsafe { CGPath::with_rect(rect.cg(), std::ptr::null()) };
-        self.t()
-            .stroke(&path, strokewidth, strokestyle.style(), &brush.paint());
     }
 
     pub unsafe fn FillRoundedRectangle(
@@ -1041,23 +950,6 @@ impl ID2D1RenderTarget {
         }
     }
 
-    pub unsafe fn DrawBitmap(
-        &self,
-        bitmap: &ID2D1Bitmap,
-        destinationrectangle: Option<&D2D_RECT_F>,
-        opacity: f32,
-        interpolationmode: D2D1_BITMAP_INTERPOLATION_MODE,
-        sourcerectangle: Option<&D2D_RECT_F>,
-    ) {
-        let mode = match interpolationmode {
-            D2D1_BITMAP_INTERPOLATION_MODE_NEAREST_NEIGHBOR => {
-                D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR
-            }
-            _ => D2D1_INTERPOLATION_MODE_LINEAR,
-        };
-        self.draw_bitmap(bitmap, destinationrectangle, opacity, mode, sourcerectangle);
-    }
-
     fn draw_bitmap(
         &self,
         bitmap: &ID2D1Bitmap,
@@ -1169,7 +1061,6 @@ pub(crate) fn ellipse_path(e: &D2D1_ELLIPSE) -> CFRetained<CGPath> {
 /// The resource factory. Geometries and stroke styles need no device.
 #[derive(Clone, Default)]
 pub struct ID2D1Factory1(());
-pub type ID2D1Factory = ID2D1Factory1;
 
 impl Interface for ID2D1Factory1 {}
 
@@ -1199,7 +1090,6 @@ pub struct D2D1_STROKE_STYLE_PROPERTIES1 {
     pub miterLimit: f32,
     pub dashStyle: D2D1_DASH_STYLE,
     pub dashOffset: f32,
-    pub transformType: D2D1_STROKE_TRANSFORM_TYPE,
 }
 
 pub(crate) struct StrokeStyle {
@@ -1242,13 +1132,15 @@ impl ID2D1StrokeStyle {
     }
 }
 
-/// For tests and tools: a premultiplied BGRA bitmap context with its pixels.
+/// For the tests: a premultiplied BGRA bitmap context with its pixels.
+#[cfg(test)]
 pub struct Canvas {
     pub cg: CFRetained<CGContext>,
     pub width: u32,
     pub height: u32,
 }
 
+#[cfg(test)]
 impl Canvas {
     pub fn new(width: u32, height: u32) -> Option<Canvas> {
         let space = srgb();
@@ -1271,7 +1163,7 @@ impl Canvas {
     pub fn pixels(&self) -> Vec<u8> {
         let data = objc2_core_graphics::CGBitmapContextGetData(Some(&self.cg));
         let stride = objc2_core_graphics::CGBitmapContextGetBytesPerRow(Some(&self.cg));
-        let Some(data) = NonNull::new(data.cast::<u8>()) else {
+        let Some(data) = std::ptr::NonNull::new(data.cast::<u8>()) else {
             return Vec::new();
         };
         let mut out = Vec::with_capacity((self.width * self.height * 4) as usize);

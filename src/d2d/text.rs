@@ -15,7 +15,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use objc2_core_foundation::{
     CFAttributedString, CFBoolean, CFData, CFDictionary, CFIndex, CFMutableAttributedString,
-    CFNumber, CFRange, CFRetained, CFString, CFType, CGAffineTransform, CGFloat, CGPoint,
+    CFNumber, CFRange, CFRetained, CFString, CFType, CGAffineTransform, CGFloat,
 };
 use objc2_core_graphics::{CGContext, CGDataProvider, CGFont};
 use objc2_core_text::{
@@ -70,6 +70,7 @@ pub struct DWRITE_HIT_TEST_METRICS {
     pub isTrimmed: BOOL,
 }
 
+#[cfg(test)]
 #[derive(Clone, Copy, Default, PartialEq, Debug)]
 pub struct DWRITE_LINE_METRICS {
     pub length: u32,
@@ -149,9 +150,8 @@ impl IDWriteInMemoryFontFileLoader {
 /// Collects font files for a font set.
 #[derive(Clone, Default)]
 pub struct IDWriteFontSetBuilder1(Rc<RefCell<Vec<IDWriteFontFile>>>);
-pub type IDWriteFontSetBuilder = IDWriteFontSetBuilder1;
 
-/// `IDWriteFontSetBuilder2`, whose own AddFontFile takes a path.
+/// `IDWriteFontSetBuilder2`, what the factory makes.
 #[derive(Clone, Default)]
 pub struct IDWriteFontSetBuilder2(IDWriteFontSetBuilder1);
 
@@ -173,17 +173,6 @@ impl IDWriteFontSetBuilder1 {
     }
 }
 
-impl IDWriteFontSetBuilder2 {
-    pub unsafe fn AddFontFile(&self, filepath: impl StrParam) -> Result<()> {
-        let bytes = std::fs::read(filepath.as_str()).map_err(|e| Error::fail(e.to_string()))?;
-        self.0
-            .0
-            .borrow_mut()
-            .push(IDWriteFontFile(CFData::from_bytes(&bytes)));
-        Ok(())
-    }
-}
-
 #[derive(Clone)]
 pub struct IDWriteFontSet(Vec<IDWriteFontFile>);
 
@@ -202,10 +191,9 @@ struct Face {
     gap: f32,
 }
 
-/// Fonts loaded from memory. `IDWriteFontCollection1` and `2` are this type.
+/// Fonts loaded from memory. `IDWriteFontCollection2` is this type.
 #[derive(Clone)]
 pub struct IDWriteFontCollection(Rc<Vec<Face>>);
-pub type IDWriteFontCollection1 = IDWriteFontCollection;
 pub type IDWriteFontCollection2 = IDWriteFontCollection;
 
 impl Interface for IDWriteFontCollection {}
@@ -667,26 +655,6 @@ impl IDWriteTextFormat {
     ) -> Result<()> {
         self.update(|s| s.spacing = (linespacingmethod, linespacing, baseline))
     }
-
-    pub unsafe fn GetFontSize(&self) -> f32 {
-        self.0.size
-    }
-
-    pub unsafe fn GetFontWeight(&self) -> DWRITE_FONT_WEIGHT {
-        self.0.weight
-    }
-
-    pub unsafe fn GetTextAlignment(&self) -> DWRITE_TEXT_ALIGNMENT {
-        self.0.settings.get().align
-    }
-
-    pub unsafe fn GetParagraphAlignment(&self) -> DWRITE_PARAGRAPH_ALIGNMENT {
-        self.0.settings.get().paragraph
-    }
-
-    pub unsafe fn GetWordWrapping(&self) -> DWRITE_WORD_WRAPPING {
-        self.0.settings.get().wrap
-    }
 }
 
 /// One laid-out line. `top` and `x` are relative to the text block, `baseline` to `top`.
@@ -771,39 +739,12 @@ impl IDWriteTextLayout {
         self.change(|l| l.styles.push((range, style)))
     }
 
-    pub unsafe fn SetTextAlignment(&self, textalignment: DWRITE_TEXT_ALIGNMENT) -> Result<()> {
-        self.change(|l| l.settings.align = textalignment)
-    }
-
-    pub unsafe fn SetParagraphAlignment(&self, a: DWRITE_PARAGRAPH_ALIGNMENT) -> Result<()> {
-        self.change(|l| l.settings.paragraph = a)
-    }
-
-    pub unsafe fn SetWordWrapping(&self, wordwrapping: DWRITE_WORD_WRAPPING) -> Result<()> {
-        self.change(|l| l.settings.wrap = wordwrapping)
-    }
-
-    pub unsafe fn SetMaxWidth(&self, maxwidth: f32) -> Result<()> {
-        self.change(|l| l.max_w = maxwidth.max(0.0))
-    }
-
-    pub unsafe fn SetMaxHeight(&self, maxheight: f32) -> Result<()> {
-        self.change(|l| l.max_h = maxheight.max(0.0))
-    }
-
-    pub unsafe fn GetMaxWidth(&self) -> f32 {
-        self.0.borrow().max_w
-    }
-
-    pub unsafe fn GetMaxHeight(&self) -> f32 {
-        self.0.borrow().max_h
-    }
-
     pub unsafe fn GetMetrics(&self, textmetrics: &mut DWRITE_TEXT_METRICS) -> Result<()> {
         *textmetrics = self.built().metrics;
         Ok(())
     }
 
+    #[cfg(test)]
     pub unsafe fn GetLineMetrics(
         &self,
         linemetrics: Option<&mut [DWRITE_LINE_METRICS]>,
@@ -874,49 +815,6 @@ impl IDWriteTextLayout {
             isTrimmed: BOOL::from(line.trimmed),
         };
         Ok(())
-    }
-
-    /// The unit under (x, y), and whether the point is on its trailing half.
-    pub unsafe fn HitTestPoint(
-        &self,
-        pointx: f32,
-        pointy: f32,
-        istrailinghit: &mut BOOL,
-        isinside: &mut BOOL,
-        hittestmetrics: &mut DWRITE_HIT_TEST_METRICS,
-    ) -> Result<()> {
-        let b = self.built();
-        let y = pointy - b.y0;
-        let line = b
-            .lines
-            .iter()
-            .find(|l| y < l.top + l.height)
-            .or(b.lines.last())
-            .ok_or_else(|| Error::fail("empty layout"))?;
-        let local = pointx - line.x;
-        let caret = line.ct.as_ref().map_or(line.start, |ct| unsafe {
-            ct.string_index_for_position(CGPoint::new(local.into(), 0.0))
-                .max(0) as usize
-        });
-        let offset = |i: usize| -> f32 {
-            line.ct.as_ref().map_or(0.0, |ct| unsafe {
-                ct.offset_for_string_index(i as CFIndex, std::ptr::null_mut()) as f32
-            })
-        };
-        // A caret after the point's character means the point was on its trailing half.
-        let (pos, trailing) = if caret > line.start && offset(caret) > local {
-            (caret - 1, false)
-        } else if caret > line.start {
-            (caret - 1, true)
-        } else {
-            (caret, false)
-        };
-        *istrailinghit = BOOL::from(trailing);
-        *isinside =
-            BOOL::from(y >= 0.0 && y < b.metrics.height && local >= 0.0 && local <= line.width_ws);
-        let mut x = 0.0;
-        let mut yy = 0.0;
-        unsafe { self.HitTestTextPosition(pos as u32, false, &mut x, &mut yy, hittestmetrics) }
     }
 
     fn built(&self) -> Rc<Built> {
