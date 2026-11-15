@@ -207,6 +207,11 @@ impl Hit {
     fn in_bars(self) -> bool {
         self != Hit::Video
     }
+
+    /// Minimize and maximize, which native fullscreen ignores, so it leaves them out.
+    fn resizes_window(self) -> bool {
+        matches!(self, Hit::Minimize | Hit::Maximize)
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
@@ -280,7 +285,7 @@ impl Layout {
         // The player's "..." is a bar item, wherever Customize Player put it.
         let mut buttons: Vec<(Hit, Rect)> = Layout::window_buttons(w)
             .into_iter()
-            .filter(|(hit, _)| *hit != Hit::More)
+            .filter(|(hit, _)| *hit != Hit::More && !(fullscreen && hit.resizes_window()))
             .collect();
         let mut volume = Rect::default();
         for p in &tools.placed {
@@ -342,6 +347,20 @@ impl Layout {
         ]
     }
 
+    /// For the library page in native fullscreen: leaves out the buttons fullscreen ignores. The
+    /// player page's layout does this itself.
+    pub fn leave_out_resize_buttons(&mut self) {
+        self.buttons.retain(|(hit, _)| !hit.resizes_window());
+    }
+
+    /// The left edge of the window buttons that are there.
+    fn window_buttons_left(&self) -> f32 {
+        [Hit::Minimize, Hit::Maximize, Hit::Fullscreen, Hit::Close]
+            .into_iter()
+            .filter_map(|hit| self.find_button(hit))
+            .fold(self.width, |l, r| l.min(r.l))
+    }
+
     pub fn hit(&self, x: f32, y: f32) -> Option<Hit> {
         if let Some(d) = &self.dialog {
             return Some(Hit::Dialog(d.hit(x, y)));
@@ -392,12 +411,15 @@ impl Layout {
         }
     }
 
-    fn button(&self, hit: Hit) -> Rect {
+    fn find_button(&self, hit: Hit) -> Option<Rect> {
         self.buttons
             .iter()
             .find(|(h, _)| *h == hit)
             .map(|(_, r)| *r)
-            .unwrap_or_default()
+    }
+
+    fn button(&self, hit: Hit) -> Rect {
+        self.find_button(hit).unwrap_or_default()
     }
 
     fn seek_fraction(&self, x: f32) -> f64 {
@@ -1856,8 +1878,11 @@ impl Painter {
                 (Hit::Close, &i.close),
             ];
             for (hit, svg) in buttons {
+                let Some(r) = s.layout.find_button(hit) else {
+                    continue;
+                };
                 self.hover_box(rt, s, hit);
-                self.icon(ctx, svg, s.layout.button(hit).l + 6.0, 8.0, true);
+                self.icon(ctx, svg, r.l + 6.0, 8.0, true);
             }
         }
     }
@@ -2350,6 +2375,21 @@ mod tests {
         ui.hide_bars();
         relayout(&mut ui);
         assert!(ui.on_move(x + 1.0, y).is_none(), "the volume stays put");
+    }
+
+    #[test]
+    fn fullscreen_leaves_out_minimize_and_maximize() {
+        let windowed = Layout::new(1280.0, 720.0, true, false);
+        let mut full = Layout::new(1280.0, 720.0, true, true);
+        full.add_tabs(1);
+        for hit in [Hit::Minimize, Hit::Maximize] {
+            let r = windowed.button(hit);
+            assert_eq!(full.hit(r.l + 18.0, 20.0), Some(Hit::Caption), "{hit:?}");
+        }
+        let fs = windowed.button(Hit::Fullscreen);
+        assert_eq!(full.button(Hit::Fullscreen), fs);
+        // The new-tab button moves up to the buttons that are left.
+        assert_eq!(full.new_tab.unwrap().r, fs.l - tabs::NEW_GAP);
     }
 
     #[test]

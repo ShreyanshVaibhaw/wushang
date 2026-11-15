@@ -18,7 +18,7 @@ const GAP: f32 = 4.0;
 /// Between the strip and the new-tab button, and the title bar's group on its left.
 const MARGIN: f32 = 12.0;
 /// Between the new-tab button and the window buttons.
-const NEW_GAP: f32 = 20.0;
+pub(super) const NEW_GAP: f32 = 20.0;
 /// The least room for a tab's title: about three letters and the ellipsis. A tab with less shows
 /// its number, which is also its Cmd shortcut, and one that would have less beside a close
 /// button has none (Cmd+W still closes it).
@@ -85,7 +85,7 @@ impl Layout {
         // Clear of the title bar's group and the box Customize Player drops into it, which is
         // the group's area padded by 4 (the first of `toolbar::ZONES`).
         let start = self.tools.zones[0].r + MARGIN - 4.0;
-        let end = self.button(Hit::Minimize).l - NEW_GAP;
+        let end = self.window_buttons_left() - NEW_GAP;
         let new = Rect::new(end - 28.0, 6.0, end, 34.0);
         if new.l < start {
             return;

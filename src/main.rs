@@ -2423,6 +2423,9 @@ fn run() -> Result<(), Box<dyn Error>> {
                     changed.then(|| {
                         let queue = card.then_some(ui.queue.open);
                         let mut layout = renderer.library_layout(w, h, &ui.browse, queue);
+                        if fullscreen {
+                            layout.leave_out_resize_buttons();
+                        }
                         if let Some(q) = &queue_data {
                             layout.add_mini_queue(&ui.queue, q);
                         }
