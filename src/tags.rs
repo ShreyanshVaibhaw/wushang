@@ -64,8 +64,10 @@ pub fn stamp(path: &Path) -> Option<Stamp> {
     Some((m.len(), u64::try_from(since.as_nanos()).ok()?))
 }
 
-/// The saved tags by path; a missing or unreadable file is an empty index.
+/// The saved tags by path; a missing or unreadable file is an empty index. A save still on its
+/// way to disk lands first.
 pub fn load(dir: &Path) -> HashMap<PathBuf, (Stamp, Track)> {
+    crate::library::finish_writes();
     let text = fs::read_to_string(dir.join(FILE)).unwrap_or_default();
     let tag = |s: &str| (!s.is_empty()).then(|| s.to_owned());
     // Version 1 files have their paths as they were.
@@ -94,7 +96,9 @@ pub fn load(dir: &Path) -> HashMap<PathBuf, (Stamp, Track)> {
         .collect()
 }
 
-/// Writes the index through a temporary file, so a crash mid-write keeps the old one.
+/// Writes the index through a temporary file, so a crash mid-write keeps the old one. The
+/// writing happens on the library's writer thread: the render loop saves every 30 seconds, and
+/// the index can run to megabytes.
 pub fn save(dir: &Path, tracks: &HashMap<PathBuf, (Stamp, Track)>) -> io::Result<()> {
     // Tabs and line breaks in a tag would split its line.
     let clean = |s: &Option<String>| s.as_deref().unwrap_or("").replace(['\t', '\r', '\n'], " ");
@@ -113,9 +117,8 @@ pub fn save(dir: &Path, tracks: &HashMap<PathBuf, (Stamp, Track)>) -> io::Result
         );
     }
     fs::create_dir_all(dir)?;
-    let tmp = dir.join(format!("{FILE}.tmp"));
-    fs::write(&tmp, out)?;
-    fs::rename(tmp, dir.join(FILE))
+    crate::library::write_later(dir.join(FILE), out.into_bytes());
+    Ok(())
 }
 
 #[cfg(test)]
@@ -136,6 +139,8 @@ mod tests {
         };
         let tracks = HashMap::from([(song.clone(), ((4096, 133_000_000_000_000_000), track))]);
         save(&dir, &tracks).unwrap();
+        // Saving writes on the library's writer thread.
+        crate::library::finish_writes();
         // A broken line is skipped, not the whole file.
         let file = dir.join(FILE);
         let text = fs::read_to_string(&file).unwrap() + "/half\t12\n";
