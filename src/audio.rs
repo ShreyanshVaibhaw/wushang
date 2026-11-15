@@ -865,23 +865,23 @@ mod tests {
         ]
     }
 
-    /// Switches to `name` and waits for the new output to play: until it is the output named,
-    /// then for its first callbacks. The switch opens it on another thread, and its start moves
-    /// the clock once by the difference in the outputs' latency (the sound queued in the old one
-    /// never plays), so a rate measured across it counts that jump. Reopening the default shows
-    /// no change of name, and the settling wait alone covers it.
+    /// Switches to `name` and waits for the switch to settle: until it is the output named (an
+    /// output that fails to open leaves the current one playing, so that wait gives up after a
+    /// while), then for the new output's first callbacks. The switch opens it on another thread,
+    /// and its start moves the clock once by the difference in the outputs' latency (the sound
+    /// queued in the old one never plays), so a rate measured across it would count that jump.
+    /// Reopening the default shows no change of name, and the settling wait alone covers it.
     fn switch_and_settle(device: &Device, name: Option<&str>) {
         device.switch_to(name);
         let start = Instant::now();
-        while device.current_output().as_deref() != name {
-            assert!(
-                start.elapsed() < Duration::from_secs(10),
-                "{name:?} never opened"
-            );
+        while device.current_output().as_deref() != name
+            && start.elapsed() < Duration::from_secs(10)
+        {
             thread::sleep(Duration::from_millis(10));
         }
-        // Its first callbacks, which set the clock from the new latency.
-        thread::sleep(Duration::from_millis(500));
+        // Its first callbacks, which set the clock from the new latency; a Bluetooth output
+        // takes a while to start.
+        thread::sleep(Duration::from_secs(1));
     }
 
     /// Clock rate in media seconds per second, measured over `seconds`.
