@@ -48,6 +48,8 @@ pub struct Drag {
     /// Its place in the bars, or None from the palette.
     pub from: Option<(Zone, usize)>,
     pub at: (f32, f32),
+    /// Where the press was: a drop that hasn't moved from it is a click.
+    pub start: (f32, f32),
 }
 
 /// Where a dragged item would land.
@@ -62,6 +64,9 @@ pub struct State {
     pub draft: Toolbar,
     pub drag: Option<Drag>,
 }
+
+/// How far the pointer moves between press and release before it is a drag, not a click.
+const CLICK_SLOP: f32 = 4.0;
 
 /// A palette cell: its item, where it is, and for an item in the bar, its place there.
 type Cell = (Item, Rect, Option<(Zone, usize)>);
@@ -261,6 +266,7 @@ impl Ui {
             item,
             from,
             at: (x, y),
+            start: (x, y),
         });
         self.drag = Some(Hit::Customize(target));
     }
@@ -292,7 +298,13 @@ impl Ui {
                     st.draft = moved;
                 }
             }
-            (Some(Drop::Remove), Some((zone, index))) => st.draft.remove(zone, index),
+            // A click on a bar item shown in the palette (one the window has no room for)
+            // isn't a drag out of the bar.
+            (Some(Drop::Remove), Some((zone, index)))
+                if (x - d.start.0).hypot(y - d.start.1) > CLICK_SLOP =>
+            {
+                st.draft.remove(zone, index)
+            }
             _ => {}
         }
         self.relayout = true;
@@ -578,6 +590,17 @@ mod tests {
         ui.customize_drop((frame.l + frame.r) / 2.0, (frame.t + frame.b) / 2.0);
         let st = ui.customize.as_ref().unwrap();
         assert_eq!(st.draft.zone(zone).len(), draft.zone(zone).len() - 1);
+
+        // A click on one, which drops it where it was pressed, keeps it in the bar.
+        lay(&mut ui);
+        let g = ui.layout.customize.as_ref().unwrap();
+        let (_, cell, from) = *g.cells.iter().find(|c| c.2.is_some()).unwrap();
+        let (zone, index) = from.unwrap();
+        let at = g.screen((cell.l + cell.r) / 2.0, cell.t + 24.0);
+        let before = ui.customize.as_ref().unwrap().draft.clone();
+        ui.customize_down(Target::Placed(zone, index), at.0, at.1);
+        ui.customize_drop(at.0, at.1);
+        assert_eq!(ui.customize.as_ref().unwrap().draft, before);
     }
 
     /// A drop the window has no room for is refused: the bar would leave the item out of every

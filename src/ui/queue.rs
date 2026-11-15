@@ -924,10 +924,6 @@ mod tests {
         );
     }
 
-    /// The row minus removes is the one highlighted, and only while it still shows what was
-    /// clicked: rows removed or moved from their menu, another tab of the panel, the mini
-    /// player's queue or another tab's queue take the selection away instead of moving it
-    /// onto a different file.
     /// A row's drag ends with the page it was on: the queue pressed on the player page must
     /// not be dragged from another page, where the drop would move its row to the top unseen.
     #[test]
@@ -944,6 +940,10 @@ mod tests {
         assert_eq!((ui.queue.press, ui.queue.drag), (None, None));
     }
 
+    /// The row minus removes is the one highlighted, and only while it still shows what was
+    /// clicked: rows removed or moved from their menu, another tab of the panel, the mini
+    /// player's queue or another tab's queue take the selection away instead of moving it
+    /// onto a different file.
     #[test]
     fn the_selection_lapses_when_its_rows_change() {
         let mut ui = Ui::new();
