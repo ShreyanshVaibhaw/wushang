@@ -12,8 +12,9 @@ use std::time::Duration;
 
 /// Where the radio directory comes from: the community run Radio Browser, no key needed.
 const RADIO_DIRECTORY: &str = "https://de1.api.radio-browser.info/xml/stations/topvote/100";
-/// Feeds and directories bigger than this are not worth parsing.
-const MAX_FETCH: usize = 4 << 20;
+/// Feeds and directories bigger than this are not worth parsing. A podcast that has run for
+/// years lists every episode with its show notes, and such feeds reach 10 MB and more.
+const MAX_FETCH: usize = 32 << 20;
 /// How long a feed, the radio directory or the release check may take in all. One thread
 /// serves them in turn, so a server trickling its answer must not hold it for longer.
 const FETCH_DEADLINE: Duration = Duration::from_secs(180);
@@ -302,6 +303,7 @@ pub struct Station {
 /// order. `url_resolved` wins over `url`, as it is the address that last worked.
 pub fn parse_stations(text: &str) -> Vec<Station> {
     let mut out: Vec<Station> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
     let mut rest = text;
     while let Some(at) = rest.find("<station") {
         let after = &rest[at + 8..];
@@ -318,7 +320,7 @@ pub fn parse_stations(text: &str) -> Vec<Station> {
             .filter(|u| !u.is_empty())
             .or_else(|| attr(tag, "url"))
             .unwrap_or_default();
-        if name.is_empty() || !is_web_url(&url) || out.iter().any(|s: &Station| s.url == url) {
+        if name.is_empty() || !is_web_url(&url) || !seen.insert(url.clone()) {
             continue;
         }
         out.push(Station {
@@ -851,6 +853,11 @@ mod tests {
                 let body = "x".repeat(2000);
                 format!("HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n{body}").into_bytes()
             }
+            // Long-running podcasts list every episode with show notes: feeds of 5 to 10 MB.
+            "/long-feed" => {
+                let body = "x".repeat(10 << 20);
+                format!("HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n{body}").into_bytes()
+            }
             "/stall" => {
                 thread::sleep(Duration::from_secs(3));
                 b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n".to_vec()
@@ -882,10 +889,32 @@ mod tests {
             fetch(&format!("{base}/big"), second, FETCH_DEADLINE, 2000).map(|b| b.len()),
             Ok(2000)
         );
+        assert_eq!(
+            fetch_text(&format!("{base}/long-feed"), second).map(|t| t.len()),
+            Ok(10 << 20)
+        );
         let stalled = fetch_text(&format!("{base}/stall"), second).unwrap_err();
         assert!(stalled.starts_with("cannot reach 127.0.0.1"), "{stalled}");
         assert!(fetch_text("ftp://example.com/x", second).is_err());
         assert!(fetch_text("not an address", second).is_err());
+    }
+
+    /// A directory as big as a fetch may be parses in linear time, duplicates still dropped.
+    #[test]
+    fn a_big_directory_parses_quickly() {
+        let stations: String = (0..150_000)
+            .map(|i| format!("<station name=\"S{i}\" url=\"http://a.example/{i}\"/>\n"))
+            .collect();
+        let xml = format!(
+            "<stations>{stations}<station name=\"Again\" url=\"http://a.example/7\"/></stations>"
+        );
+        let started = std::time::Instant::now();
+        assert_eq!(parse_stations(&xml).len(), 150_000);
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "{:?}",
+            started.elapsed()
+        );
     }
 
     /// A server sending a byte just inside every read timeout must not hold the one fetch
