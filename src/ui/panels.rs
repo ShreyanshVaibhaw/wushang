@@ -739,9 +739,9 @@ impl Builder<'_> {
         self.push(Kind::Heading(text), r, None, false, false);
     }
 
-    fn label(&mut self, text: &'static str, x: f32, cy: f32, dim: bool) {
+    fn label(&mut self, text: &'static str, x: f32, cy: f32) {
         let r = self.rect(x, cy, W - PAD, 24.0);
-        self.push(Kind::Label(text), r, None, false, dim);
+        self.push(Kind::Label(text), r, None, false, false);
     }
 
     fn divider(&mut self, cy: f32) {
@@ -749,19 +749,18 @@ impl Builder<'_> {
         self.push(Kind::Divider, r, None, false, false);
     }
 
-    /// A label with an OFF/ON switch at the right; disabled without a control.
-    fn toggle(&mut self, label: &'static str, cy: f32, ctl: Option<Ctl>) {
-        let dim = ctl.is_none();
-        self.label(label, LABEL_X, cy, dim);
+    /// A label with an OFF/ON switch at the right.
+    fn toggle(&mut self, label: &'static str, cy: f32, ctl: Ctl) {
+        self.label(label, LABEL_X, cy);
         let r = self.rect(W - PAD - 68.0, cy, W - PAD, 32.0);
-        self.push(Kind::Toggle, r, ctl, !dim, dim);
+        self.push(Kind::Toggle, r, Some(ctl), true, false);
     }
 
     /// A label with a menu at the right, or a full-width menu without a label.
     fn dropdown(&mut self, label: Option<&'static str>, cy: f32, ctl: Ctl) {
         let l = match label {
             Some(text) => {
-                self.label(text, LABEL_X, cy, false);
+                self.label(text, LABEL_X, cy);
                 160.0
             }
             None => PAD,
@@ -773,26 +772,24 @@ impl Builder<'_> {
 
     /// A label with a value field at the right. Fields whose control has choices open a list.
     fn field(&mut self, label: &'static str, cy: f32, ctl: Ctl) {
-        self.label(label, LABEL_X, cy, false);
+        self.label(label, LABEL_X, cy);
         let r = self.rect(W - PAD - FIELD_W, cy, W - PAD, FIELD_H);
         self.push(Kind::Field, r, Some(ctl), ctl.has_options(), false);
     }
 
-    fn slider(&mut self, ctl: Option<Ctl>, cy: f32, l: f32, r: f32, ticks: u8, centre: bool) {
-        let dim = ctl.is_none();
+    fn slider(&mut self, ctl: Ctl, cy: f32, l: f32, r: f32, ticks: u8, centre: bool) {
         let rect = self.rect(l, cy, r, 14.0);
-        self.push(Kind::Slider { ticks, centre }, rect, ctl, !dim, dim);
+        self.push(Kind::Slider { ticks, centre }, rect, Some(ctl), true, false);
     }
 
-    fn ticks(&mut self, labels: &'static [&'static str], cy: f32, dim: bool) {
+    fn ticks(&mut self, labels: &'static [&'static str], cy: f32) {
         let r = self.rect(PAD, cy, W - PAD, 16.0);
-        self.push(Kind::TickLabels(labels), r, None, false, dim);
+        self.push(Kind::TickLabels(labels), r, None, false, false);
     }
 
-    fn button(&mut self, text: &'static str, cy: f32, ctl: Option<Ctl>) {
+    fn button(&mut self, text: &'static str, cy: f32, ctl: Ctl) {
         let r = self.rect(W - PAD - 69.0, cy, W - PAD, 36.0);
-        let click = ctl.is_some();
-        self.push(Kind::Button(text), r, ctl, click, false);
+        self.push(Kind::Button(text), r, Some(ctl), true, false);
     }
 
     fn choice(&mut self, text: String, cy: f32, ctl: Ctl) {
@@ -800,10 +797,10 @@ impl Builder<'_> {
         self.push(Kind::Choice(text), r, Some(ctl), true, false);
     }
 
-    fn icon(&mut self, glyph: Glyph, cx: f32, cy: f32, ctl: Option<Ctl>, dim: bool) {
+    /// An icon button, greyed out and unclickable while `dim`.
+    fn icon(&mut self, glyph: Glyph, cx: f32, cy: f32, ctl: Ctl, dim: bool) {
         let r = self.rect(cx - 16.0, cy, cx + 16.0, 32.0);
-        let click = ctl.is_some() && !dim;
-        self.push(Kind::Icon(glyph), r, ctl, click, dim);
+        self.push(Kind::Icon(glyph), r, Some(ctl), !dim, dim);
     }
 
     /// "Expand Settings" for a filter group at `cy`, or its open box with `fill` placing the
@@ -838,7 +835,7 @@ fn tracks(b: &mut Builder, tab: TrackTab, d: &PanelData) -> f32 {
         TrackTab::Subtitles => &d.sub_tracks,
     };
     let ctl = |i| Ctl::Track(tab, i);
-    b.label("Embedded Tracks", 28.0, 80.0, false);
+    b.label("Embedded Tracks", 28.0, 80.0);
     let mut y = 127.5;
     b.choice("None".into(), y, ctl(None));
     for (i, name) in names.iter().enumerate() {
@@ -850,14 +847,8 @@ fn tracks(b: &mut Builder, tab: TrackTab, d: &PanelData) -> f32 {
         TrackTab::Audio => {
             b.divider(y + 34.0);
             let label = y + 66.0;
-            b.label("Output Device", 28.0, label, false);
-            b.icon(
-                Glyph::Refresh,
-                359.0,
-                label,
-                Some(Ctl::RefreshDevices),
-                false,
-            );
+            b.label("Output Device", 28.0, label);
+            b.icon(Glyph::Refresh, 359.0, label, Ctl::RefreshDevices, false);
             y = label + 47.5 - ROW;
             for (i, name) in d.devices.iter().enumerate() {
                 y += ROW;
@@ -866,11 +857,11 @@ fn tracks(b: &mut Builder, tab: TrackTab, d: &PanelData) -> f32 {
         }
         TrackTab::Subtitles => {
             let label = y + 64.0;
-            b.label("External Tracks", 28.0, label, false);
+            b.label("External Tracks", 28.0, label);
             // The pencil opens the chosen file in an editor, so it waits for a choice.
             let none = d.external_selected.is_none();
-            b.icon(Glyph::Pencil, 315.0, label, Some(Ctl::EditSubtitle), none);
-            b.icon(Glyph::Plus, 359.0, label, Some(Ctl::AddSubtitle), false);
+            b.icon(Glyph::Pencil, 315.0, label, Ctl::EditSubtitle, none);
+            b.icon(Glyph::Plus, 359.0, label, Ctl::AddSubtitle, false);
             y = label + 47.5 - ROW;
             for (i, name) in d.external_subs.iter().enumerate() {
                 y += ROW;
@@ -882,25 +873,21 @@ fn tracks(b: &mut Builder, tab: TrackTab, d: &PanelData) -> f32 {
 }
 
 fn playback(b: &mut Builder) -> f32 {
-    b.toggle(
-        "Show Subtitle Timeline on Seekbar",
-        87.5,
-        Some(Ctl::SubTimeline),
-    );
-    b.toggle("Show Statistics", 139.5, Some(Ctl::ShowStatistics));
-    b.toggle("Reverse", 191.5, Some(Ctl::Reverse));
+    b.toggle("Show Subtitle Timeline on Seekbar", 87.5, Ctl::SubTimeline);
+    b.toggle("Show Statistics", 139.5, Ctl::ShowStatistics);
+    b.toggle("Reverse", 191.5, Ctl::Reverse);
     b.dropdown(Some("Sleep Timer"), 251.0, Ctl::SleepTimer);
     b.dropdown(Some("Audio Visualizer"), 319.0, Ctl::Visualizer);
     b.field("Speed", 386.0, Ctl::Speed);
-    b.slider(Some(Ctl::Speed), 433.0, PAD, W - PAD, 6, false);
-    b.ticks(&SPEED_TICKS, 463.0, false);
+    b.slider(Ctl::Speed, 433.0, PAD, W - PAD, 6, false);
+    b.ticks(&SPEED_TICKS, 463.0);
     478.0
 }
 
 fn video(b: &mut Builder) -> f32 {
     b.heading("Defaults", 80.0);
-    b.button("Reset", 80.0, Some(Ctl::ResetVideo));
-    b.label("Flip", LABEL_X, 125.0, false);
+    b.button("Reset", 80.0, Ctl::ResetVideo);
+    b.label("Flip", LABEL_X, 125.0);
     let well = b.rect(PAD, 174.0, W - PAD, 40.0);
     b.push(Kind::Segments, well, None, false, false);
     let seg = (well.w() - 2.0 - 4.0) / 3.0;
@@ -924,7 +911,7 @@ fn video(b: &mut Builder) -> f32 {
     b.dropdown(Some("Render"), 649.0, Ctl::Render);
     b.divider(692.5);
     b.heading("Filters", 722.0);
-    b.label("Essential", LABEL_X, 761.0, false);
+    b.label("Essential", LABEL_X, 761.0);
     let filters = [
         ("Brightness", Ctl::Brightness),
         ("Contrast", Ctl::Contrast),
@@ -936,8 +923,8 @@ fn video(b: &mut Builder) -> f32 {
     b.group(814.0, Ctl::Essential, open, h, |b, top| {
         for (i, (name, ctl)) in filters.into_iter().enumerate() {
             let y = top + 66.0 + BOX_ITEM * i as f32;
-            b.label(name, PAD + 16.0, y, false);
-            b.slider(Some(ctl), y + 33.0, PAD + 16.0, W - PAD - 16.0, 0, false);
+            b.label(name, PAD + 16.0, y);
+            b.slider(ctl, y + 33.0, PAD + 16.0, W - PAD - 16.0, 0, false);
         }
     }) + 20.0
 }
@@ -946,17 +933,17 @@ fn audio(b: &mut Builder) -> f32 {
     b.heading("Defaults", 80.0);
     b.field("Audio Track", 124.5, Ctl::AudioTrack);
     b.field("Audio Language", 177.5, Ctl::AudioLanguage);
-    b.label("Stereo Mode", LABEL_X, 238.0, false);
-    b.button("Test", 238.0, Some(Ctl::TestStereo));
+    b.label("Stereo Mode", LABEL_X, 238.0);
+    b.button("Test", 238.0, Ctl::TestStereo);
     b.dropdown(None, 297.5, Ctl::Stereo);
     b.divider(341.0);
     b.heading("Synchronization", 372.0);
     b.field("Audio Track Delay", 420.0, Ctl::AudioDelay);
-    b.slider(Some(Ctl::AudioDelay), 467.5, PAD, W - PAD, 0, true);
-    b.ticks(&DELAY_TICKS, 494.0, false);
+    b.slider(Ctl::AudioDelay, 467.5, PAD, W - PAD, 0, true);
+    b.ticks(&DELAY_TICKS, 494.0);
     b.divider(525.0);
     b.heading("Filters", 555.0);
-    b.label("Equalizer", LABEL_X, 595.0, false);
+    b.label("Equalizer", LABEL_X, 595.0);
     b.dropdown(None, 645.5, Ctl::EqPreset);
     let rows = 1 + BANDS.len();
     let h = BOX_HEAD + 20.0 + BOX_EQ_ROW * rows as f32 - 6.0;
@@ -968,12 +955,12 @@ fn audio(b: &mut Builder) -> f32 {
             let y = top + BOX_HEAD + 14.0 + BOX_EQ_ROW * i as f32;
             let label = b.rect(PAD + 16.0, y, PAD + 86.0, 24.0);
             b.push(Kind::Label(name), label, None, false, false);
-            b.slider(Some(ctl), y, PAD + 90.0, W - PAD - 16.0, 0, true);
+            b.slider(ctl, y, PAD + 90.0, W - PAD - 16.0, 0, true);
         }
     });
     // "2 Pass" sits 58 under the closed group's centre.
     let pass = bottom - DROPDOWN_H / 2.0 + 58.0;
-    b.toggle("2 Pass", pass, Some(Ctl::TwoPass));
+    b.toggle("2 Pass", pass, Ctl::TwoPass);
     b.divider(pass + 43.0);
     pass + 60.0
 }
@@ -985,19 +972,19 @@ fn subtitles(b: &mut Builder) -> f32 {
     b.divider(211.0);
     b.heading("Synchronization", 241.0);
     b.field("Subtitle Track Delay", 289.0, Ctl::SubDelay);
-    b.slider(Some(Ctl::SubDelay), 332.5, PAD, W - PAD, 0, true);
-    b.ticks(&DELAY_TICKS, 359.0, false);
+    b.slider(Ctl::SubDelay, 332.5, PAD, W - PAD, 0, true);
+    b.ticks(&DELAY_TICKS, 359.0);
     b.field("Subtitle Speed", 404.0, Ctl::SubSpeed);
-    b.slider(Some(Ctl::SubSpeed), 448.0, PAD, W - PAD, 0, false);
+    b.slider(Ctl::SubSpeed, 448.0, PAD, W - PAD, 0, false);
     b.field("Subtitle Duration Factor", 493.0, Ctl::SubDuration);
-    b.slider(Some(Ctl::SubDuration), 538.0, PAD, W - PAD, 0, false);
+    b.slider(Ctl::SubDuration, 538.0, PAD, W - PAD, 0, false);
     b.divider(570.5);
     b.heading("Appearance", 601.0);
     // Not in the design: Settings' text size.
     b.field("Text Size", 646.0, Ctl::SubSize);
-    b.slider(Some(Ctl::SubSize), 690.0, PAD, W - PAD, 0, false);
-    b.ticks(&SIZE_TICKS, 717.0, false);
-    b.toggle("Embedded Sub Format", 762.0, Some(Ctl::SubStyles));
+    b.slider(Ctl::SubSize, 690.0, PAD, W - PAD, 0, false);
+    b.ticks(&SIZE_TICKS, 717.0);
+    b.toggle("Embedded Sub Format", 762.0, Ctl::SubStyles);
     b.field("Subtitle Font", 814.0, Ctl::SubFont);
     b.field("Text Color", 867.0, Ctl::SubColor);
     b.field("Outline Color", 918.0, Ctl::OutlineColor);
