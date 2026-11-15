@@ -2469,6 +2469,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                     renderer.add_dialog(&mut layout, d);
                 }
                 ui.layout = layout;
+                ui.settle_library_scroll();
                 ui.relayout = false;
                 ui.dirty = true;
                 ui.sync_menu();

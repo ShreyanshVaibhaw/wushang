@@ -332,6 +332,17 @@ impl Browse {
     }
 }
 
+impl Ui {
+    /// After a new layout: a scroll left past the library's end (a list that shrank, a window
+    /// that grew), which the layout drew at the end, comes back to the end, so the wheel goes
+    /// on from where the page shows.
+    pub fn settle_library_scroll(&mut self) {
+        if self.layout.page == Page::Library || self.layout.has_overlay() {
+            self.browse.scroll = self.browse.scroll.min(self.layout.browse.max_scroll);
+        }
+    }
+}
+
 #[derive(Clone, Default)]
 pub struct Geometry {
     /// The scrolling area under the header.
@@ -433,12 +444,13 @@ pub(super) fn layout(
         w - CONTENT_RIGHT_GAP,
         height - 8.0,
     );
-    let (tiles, bottom) = if b.grid {
-        grid(&b.entries, content, b.scroll)
-    } else {
-        list(&b.entries, content, FIRST_ROW - b.scroll)
-    };
-    let max_scroll = (bottom + b.scroll - content.b).max(0.0);
+    let (tiles, max_scroll) = scrolled(b.scroll, content, |scroll| {
+        if b.grid {
+            grid(&b.entries, content, scroll)
+        } else {
+            list(&b.entries, content, FIRST_ROW - scroll)
+        }
+    });
 
     // The card's queue gets the room above it, short of the title bar.
     let card = card.map(|queue| {
@@ -507,11 +519,13 @@ pub(super) fn overlay(p: &Painter, l: &mut Layout, b: &Browse) {
         panel.r - 10.0,
         panel.b,
     );
-    let (tiles, bottom) = list(&b.entries, content, t + OVERLAY_FIRST_ROW - b.scroll);
+    let (tiles, max_scroll) = scrolled(b.scroll, content, |scroll| {
+        list(&b.entries, content, t + OVERLAY_FIRST_ROW - scroll)
+    });
     l.browse = Geometry {
         content,
         tiles,
-        max_scroll: (bottom + b.scroll - content.b).max(0.0),
+        max_scroll,
         crumbs,
         elided,
         count: Rect::new(x0 + 20.0, tools - 14.0, x0 + 200.0, tools + 14.0),
@@ -520,6 +534,23 @@ pub(super) fn overlay(p: &Painter, l: &mut Layout, b: &Browse) {
         header_cy: cy,
         overlay: Some(panel),
     };
+}
+
+/// The tiles `place` lays out at `scroll`, and how far the page can scroll. A scroll past the
+/// end (left by a list that shrank or a window that grew; only the wheel clamps it) lays out
+/// at the end instead.
+fn scrolled(
+    scroll: f32,
+    content: Rect,
+    place: impl Fn(f32) -> (Vec<Tile>, f32),
+) -> (Vec<Tile>, f32) {
+    let (tiles, bottom) = place(scroll);
+    let max_scroll = (bottom + scroll - content.b).max(0.0);
+    if scroll > max_scroll {
+        (place(max_scroll).0, max_scroll)
+    } else {
+        (tiles, max_scroll)
+    }
 }
 
 fn rail_icon(panel: Rect, i: usize) -> Rect {
@@ -1504,5 +1535,43 @@ mod tests {
         assert_eq!(labels(&b.entries), ["Add", "x", "y"]);
         assert!(!b.has_artists());
         assert!(!b.has_albums());
+    }
+
+    /// A list that shrank (files removed, hidden files turned off) or a window that grew can
+    /// leave the scroll past the page's end; the page draws as if scrolled to the end.
+    #[test]
+    fn the_page_never_draws_past_its_end() {
+        let (_ctx, p) = super::super::render_check::painter();
+        let mut b = Browse::new();
+        b.entries = (0..60).map(|i| file(&format!("{i}"), None, None)).collect();
+        for grid in [true, false] {
+            b.grid = grid;
+            b.scroll = 100_000.0;
+            let past = layout(&p, 1280.0, 720.0, &b, None);
+            let max = past.browse.max_scroll;
+            assert!(max > 0.0);
+            b.scroll = max;
+            let end = layout(&p, 1280.0, 720.0, &b, None);
+            assert_eq!(past.browse.tiles[0].thumb, end.browse.tiles[0].thumb);
+        }
+        let player = |scroll: f32, b: &mut Browse| {
+            b.scroll = scroll;
+            let mut l = Layout::new(1280.0, 720.0, true, false);
+            overlay(&p, &mut l, b);
+            l.browse
+        };
+        let past = player(100_000.0, &mut b);
+        let end = player(past.max_scroll, &mut b);
+        assert_eq!(past.tiles[0].thumb, end.tiles[0].thumb);
+
+        // The wheel then goes on from the end the page shows.
+        let mut ui = Ui::new();
+        ui.browse.entries = b.entries.clone();
+        ui.browse.scroll = 100_000.0;
+        ui.layout = layout(&p, 1280.0, 720.0, &ui.browse, None);
+        ui.settle_library_scroll();
+        let max = ui.layout.browse.max_scroll;
+        ui.scroll(-60.0);
+        assert_eq!(ui.browse.scroll, max - 60.0);
     }
 }

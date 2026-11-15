@@ -1357,7 +1357,8 @@ impl Ui {
                 st.list_scroll = (st.list_scroll + dy).clamp(0.0, l.max_scroll);
             }
             Some(_) => {}
-            None => st.scroll = (st.scroll + dy).clamp(0.0, g.max_scroll),
+            // From where the page shows: a scroll left past the end lays out at the end.
+            None => st.scroll = (st.scroll.min(g.max_scroll) + dy).clamp(0.0, g.max_scroll),
         }
         self.relayout = true;
     }
@@ -2019,6 +2020,24 @@ mod tests {
         let (cx, cy) = centre(item);
         let hit = g.hit(g.origin.0 + cx * g.scale, g.origin.1 + cy * g.scale);
         assert_eq!(hit, Target::Category(Category::Recording));
+    }
+
+    /// A scroll left past the end (the search narrowed, the window grew) draws at the end, and
+    /// the wheel goes on from there rather than from the stale value.
+    #[test]
+    fn the_wheel_scrolls_from_where_the_page_shows() {
+        let mut ui = Ui::new();
+        ui.layout = Layout::new(1280.0, 720.0, true, false);
+        ui.open_preferences(Prefs::default(), vec!["Default".into()], Category::Playback);
+        let st = ui.preferences.as_mut().unwrap();
+        // Every setting with an "e" in it: more than a window's worth.
+        st.search = TextField::new("e");
+        st.scroll = 100_000.0;
+        ui.layout.add_preferences(ui.preferences.as_ref().unwrap());
+        let max = ui.layout.preferences.as_ref().unwrap().max_scroll;
+        assert!(max > 60.0);
+        ui.scroll_preferences(0.0, 0.0, 1.0);
+        assert_eq!(ui.preferences.as_ref().unwrap().scroll, max - 60.0);
     }
 
     #[test]
