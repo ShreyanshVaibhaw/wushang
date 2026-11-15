@@ -77,7 +77,9 @@ thread_local! {
     static MENU_ENABLED: Cell<bool> = const { Cell::new(true) };
     /// A pass runs from the timer inside AppKit's own loop, which mustn't be waited in.
     static IN_MODAL: Cell<bool> = const { Cell::new(false) };
-    static MODAL_TIMER: OnceCell<Retained<NSTimer>> = const { OnceCell::new() };
+    /// What the modal timer runs, and the timer, remade when the window's screen changes.
+    static MODAL_TICK: Cell<Option<fn()>> = const { Cell::new(None) };
+    static MODAL_TIMER: RefCell<Option<Retained<NSTimer>>> = const { RefCell::new(None) };
 }
 
 define_class!(
@@ -157,6 +159,7 @@ define_class!(
 
         #[unsafe(method(applicationDidChangeScreenParameters:))]
         fn screens_changed(&self, _: &NSNotification) {
+            retime_modal_tick();
             dispatch(Event::DisplayChanged);
         }
     }
@@ -175,6 +178,7 @@ define_class!(
 
         #[unsafe(method(windowDidChangeScreen:))]
         fn did_change_screen(&self, _: &NSNotification) {
+            retime_modal_tick();
             dispatch(Event::DisplayChanged);
         }
 
@@ -460,10 +464,33 @@ pub fn wait_for_event(timeout: Duration) {
     });
 }
 
-/// Has `tick` run every few milliseconds while AppKit runs a loop of its own (a live resize,
-/// a window drag, an open menu, a modal panel), where the render loop can't. Windows' version
-/// was a timer set on WM_ENTERSIZEMOVE; these modes only exist while such a loop runs.
+/// Has `tick` run once a refresh of the window's screen while AppKit runs a loop of its own (a
+/// live resize, a window drag, an open menu, a modal panel), where the render loop can't.
+/// Windows' version was a timer set on WM_ENTERSIZEMOVE; these modes only exist while such a
+/// loop runs.
 pub fn set_modal_tick(tick: fn()) {
+    MODAL_TICK.set(Some(tick));
+    retime_modal_tick();
+}
+
+/// How often the modal tick runs for a screen showing up to `fps` frames a second: once a
+/// frame, as the render loop would, and at 60 when the screen doesn't say.
+fn tick_interval(fps: Option<isize>) -> f64 {
+    1.0 / fps.unwrap_or(60).clamp(24, 240) as f64
+}
+
+/// Makes the modal tick's timer again if the window's screen now refreshes at another rate:
+/// the window moved to another screen, or the screens changed.
+fn retime_modal_tick() {
+    let Some(tick) = MODAL_TICK.get() else {
+        return;
+    };
+    let interval = tick_interval(window::refresh_rate());
+    let same =
+        MODAL_TIMER.with_borrow(|t| t.as_ref().is_some_and(|t| t.timeInterval() == interval));
+    if same {
+        return;
+    }
     let block = RcBlock::new(move |_: NonNull<NSTimer>| {
         IN_MODAL.set(true);
         autoreleasepool(|_| {
@@ -475,12 +502,15 @@ pub fn set_modal_tick(tick: fn()) {
         IN_MODAL.set(false);
     });
     // SAFETY: the block is 'static, and both modes are AppKit's own.
-    unsafe {
-        let timer = NSTimer::timerWithTimeInterval_repeats_block(1.0 / 240.0, true, &block);
+    let timer = unsafe {
+        let timer = NSTimer::timerWithTimeInterval_repeats_block(interval, true, &block);
         let run_loop = NSRunLoop::mainRunLoop();
         run_loop.addTimer_forMode(&timer, NSEventTrackingRunLoopMode);
         run_loop.addTimer_forMode(&timer, NSModalPanelRunLoopMode);
-        MODAL_TIMER.with(|t| _ = t.set(timer));
+        timer
+    };
+    if let Some(old) = MODAL_TIMER.replace(Some(timer)) {
+        old.invalidate();
     }
 }
 
@@ -593,6 +623,16 @@ fn item(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_modal_tick_follows_the_screens_refresh() {
+        assert_eq!(tick_interval(Some(60)), 1.0 / 60.0);
+        assert_eq!(tick_interval(Some(120)), 1.0 / 120.0);
+        assert_eq!(tick_interval(None), 1.0 / 60.0);
+        // A screen claiming more or fewer still gets a usable rate.
+        assert_eq!(tick_interval(Some(1000)), 1.0 / 240.0);
+        assert_eq!(tick_interval(Some(1)), 1.0 / 24.0);
+    }
 
     #[test]
     fn quit_stays_on_while_the_window_has_the_keys() {

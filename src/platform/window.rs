@@ -88,6 +88,14 @@ pub fn main_screen() -> (f64, f64, f64) {
     })
 }
 
+/// The most frames a second the window's screen shows (the main screen's before the window is
+/// made, or off every screen), if AppKit says.
+pub(super) fn refresh_rate() -> Option<isize> {
+    let screen = WINDOW.with(|w| w.get().and_then(|w| w.screen()));
+    let screen = screen.or_else(|| NSScreen::mainScreen(mtm()))?;
+    Some(screen.maximumFramesPerSecond()).filter(|&fps| fps > 0)
+}
+
 /// Creates the window, hidden, with its content `size` and `min` in points; `show` puts it on
 /// screen once the renderer is ready.
 pub fn create_window(title: &str, size: (f64, f64), min: (f64, f64)) -> Window {
