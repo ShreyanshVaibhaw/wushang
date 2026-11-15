@@ -812,9 +812,11 @@ impl App {
         self.tabs[i].stop();
     }
 
-    /// Pauses every tab, those out of sight too: the sleep timer ran out.
-    fn pause_all(&self) {
-        for tab in &self.tabs {
+    /// Pauses every tab, those out of sight too: the sleep timer ran out. A tab playing
+    /// backwards stops stepping back, as reverse playback runs paused.
+    fn pause_all(&mut self) {
+        for tab in &mut self.tabs {
+            tab.reverse = None;
             if !tab.shared.paused.load(Relaxed) {
                 tab.shared.toggle_pause();
             }
@@ -1866,7 +1868,8 @@ impl Tab {
         }
         let paused = self.shared.paused.load(Relaxed);
         if on {
-            let Some(at) = self.session.as_ref().and_then(Session::position) else {
+            // Where it is, or where it's going while the clock waits after a seek.
+            let Some(at) = self.session.as_ref().map(Session::place) else {
                 return;
             };
             if !paused {
@@ -4841,6 +4844,21 @@ mod tests {
         assert_eq!(app.session().map(|s| s.path.clone()), Some(video));
         assert!(app.tab().subtitles().is_some());
         assert_eq!(app.tab().external.last().map(|(p, _)| p), Some(&srt));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// The sleep timer stops every tab, one playing backwards too: reverse playback runs paused,
+    /// stepping back on its own, and pausing passed it by.
+    #[test]
+    fn the_sleep_timer_stops_reverse_playback() {
+        let (mut app, dir, _one) = test_app("sleep-reverse");
+        assert!(app.play_file(&media("test_60s_noaudio.mp4")));
+        app.tab().shared.seek_to(20.0);
+        app.tab_mut().set_reverse(true);
+        assert!(app.tab().reverse.is_some());
+        app.pause_all();
+        assert!(app.tab().reverse.is_none());
+        assert!(app.tab().shared.paused.load(Relaxed));
         std::fs::remove_dir_all(dir).unwrap();
     }
 
