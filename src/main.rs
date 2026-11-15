@@ -2332,7 +2332,9 @@ fn run() -> Result<(), Box<dyn Error>> {
             renderer.resize(w, h)?;
         }
         let hdr = PREFS.with_borrow(|p| p.hdr);
-        renderer.update_display(&win.ns_window(), hdr, DISPLAY_CHANGED.swap(false, Relaxed));
+        // A window back in view, or a new screen under an HDR frame, needs the page again.
+        let stale =
+            renderer.update_display(&win.ns_window(), hdr, DISPLAY_CHANGED.swap(false, Relaxed));
 
         // Tabs out of sight play on, and the last of them all to end may quit, per Settings.
         if app.play_out_of_sight() && app.quit_at_end() {
@@ -2509,7 +2511,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         let visual_on = visualizer > 0
             && UI.with_borrow(|ui| ui.page == Page::Player)
             && app.session().is_some_and(|s| s.video_size.is_none());
-        if next.is_some() || needs_paint || resized || tick || (visual_on && !paused) {
+        if next.is_some() || needs_paint || stale || resized || tick || (visual_on && !paused) {
             let new_frame = next.is_some();
             if let Some(f) = next {
                 app.tab_mut().current = Some(f);

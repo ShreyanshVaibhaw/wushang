@@ -161,6 +161,10 @@ pub struct Renderer {
     edr: bool,
     /// False while the window is hidden or covered, when the layer may hand out no drawables.
     visible: bool,
+    /// Whether the last frame drawn was HDR, the only kind a change of screen shows differently.
+    hdr: bool,
+    /// Set when a present got no drawable, so the window still shows an older page.
+    missed: bool,
 }
 
 /// What one frame in flight uses. The present that takes the slot next waits for the GPU first.
@@ -217,6 +221,8 @@ impl Renderer {
             screen: None,
             edr: false,
             visible: true,
+            hdr: false,
+            missed: false,
         })
     }
 
@@ -233,12 +239,18 @@ impl Renderer {
 
     /// Follows the window's screen and whether it is visible; `allowed` is the HDR setting. The
     /// screen's headroom moves with its brightness, so this reads it on every call, which costs
-    /// a few property reads: call it every pass. `force` (a display change) adds nothing to that.
-    pub fn update_display(&mut self, window: &NSWindow, allowed: bool, _force: bool) {
-        self.visible = window
+    /// a few property reads: call it every pass. True when the page on screen is stale and needs
+    /// presenting again though nothing in the interface changed; `force` (a display change, or
+    /// the system's appearance) always is.
+    pub fn update_display(&mut self, window: &NSWindow, allowed: bool, force: bool) -> bool {
+        let visible = window
             .occlusionState()
             .contains(NSWindowOcclusionState::Visible);
-        self.screen = allowed.then(|| crate::hdr::screen(window)).flatten();
+        let screen = allowed.then(|| crate::hdr::screen(window)).flatten();
+        let was = (self.visible, self.screen);
+        (self.visible, self.screen) = (visible, screen);
+        let missed = std::mem::take(&mut self.missed);
+        force || missed || stale(self.hdr, was, (visible, screen))
     }
 
     /// Switches the layer in or out of EDR. Only HDR10 and HLG frames need it, so the interface
@@ -329,9 +341,8 @@ impl Renderer {
                     None
                 })
         });
-        let screen = self
-            .screen
-            .filter(|_| video.as_ref().is_some_and(|v| v.colors.hdr()));
+        self.hdr = video.as_ref().is_some_and(|v| v.colors.hdr());
+        let screen = self.screen.filter(|_| self.hdr);
         self.set_edr(screen.is_some());
         let px = 96.0 / dpi;
         self.painter.picture = video.as_ref().map(|v| {
@@ -351,7 +362,9 @@ impl Renderer {
         painted?;
 
         let Some(drawable) = self.layer.nextDrawable() else {
-            return Ok(()); // timed out: this frame is dropped, the next pass tries again
+            // Timed out: this frame is dropped, and `update_display` asks for it again.
+            self.missed = true;
+            return Ok(());
         };
         let target = drawable.texture();
         let commands = self.gpu.queue.commandBuffer().ok_or("no command buffer")?;
@@ -391,6 +404,14 @@ impl Renderer {
         })?;
         Ok((w, h, pixels))
     }
+}
+
+/// Whether the page presented while the window was `was` (visible, screen) is stale once it is
+/// `now`, the last frame drawn being `hdr`. Presents are skipped while the window is out of
+/// sight, so coming back into view always is; a new screen or headroom only changes how an HDR
+/// frame looks.
+fn stale(hdr: bool, was: (bool, Option<Screen>), now: (bool, Option<Screen>)) -> bool {
+    (now.0 && !was.0) || (hdr && now.1 != was.1)
 }
 
 /// The layer's pixels: 10-bit sRGB, or half-float extended linear Display P3 for EDR, where 1.0
@@ -1458,6 +1479,30 @@ mod tests {
         );
         assert_eq!(source, (0, 0, 1920, 1080));
         assert_eq!(dest, (480, 270, 1440, 810));
+    }
+
+    /// Nothing the interface does repaints a window that comes back into view, or a paused HDR
+    /// frame whose screen changed, so the renderer says when its page went stale.
+    #[test]
+    fn the_page_goes_stale_when_the_window_or_screen_changes() {
+        let edr = Some(Screen {
+            peak: 1000.0,
+            white: 203.0,
+        });
+        let brighter = Some(Screen {
+            peak: 1600.0,
+            white: 203.0,
+        });
+        // Restored from the Dock, or uncovered: the presents skipped meanwhile are owed.
+        assert!(stale(false, (false, None), (true, None)));
+        // Hidden, or still in view on the same screen: nothing to show.
+        assert!(!stale(true, (true, edr), (false, edr)));
+        assert!(!stale(true, (true, edr), (true, edr)));
+        // A paused HDR frame dragged to an SDR screen, or the brightness keys on an EDR one.
+        assert!(stale(true, (true, edr), (true, None)));
+        assert!(stale(true, (true, edr), (true, brighter)));
+        // SDR frames and the interface look the same on any screen.
+        assert!(!stale(false, (true, edr), (true, brighter)));
     }
 
     #[test]
