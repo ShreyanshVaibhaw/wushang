@@ -611,7 +611,8 @@ impl App {
     /// (`playlist`) a file joins the playlist, and anything else plays. Returns whether it
     /// plays.
     fn open_dropped(&mut self, path: PathBuf, playlist: Option<String>) -> bool {
-        if subs::is_subtitle_file(&path) && self.session().is_some() {
+        // A stream still connecting takes it too, once it has.
+        if subs::is_subtitle_file(&path) && !self.tab().is_empty() {
             self.tab_mut().show_subtitle_file(path);
             return false;
         }
@@ -1338,7 +1339,12 @@ impl App {
     /// Appends files to the queue, for the panel's + and the menus' "Add to Queue".
     pub fn add_to_queue(&mut self, paths: Vec<PathBuf>) {
         if !paths.is_empty() {
-            self.tab_mut().queue.add(paths);
+            let tab = self.tab_mut();
+            tab.queue.add(paths);
+            // A stream still connecting moves on to them if it fails.
+            if let Some(o) = tab.opening.as_mut() {
+                o.skips.get_or_insert(tab.queue.items().len());
+            }
             self.queue_changed();
         }
     }
@@ -4744,6 +4750,12 @@ mod tests {
         assert_eq!(app.session().map(|s| s.path.clone()), Some(video));
         assert!(app.tab().subtitles().is_some());
         assert_eq!(app.tab().external.last().map(|(p, _)| p), Some(&srt));
+
+        // On a stream still connecting it is picked for it, and the stream goes on connecting.
+        assert!(app.play_file(Path::new("http://10.255.255.1/live.ts")));
+        app.open_dropped(srt.clone(), None);
+        assert!(app.tab().opening.is_some(), "the stream still connects");
+        assert_eq!(app.tab().external.last().map(|(p, _)| p), Some(&srt));
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -4775,6 +4787,13 @@ mod tests {
         menu_action(&mut app, Window, MenuAction::AddToQueue(vec![file.clone()]));
         assert!(app.tab().opening.is_some(), "the stream still connects");
         assert!(app.tab().queue.items().contains(&file));
+
+        // A stream that then fails moves on to what was added after it.
+        PREFS.with_borrow_mut(|p| p.net_reconnect = false);
+        assert!(app.play_file(Path::new("http://127.0.0.1:9/live.ts")));
+        menu_action(&mut app, Window, MenuAction::AddToQueue(vec![file.clone()]));
+        let on = |app: &App| app.session().is_some_and(|s| s.path == file);
+        assert!(passes(&mut app, 10.0, on), "{:?}", app.notice);
         std::fs::remove_dir_all(dir).unwrap();
     }
 
