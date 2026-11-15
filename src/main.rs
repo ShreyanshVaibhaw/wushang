@@ -63,7 +63,7 @@ use net::NetKind;
 use player::{HwDevice, Shared, VideoFrame};
 use prefs::Prefs;
 use queue::{Queue, Repeat};
-use render::{DeviceLock, Flip, Renderer, VideoAdjust, Zoom};
+use render::{Flip, Renderer, VideoAdjust, Zoom};
 use session::{Session, TrackChoice, TrackKind};
 use subs::Cues;
 use ui::panels::{ASPECT, CROP};
@@ -1991,8 +1991,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         set_topmost(win, true);
     }
     platform::set_handler(on_event);
-    let lock = app.hw.as_ref().and_then(DeviceLock::from_hw);
-    let mut renderer = Renderer::new(win.layer(), win.size_px(), device, lock)?;
+    let mut renderer = Renderer::new(win.layer(), win.size_px(), device)?;
     // Show the window the way the launcher asked: `open -j` starts wushang hidden, and then it
     // stays out of the way and isn't zoomed. The layer already has its size, so a window that
     // starts hidden still gets full-size drawables.

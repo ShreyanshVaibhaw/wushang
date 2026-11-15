@@ -64,16 +64,6 @@ const FLIGHTS: usize = 2;
 /// The largest texture Apple's GPUs take; a frame bigger than this is skipped.
 const MAX_TEXTURE: u32 = 16384;
 
-/// Metal needs no lock around the decoder: VideoToolbox and the renderer share only finished
-/// IOSurfaces. Kept so the shell's code keeps the shape it has on Windows.
-pub struct DeviceLock;
-
-impl DeviceLock {
-    pub fn from_hw(_hw: &crate::player::HwDevice) -> Option<Self> {
-        None
-    }
-}
-
 /// The GPU for decoding, video and the interface.
 pub fn create_device() -> Result<Device> {
     Ok(MTLCreateSystemDefaultDevice().ok_or("no Metal device")?)
@@ -187,12 +177,9 @@ impl Flight {
 }
 
 impl Renderer {
-    pub fn new(
-        layer: Retained<CAMetalLayer>,
-        size: (u32, u32),
-        device: Device,
-        _lock: Option<DeviceLock>,
-    ) -> Result<Self> {
+    /// Metal needs no lock around the decoder, as Direct3D did on Windows: VideoToolbox and the
+    /// renderer share only finished IOSurfaces.
+    pub fn new(layer: Retained<CAMetalLayer>, size: (u32, u32), device: Device) -> Result<Self> {
         let mut gpu = Gpu::new(device)?;
         // Both outputs' pipelines now, so the first frame and the first HDR one don't stall.
         gpu.pipelines(MTLPixelFormat::BGR10A2Unorm)?;
