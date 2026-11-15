@@ -1907,9 +1907,11 @@ fn answer(shared: &(Mutex<DirSearch>, Condvar), ask: Ask) {
     let mut s = shared.0.lock().unwrap();
     s.asking.remove(&ask);
     // A caller waiting shows this answer itself. A page shown before it came shows the answer
-    // before, or none: a folder still loading, or a path taken to be there.
-    let differs = s.answers.get(&ask).is_none_or(|(old, _)| *old != new);
-    s.changed |= differs && !s.waiting.contains(&ask);
+    // before, or none: a folder still loading, or a path taken to be there. A page may show
+    // the answer before even when another caller (a play queue) waited for this one.
+    let old = s.answers.get(&ask);
+    let differs = old.is_none_or(|(old, _)| *old != new);
+    s.changed |= differs && (old.is_some() || !s.waiting.contains(&ask));
     s.answers.insert(ask, (new, std::time::Instant::now()));
     if s.answers.len() > MAX_ANSWERS {
         let oldest = (s.answers.iter())
@@ -2194,9 +2196,16 @@ mod tests {
         assert_eq!(lib.media_in(&place), [show.join("E01.mkv")]);
         tmp.touch("Show/E02.mkv");
         lib.media_dirs.age_answers();
+        lib.media_dirs.settle();
+        _ = lib.media_folders_changed();
         assert_eq!(
             lib.media_in(&place),
             [show.join("E01.mkv"), show.join("E02.mkv")]
+        );
+        // The page that showed the old listing is redone too.
+        assert!(
+            lib.media_folders_changed(),
+            "the page keeps the old listing"
         );
     }
 
