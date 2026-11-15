@@ -254,7 +254,16 @@ impl Ui {
             return;
         };
         match (target, d.from) {
-            (Some(Drop::Into(zone, index)), from) => st.draft.place(d.item, from, zone, index),
+            (Some(Drop::Into(zone, index)), from) => {
+                // A drop the window has no room for is refused: the bar would leave an item out
+                // of every group, where Customize could neither show it nor take it back.
+                let (w, h) = (self.layout.width, self.layout.height);
+                let mut moved = st.draft.clone();
+                moved.place(d.item, from, zone, index);
+                if toolbar::left_out(&moved, w, h) <= toolbar::left_out(&st.draft, w, h) {
+                    st.draft = moved;
+                }
+            }
             (Some(Drop::Remove), Some((zone, index))) => st.draft.remove(zone, index),
             _ => {}
         }
@@ -487,6 +496,44 @@ mod tests {
                 .iter()
                 .all(|(i, _)| !matches!(i, Item::Play | Item::Queue))
         );
+    }
+
+    /// A drop the window has no room for is refused: the bar would leave the item out of every
+    /// group, where Customize could neither show it nor take it back.
+    #[test]
+    fn a_drop_with_no_room_is_refused() {
+        let mut ui = Ui::new();
+        ui.open_customize();
+        let lay = |ui: &mut Ui| {
+            let st = ui.customize.as_ref().unwrap();
+            let mut layout = Layout::player(800.0, 450.0, true, false, &st.draft);
+            layout.add_customize(st);
+            ui.layout = layout;
+        };
+        lay(&mut ui);
+        // Keep dropping palette items at the left group's end until the window refuses one.
+        let mut refused = false;
+        for _ in 0..20 {
+            let st = ui.customize.as_ref().unwrap();
+            let (Some(&item), before) = (
+                st.draft.palette().iter().find(|i| !i.repeats()),
+                st.draft.clone(),
+            ) else {
+                break;
+            };
+            let zone = ui.layout.tools.zones[ZONES.iter().position(|z| *z == Zone::Left).unwrap()];
+            ui.customize_down(Target::Palette(item), 0.0, 0.0);
+            ui.customize_drop(zone.l + 1.0, (zone.t + zone.b) / 2.0);
+            let st = ui.customize.as_ref().unwrap();
+            let left_out = toolbar::left_out(&st.draft, 800.0, 450.0);
+            assert_eq!(left_out, 0, "every item placed is on the bar");
+            if st.draft == before {
+                refused = true;
+                break;
+            }
+            lay(&mut ui);
+        }
+        assert!(refused, "the window ran out of room");
     }
 
     #[test]

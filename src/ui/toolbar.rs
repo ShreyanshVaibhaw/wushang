@@ -507,6 +507,15 @@ fn fit(t: &Toolbar, w: f32) -> Toolbar {
     }
 }
 
+/// How many of `t`'s items a window `w` by `h` has no room for.
+pub fn left_out(t: &Toolbar, w: f32, h: f32) -> usize {
+    let all: usize = [&t.title, &t.left, &t.center, &t.right]
+        .iter()
+        .map(|g| g.len())
+        .sum();
+    all - layout(t, w, h).placed.len()
+}
+
 pub fn layout(t: &Toolbar, w: f32, h: f32) -> Bars {
     let t = &fit(t, w);
     let tall = !t.center.is_empty();
