@@ -1975,7 +1975,7 @@ fn walk(dir: &Path, depth: usize, folders: &mut Folders, found: &mut impl FnMut(
 }
 
 /// Case-insensitive order with digit runs compared as numbers, so "E2" sorts before "E10".
-fn natural_cmp(a: &str, b: &str) -> Ordering {
+pub fn natural_cmp(a: &str, b: &str) -> Ordering {
     let (mut x, mut y) = (a.chars().peekable(), b.chars().peekable());
     let digits = |it: &mut std::iter::Peekable<std::str::Chars>| {
         let mut s = String::new();

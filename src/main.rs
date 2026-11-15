@@ -3324,7 +3324,7 @@ fn add_subtitle_to(app: &mut App, path: &Path, subs: PathBuf) {
 fn play_playlist(app: &mut App, name: &str, shuffle: bool) {
     let mut items = app.library.playlist_items(name);
     if shuffle {
-        shuffle_in_place(&mut items);
+        queue::shuffle(&mut items);
     }
     let Some(first) = items.first().cloned() else {
         return;
@@ -3332,20 +3332,6 @@ fn play_playlist(app: &mut App, name: &str, shuffle: bool) {
     app.mark_playlist(name);
     if app.play(&first, items) {
         show_player();
-    }
-}
-
-/// Fisher-Yates with a xorshift seeded from the clock; good enough for a play order.
-fn shuffle_in_place<T>(items: &mut [T]) {
-    let mut x = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(1, |d| d.as_nanos() as u64)
-        | 1;
-    for i in (1..items.len()).rev() {
-        x ^= x << 13;
-        x ^= x >> 7;
-        x ^= x << 17;
-        items.swap(i, (x % (i as u64 + 1)) as usize);
     }
 }
 

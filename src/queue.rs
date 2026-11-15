@@ -47,9 +47,6 @@ impl Queue {
                 items.len() - 1
             }
         });
-        let seed = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_or(0, |d| d.as_nanos() as u64);
         Queue {
             items,
             current,
@@ -57,7 +54,7 @@ impl Queue {
             shuffle: false,
             order: Vec::new(),
             gap: None,
-            rng: seed | 1,
+            rng: seed(),
         }
     }
 
@@ -174,31 +171,9 @@ impl Queue {
             if self.shuffle {
                 let from = self.current.and_then(|c| self.pos(c)).map_or(0, |p| p + 1);
                 let span = (self.order.len() - from + 1) as u64;
-                let at = from + (self.random() % span) as usize;
+                let at = from + (xorshift(&mut self.rng) % span) as usize;
                 self.order.insert(at, self.items.len() - 1);
             }
-        }
-    }
-
-    /// Inserts `paths` right after the current item (at the start when nothing plays), in the
-    /// list and in play order, so they play next.
-    #[cfg(test)]
-    pub fn insert_next(&mut self, paths: impl IntoIterator<Item = PathBuf>) {
-        let paths: Vec<PathBuf> = paths.into_iter().collect();
-        let k = paths.len();
-        if k == 0 {
-            return;
-        }
-        let at = self.current.map_or(self.gap.unwrap_or(0), |c| c + 1);
-        let at = at.min(self.items.len());
-        self.remap(|i| if i >= at { i + k } else { i });
-        self.items.splice(at..at, paths);
-        if self.shuffle {
-            let pos = match self.current.and_then(|c| self.pos(c)) {
-                Some(p) => p + 1,
-                None => self.gap.unwrap_or(0).min(self.order.len()),
-            };
-            self.order.splice(pos..pos, at..at + k);
         }
     }
 
@@ -271,14 +246,16 @@ impl Queue {
 
     /// Sorts by file name in natural order ("E2" before "E10"); the current item stays current.
     pub fn sort_by_name(&mut self) {
-        let name = |p: &PathBuf| {
-            p.file_name()
-                .unwrap_or(p.as_os_str())
-                .to_string_lossy()
-                .to_lowercase()
-        };
+        let names: Vec<String> = (self.items.iter())
+            .map(|p| {
+                p.file_name()
+                    .unwrap_or(p.as_os_str())
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
         let mut idx: Vec<usize> = (0..self.items.len()).collect();
-        idx.sort_by(|&a, &b| natural_cmp(&name(&self.items[a]), &name(&self.items[b])));
+        idx.sort_by(|&a, &b| crate::library::natural_cmp(&names[a], &names[b]));
         // idx[new] = old, so invert it for the old -> new mapping.
         let mut new_of = vec![0; idx.len()];
         for (new, &old) in idx.iter().enumerate() {
@@ -307,10 +284,7 @@ impl Queue {
         let mut rest: Vec<usize> = (0..self.items.len())
             .filter(|&i| Some(i) != self.current)
             .collect();
-        for i in (1..rest.len()).rev() {
-            let j = (self.random() % (i as u64 + 1)) as usize;
-            rest.swap(i, j);
-        }
+        fisher_yates(&mut rest, &mut self.rng);
         self.order.extend(self.current);
         self.order.extend(rest);
     }
@@ -362,49 +336,34 @@ impl Queue {
             *o = f(*o);
         }
     }
+}
 
-    fn random(&mut self) -> u64 {
-        let mut x = self.rng;
-        x ^= x << 13;
-        x ^= x >> 7;
-        x ^= x << 17;
-        self.rng = x;
-        x
+/// A seed for `fisher_yates` from the clock; never zero, which xorshift can't leave.
+fn seed() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos() as u64)
+        | 1
+}
+
+/// The next number from xorshift state `rng`, which it moves on.
+fn xorshift(rng: &mut u64) -> u64 {
+    *rng ^= *rng << 13;
+    *rng ^= *rng >> 7;
+    *rng ^= *rng << 17;
+    *rng
+}
+
+/// Shuffles `items` in place with numbers from `rng`.
+fn fisher_yates<T>(items: &mut [T], rng: &mut u64) {
+    for i in (1..items.len()).rev() {
+        items.swap(i, (xorshift(rng) % (i as u64 + 1)) as usize);
     }
 }
 
-/// Compares with runs of digits as numbers, so "e2" sorts before "e10".
-fn natural_cmp(a: &str, b: &str) -> std::cmp::Ordering {
-    let (mut a, mut b) = (a.chars().peekable(), b.chars().peekable());
-    loop {
-        match (a.peek().copied(), b.peek().copied()) {
-            (None, None) => return std::cmp::Ordering::Equal,
-            (None, _) => return std::cmp::Ordering::Less,
-            (_, None) => return std::cmp::Ordering::Greater,
-            (Some(x), Some(y)) if x.is_ascii_digit() && y.is_ascii_digit() => {
-                let number = |it: &mut std::iter::Peekable<std::str::Chars>| {
-                    let mut digits = String::new();
-                    while let Some(c) = it.peek().filter(|c| c.is_ascii_digit()) {
-                        digits.push(*c);
-                        it.next();
-                    }
-                    let trimmed = digits.trim_start_matches('0').to_owned();
-                    (trimmed.len(), trimmed)
-                };
-                let (na, nb) = (number(&mut a), number(&mut b));
-                if na != nb {
-                    return na.cmp(&nb);
-                }
-            }
-            (Some(x), Some(y)) => {
-                if x != y {
-                    return x.cmp(&y);
-                }
-                a.next();
-                b.next();
-            }
-        }
-    }
+/// Shuffles `items` in place, as a shuffled queue orders its items: a playlist's Shuffle.
+pub fn shuffle<T>(items: &mut [T]) {
+    fisher_yates(items, &mut seed());
 }
 
 #[cfg(test)]
@@ -608,25 +567,6 @@ mod tests {
         sorted.sort();
         assert_eq!(sorted, (0..7).collect::<Vec<_>>());
         assert_eq!(q.order[0], 1, "the current item stays first");
-    }
-
-    #[test]
-    fn insert_next_plays_next() {
-        let mut q = queue("b");
-        q.insert_next(paths(&["x", "y"]));
-        assert_eq!(names(&q), ["a", "b", "x", "y", "c", "d"]);
-        assert_eq!(q.current(), Some(1));
-        assert_eq!(name(q.next()).as_deref(), Some("x"));
-
-        let mut q = queue("b");
-        q.toggle_shuffle();
-        q.insert_next(paths(&["x"]));
-        assert_eq!(name(q.next()).as_deref(), Some("x"));
-        assert_eq!(q.order.len(), 5);
-
-        let mut q = Queue::new(paths(&["a"]), None);
-        q.insert_next(paths(&["x"]));
-        assert_eq!(names(&q), ["x", "a"]);
     }
 
     #[test]
