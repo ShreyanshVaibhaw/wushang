@@ -145,15 +145,59 @@ fn save(release: &Release) -> Result<Saved, String> {
     let timeout = Duration::from_secs(60);
     let bytes = net::fetch(&release.zip, timeout, DOWNLOAD_DEADLINE, MAX_DOWNLOAD)
         .map_err(|e| format!("Can't download the update: {e}"))?;
-    fs::create_dir_all(&dir).map_err(|e| format!("Can't save the update: {e}"))?;
-    // Named from the version, which is only digits and dots, never from the address.
-    let path = dir.join(format!("wushang-{}{suffix}", release.version));
-    fs::write(&path, bytes).map_err(|e| format!("Can't save the update: {e}"))?;
+    let path = write_download(&dir, release, suffix, &bytes)?;
     // Finder opens on Downloads with the file selected, as Explorer did on Windows.
     if let Err(e) = Command::new("/usr/bin/open").arg("-R").arg(&path).spawn() {
         eprintln!("update: can't show the download in Finder: {e}");
     }
     Ok(Saved::Zip(path))
+}
+
+/// Saves the downloaded `bytes` of `release` in `dir`.
+fn write_download(
+    dir: &std::path::Path,
+    release: &Release,
+    suffix: &str,
+    bytes: &[u8],
+) -> Result<PathBuf, String> {
+    fs::create_dir_all(dir).map_err(|e| format!("Can't save the update: {e}"))?;
+    // Named from the version, which is only digits and dots, never from the address.
+    let path = dir.join(format!("wushang-{}{suffix}", release.version));
+    fs::write(&path, bytes).map_err(|e| format!("Can't save the update: {e}"))?;
+    // An image Gatekeeper wouldn't check is not left behind.
+    if let Err(e) = quarantine(&path, &release.zip) {
+        _ = fs::remove_file(&path);
+        return Err(e);
+    }
+    Ok(path)
+}
+
+/// Marks `path` as downloaded from `origin`, as a browser does, so Gatekeeper checks the app
+/// dragged out of it before it first runs. Without the mark nothing checks it. Launch Services
+/// writes the `com.apple.quarantine` attribute in the format the system reads.
+fn quarantine(path: &std::path::Path, origin: &str) -> Result<(), String> {
+    use objc2::runtime::AnyObject;
+    use objc2_foundation::{NSDictionary, NSString, NSURL, NSURLQuarantinePropertiesKey};
+    // The values of Launch Services' kLSQuarantine... constants.
+    let keys = [
+        &*NSString::from_str("LSQuarantineAgentName"),
+        &*NSString::from_str("LSQuarantineType"),
+        &*NSString::from_str("LSQuarantineDataURL"),
+    ];
+    let agent = NSString::from_str("wushang");
+    let kind = NSString::from_str("LSQuarantineTypeWebDownload");
+    let source = NSURL::URLWithString(&NSString::from_str(origin))
+        .ok_or_else(|| "Can't mark the update as downloaded: bad address".to_owned())?;
+    let values: [&AnyObject; 3] = [&agent, &kind, &source];
+    let properties = NSDictionary::from_slices(&keys, &values);
+    let url = NSURL::fileURLWithPath(&NSString::from_str(&path.to_string_lossy()));
+    unsafe { url.setResourceValue_forKey_error(Some(&properties), NSURLQuarantinePropertiesKey) }
+        .map_err(|e| {
+            format!(
+                "Can't mark the update as downloaded: {}",
+                e.localizedDescription()
+            )
+        })
 }
 
 /// Would run a downloaded installer once wushang exits; macOS updates have none.
@@ -175,6 +219,47 @@ mod tests {
         {"name":"w","browser_download_url":"https://github.com/ShreyanshVaibhaw/wushang/releases/download/v1.2.0/wushang-1.2.0-windows-x64.zip"},
         {"name":"z","browser_download_url" : "https:\/\/github.com\/ShreyanshVaibhaw\/wushang\/releases\/download\/v1.2.0\/wushang-1.2.0-macos-arm64.zip"},
         {"name":"d","browser_download_url":"https://github.com/ShreyanshVaibhaw/wushang/releases/download/v1.2.0/wushang-1.2.0-macos-arm64.dmg"}]}"#;
+
+    /// The `com.apple.quarantine` attribute of `path`, if it has one.
+    fn quarantine_of(path: &std::path::Path) -> Option<String> {
+        use std::os::unix::ffi::OsStrExt;
+        let path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        let name = c"com.apple.quarantine";
+        let mut value = [0u8; 256];
+        let n = unsafe {
+            libc::getxattr(
+                path.as_ptr(),
+                name.as_ptr(),
+                value.as_mut_ptr().cast(),
+                value.len(),
+                0,
+                0,
+            )
+        };
+        (n >= 0).then(|| String::from_utf8_lossy(&value[..n as usize]).into_owned())
+    }
+
+    /// Gatekeeper checks an app only when the file it came in is quarantined, as a browser's
+    /// downloads are; without the attribute, the app dragged out of the image is never
+    /// checked.
+    #[test]
+    fn the_saved_download_is_quarantined() {
+        let dir = std::env::temp_dir().join("wushang-update-quarantine");
+        _ = fs::remove_dir_all(&dir);
+        let release = newer(JSON, "1.0.0").unwrap();
+        let path = write_download(&dir, &release, DMG_SUFFIX, b"image").unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"image");
+        let value = quarantine_of(&path).expect("no quarantine attribute");
+        // flags;time;agent;event, all hex but the agent, with the download flag set. macOS
+        // names the agent from the app's bundle, which a test binary hasn't got.
+        let fields: Vec<&str> = value.split(';').collect();
+        let hex = |s: &str| u64::from_str_radix(s, 16).ok();
+        assert!(
+            fields.len() == 4 && hex(fields[0]).is_some_and(|f| f & 1 != 0),
+            "{value}"
+        );
+        assert!(hex(fields[1]).is_some(), "{value}");
+    }
 
     #[test]
     fn a_newer_release_is_offered_with_its_disk_image() {
