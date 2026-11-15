@@ -1006,11 +1006,20 @@ fn params(colors: &Colors, planes: &Planes, adjust: &VideoAdjust) -> Params {
         planes.chroma.height() < planes.luma.height(),
     );
     let shift = |on: bool, s: f32, size: usize| if on { s / size as f32 } else { 0.0 };
+    // An odd luma size has a chroma plane of half of one more, whose last sample covers only one
+    // luma pixel, so the chroma plane reaches half a luma pixel further and its uv is scaled.
+    let scale = |on: bool, luma: usize, chroma: usize| {
+        if on {
+            luma as f32 / (2 * chroma) as f32
+        } else {
+            1.0
+        }
+    };
     let chroma_at = [
         shift(subsampled.0, colors.siting.0, planes.chroma.width()),
         shift(subsampled.1, colors.siting.1, planes.chroma.height()),
-        0.0,
-        0.0,
+        scale(subsampled.0, planes.luma.width(), planes.chroma.width()),
+        scale(subsampled.1, planes.luma.height(), planes.chroma.height()),
     ];
     let level = |l: f32| l.clamp(-1.0, 1.0);
     // Contrast and saturation are gains up to 2x, like VLC's adjust filter; brightness adds up to
@@ -1700,6 +1709,46 @@ mod tests {
             w,
             |i| exact(ten(SWATCHES[i]), (0.2126, 0.0722), false, 10),
             1.0,
+        );
+    }
+
+    /// An odd width or height has a chroma plane of half of one more, whose last sample covers
+    /// the one luma pixel left over. Each chroma sample alternates between two colours, sited
+    /// top-left, so the luma pixel it sits on shows that colour unmixed, out to the edges.
+    #[test]
+    fn odd_sizes_keep_chroma_on_its_luma() {
+        let mut gpu = gpu();
+        let pair = [SWATCHES[4], SWATCHES[5]];
+        let (w, h) = (33, 17);
+        let mut frame = nv12(w, h, |x, y| pair[((x / 2 + y / 2) % 2) as usize]);
+        frame.set_color_space(ff::color::Space::BT709);
+        unsafe {
+            (*frame.as_mut_ptr()).chroma_location = ffi::AVChromaLocation::AVCHROMA_LOC_TOPLEFT
+        };
+        let out = draw(&mut gpu, &frame, &VideoAdjust::default(), None);
+        let mut worst = (0f32, 0, 0);
+        for y in (0..h).step_by(2) {
+            for x in (0..w).step_by(2) {
+                let got = out[(y * w + x) as usize];
+                let want = exact(
+                    pair[((x / 2 + y / 2) % 2) as usize],
+                    (0.2126, 0.0722),
+                    false,
+                    8,
+                );
+                let off = (0..3)
+                    .map(|c| (got[c] - want[c]).abs() * 255.0)
+                    .fold(0.0, f32::max);
+                if off > worst.0 {
+                    worst = (off, x, y);
+                }
+            }
+        }
+        assert!(
+            worst.0 <= 2.0,
+            "{} levels off at {:?}",
+            worst.0,
+            (worst.1, worst.2)
         );
     }
 

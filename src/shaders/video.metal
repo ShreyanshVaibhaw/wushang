@@ -32,7 +32,8 @@ struct Params {
     /// Samples to Y (0 black, 1 white) and Cb, Cr (-0.5..0.5): sample * scale - offset.
     float4 scale;
     float4 offset;
-    /// xy: where the chroma plane is read, relative to the luma position, in its uv.
+    /// Where the chroma plane is read: the luma position's uv times zw, plus xy. zw is 1 except
+    /// for a subsampled odd size, whose chroma plane reaches half a luma pixel past the luma's.
     float4 chroma;
     /// Rows of the YCbCr to R'G'B' matrix.
     float4 matrix[3];
@@ -100,7 +101,7 @@ fragment float4 video(Varyings in [[stage_in]],
                       sampler linear [[sampler(0)]],
                       constant Params &p [[buffer(0)]]) {
     float y = luma.sample(linear, in.uv).r;
-    float2 c = chroma.sample(linear, in.uv + p.chroma.xy).rg;
+    float2 c = chroma.sample(linear, in.uv * p.chroma.zw + p.chroma.xy).rg;
     float3 ycc = float3(y, c) * p.scale.xyz - p.offset.xyz;
 
     // VLC's adjust filter: contrast and brightness on luma, hue and saturation on chroma.
