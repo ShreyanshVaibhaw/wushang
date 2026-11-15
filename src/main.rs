@@ -48,9 +48,9 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use d2d::{
-    IDC_HAND, IDC_IBEAM, VIRTUAL_KEY, VK_1, VK_8, VK_9, VK_BACK, VK_D, VK_DELETE, VK_DOWN, VK_END,
-    VK_ESCAPE, VK_F, VK_F1, VK_HOME, VK_I, VK_LEFT, VK_M, VK_N, VK_O, VK_OEM_4, VK_OEM_5, VK_OEM_6,
-    VK_OEM_COMMA, VK_P, VK_Q, VK_R, VK_RETURN, VK_RIGHT, VK_S, VK_SPACE, VK_T, VK_TAB, VK_UP, VK_W,
+    IDC_HAND, IDC_IBEAM, VIRTUAL_KEY, VK_1, VK_8, VK_9, VK_BACK, VK_D, VK_DOWN, VK_ESCAPE, VK_F,
+    VK_F1, VK_I, VK_LEFT, VK_M, VK_N, VK_O, VK_OEM_4, VK_OEM_5, VK_OEM_6, VK_OEM_COMMA, VK_P, VK_Q,
+    VK_R, VK_RETURN, VK_RIGHT, VK_S, VK_SPACE, VK_T, VK_TAB, VK_UP, VK_W,
 };
 use ffmpeg_next as ff;
 use platform::{Event, Rect, Window};
@@ -3945,37 +3945,17 @@ fn on_event(event: Event) {
             alt,
         } => {
             let typing = UI.with_borrow(|ui| ui.dialog.is_some() || ui.preferences.is_some());
-            if alt {
-                // Option + Left/Right is Alt's very short skip; in a text field it moves by
-                // words and Option + Backspace deletes one, as on macOS. Other Option keys type
+            if alt && !typing {
+                // Option + Left/Right is Alt's very short skip. Other Option keys type
                 // characters, as Alt keys on Windows did nothing here.
-                let word = matches!(key, VK_LEFT | VK_RIGHT | VK_BACK | VK_DELETE);
-                if typing && word {
-                    on_key(win, shared, key, shift, true);
-                } else if matches!(key, VK_LEFT | VK_RIGHT)
-                    && !typing
-                    && !UI.with_borrow(|ui| ui.menu.is_open())
-                {
+                if matches!(key, VK_LEFT | VK_RIGHT) && !UI.with_borrow(|ui| ui.menu.is_open()) {
                     let skip = f64::from(PREFS.with_borrow(|p| p.skip[0]));
                     shared.seek_by(if key == VK_LEFT { -skip } else { skip });
-                } else if typing {
-                    // The key of a character Option types, which opens a dialog's typing gate.
-                    on_key(win, shared, key, shift, false);
                 } else {
                     return;
                 }
-            } else if typing && ctrl && matches!(key, VK_LEFT | VK_RIGHT | VK_BACK) {
-                // Command + Left/Right go to the field's start and end, and Command +
-                // Backspace deletes back to the start, as on macOS.
-                if key == VK_BACK {
-                    on_key(win, shared, VK_HOME, true, false);
-                    on_key(win, shared, VK_BACK, false, false);
-                } else {
-                    let to = if key == VK_LEFT { VK_HOME } else { VK_END };
-                    on_key(win, shared, to, shift, false);
-                }
             } else {
-                on_key(win, shared, key, shift, ctrl);
+                on_key(win, shared, key, shift, ctrl, alt);
             }
             UI.with_borrow_mut(|ui| {
                 ui.wake();
@@ -4316,8 +4296,9 @@ fn videos_folder(library: &Library) -> String {
         .map_or_else(|| "No folder yet".to_owned(), |p| p.display().to_string())
 }
 
-/// A key down, with Shift and Ctrl (Command, or Control) as held when it was pressed.
-fn on_key(win: Window, shared: &Shared, key: VIRTUAL_KEY, shift: bool, ctrl: bool) {
+/// A key down, with Shift, Ctrl (Command, or Control) and Alt (Option) as held when it was
+/// pressed. Only the text fields read Alt.
+fn on_key(win: Window, shared: &Shared, key: VIRTUAL_KEY, shift: bool, ctrl: bool, alt: bool) {
     let (skip, volume_step) = PREFS.with_borrow(|p| (p.skip, p.volume_step));
     let step = f64::from(match (ctrl, shift) {
         (true, _) => skip[3],
@@ -4328,7 +4309,7 @@ fn on_key(win: Window, shared: &Shared, key: VIRTUAL_KEY, shift: bool, ctrl: boo
     let page = UI.with_borrow(|ui| ui.page);
     // An open dialog takes every key, then the Settings window.
     if UI.with_borrow(|ui| ui.dialog.is_some()) {
-        let action = UI.with_borrow_mut(|ui| ui.dialog_key(key, shift, ctrl));
+        let action = UI.with_borrow_mut(|ui| ui.dialog_key(key, shift, ctrl, alt));
         act(win, shared, action);
         return;
     }
@@ -4343,7 +4324,7 @@ fn on_key(win: Window, shared: &Shared, key: VIRTUAL_KEY, shift: bool, ctrl: boo
         return;
     }
     if UI.with_borrow(|ui| ui.preferences.is_some()) {
-        UI.with_borrow_mut(|ui| ui.preferences_key(key, shift, ctrl));
+        UI.with_borrow_mut(|ui| ui.preferences_key(key, shift, ctrl, alt));
         return;
     }
     // An open menu takes the keyboard.

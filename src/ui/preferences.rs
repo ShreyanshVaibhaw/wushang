@@ -11,7 +11,7 @@
 
 use std::time::Instant;
 
-use super::dialog::TextField;
+use super::dialog::{Reach, TextField};
 use super::*;
 use crate::dsp::EQ_PRESETS;
 use crate::prefs::{self, Choices, Prefs};
@@ -1295,9 +1295,10 @@ impl Ui {
         self.prefs_changed()
     }
 
-    /// A key while the window is open: typing searches, Esc closes the list, then clears the
-    /// search, then closes the window.
-    pub fn preferences_key(&mut self, key: VIRTUAL_KEY, shift: bool, ctrl: bool) {
+    /// A key while the window is open, with Command (or Control) as `cmd` and Option as
+    /// `alt`: typing searches, Esc closes the list, then clears the search, then closes the
+    /// window.
+    pub fn preferences_key(&mut self, key: VIRTUAL_KEY, shift: bool, cmd: bool, alt: bool) {
         let Some(st) = self.preferences.as_mut() else {
             return;
         };
@@ -1312,13 +1313,13 @@ impl Ui {
                 st.scroll = 0.0;
             }
             VK_ESCAPE => self.close_preferences(),
-            VK_LEFT => f.left(shift, ctrl),
-            VK_RIGHT => f.right(shift, ctrl),
+            VK_LEFT => f.left(shift, Reach::of(cmd, alt)),
+            VK_RIGHT => f.right(shift, Reach::of(cmd, alt)),
             VK_HOME => f.move_to(0, shift),
             VK_END => f.move_to(usize::MAX, shift),
-            VK_BACK => f.backspace(ctrl),
-            VK_DELETE => f.delete(ctrl),
-            VK_A if ctrl => f.select_all(),
+            VK_BACK => f.backspace(Reach::of(cmd, alt)),
+            VK_DELETE => f.delete(Reach::of(cmd, alt)),
+            VK_A if cmd => f.select_all(),
             _ => return,
         }
         if let Some(st) = self.preferences.as_mut() {

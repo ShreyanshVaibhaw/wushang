@@ -166,6 +166,26 @@ const SHORTCUTS: [(&str, &str); 30] = [
     ("Q, ⌘Q", "Quit"),
 ];
 
+/// How far an arrow, Backspace or Delete reaches in a text field: a character, a word (with
+/// Option) or the rest of the line (with Command), as in any macOS field.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Reach {
+    Char,
+    Word,
+    Line,
+}
+
+impl Reach {
+    /// What the held keys make it; Command (or Control) wins over Option.
+    pub fn of(cmd: bool, alt: bool) -> Reach {
+        match (cmd, alt) {
+            (true, _) => Reach::Line,
+            (false, true) => Reach::Word,
+            (false, false) => Reach::Char,
+        }
+    }
+}
+
 /// A single-line text field's text, caret and selection. Positions are byte offsets on char
 /// boundaries; the selection runs between `anchor` and `caret`.
 #[derive(Clone, Debug, PartialEq)]
@@ -228,7 +248,25 @@ impl TextField {
             .map_or(i, |c| i + c.len_utf8())
     }
 
-    /// The start of the word before `i`, skipping spaces first, like Ctrl+Left.
+    /// Where `reach` from `i` ends, going back.
+    fn before(&self, i: usize, reach: Reach) -> usize {
+        match reach {
+            Reach::Char => self.prev(i),
+            Reach::Word => self.word_left(i),
+            Reach::Line => 0,
+        }
+    }
+
+    /// Where `reach` from `i` ends, going forward.
+    fn after(&self, i: usize, reach: Reach) -> usize {
+        match reach {
+            Reach::Char => self.next(i),
+            Reach::Word => self.word_right(i),
+            Reach::Line => self.text.len(),
+        }
+    }
+
+    /// The start of the word before `i`, skipping spaces first, like Option+Left.
     fn word_left(&self, mut i: usize) -> usize {
         while i > 0 && self.text[..i].ends_with(char::is_whitespace) {
             i = self.prev(i);
@@ -239,7 +277,7 @@ impl TextField {
         i
     }
 
-    /// The start of the next word after `i`, like Ctrl+Right.
+    /// The start of the next word after `i`, like Option+Right.
     fn word_right(&self, mut i: usize) -> usize {
         let at = |i: usize| self.text[i..].chars().next();
         while at(i).is_some_and(|c| !c.is_whitespace()) {
@@ -274,26 +312,18 @@ impl TextField {
         self.anchor = self.caret;
     }
 
-    /// Deletes the selection, else the character (or word) before the caret.
-    pub fn backspace(&mut self, word: bool) {
+    /// Deletes the selection, else `reach` before the caret.
+    pub fn backspace(&mut self, reach: Reach) {
         if self.anchor == self.caret {
-            self.anchor = if word {
-                self.word_left(self.caret)
-            } else {
-                self.prev(self.caret)
-            };
+            self.anchor = self.before(self.caret, reach);
         }
         self.insert("");
     }
 
-    /// Deletes the selection, else the character (or word) after the caret.
-    pub fn delete(&mut self, word: bool) {
+    /// Deletes the selection, else `reach` after the caret.
+    pub fn delete(&mut self, reach: Reach) {
         if self.anchor == self.caret {
-            self.anchor = if word {
-                self.word_right(self.caret)
-            } else {
-                self.next(self.caret)
-            };
+            self.anchor = self.after(self.caret, reach);
         }
         self.insert("");
     }
@@ -311,20 +341,18 @@ impl TextField {
     }
 
     /// Left arrow: a selection collapses to its start, else the caret moves.
-    pub fn left(&mut self, extend: bool, word: bool) {
-        let to = match (extend, word) {
-            (false, false) if self.anchor != self.caret => self.selection().start,
-            (_, true) => self.word_left(self.caret),
-            _ => self.prev(self.caret),
+    pub fn left(&mut self, extend: bool, reach: Reach) {
+        let to = match (extend, reach) {
+            (false, Reach::Char) if self.anchor != self.caret => self.selection().start,
+            _ => self.before(self.caret, reach),
         };
         self.move_to(to, extend);
     }
 
-    pub fn right(&mut self, extend: bool, word: bool) {
-        let to = match (extend, word) {
-            (false, false) if self.anchor != self.caret => self.selection().end,
-            (_, true) => self.word_right(self.caret),
-            _ => self.next(self.caret),
+    pub fn right(&mut self, extend: bool, reach: Reach) {
+        let to = match (extend, reach) {
+            (false, Reach::Char) if self.anchor != self.caret => self.selection().end,
+            _ => self.after(self.caret, reach),
         };
         self.move_to(to, extend);
     }
@@ -342,6 +370,36 @@ impl TextField {
         }
         self.insert("");
         Some(s)
+    }
+
+    /// An editing key, with Command (or Control) as `cmd` and Option as `alt`: the arrows,
+    /// Home, End, Backspace and Delete, and Command+A, C, X and V. True when it changed the
+    /// text, caret or selection.
+    pub fn key(&mut self, key: VIRTUAL_KEY, shift: bool, cmd: bool, alt: bool) -> bool {
+        let reach = Reach::of(cmd, alt);
+        match key {
+            VK_LEFT => self.left(shift, reach),
+            VK_RIGHT => self.right(shift, reach),
+            VK_HOME => self.move_to(0, shift),
+            VK_END => self.move_to(usize::MAX, shift),
+            VK_BACK => self.backspace(reach),
+            VK_DELETE => self.delete(reach),
+            VK_A if cmd => self.select_all(),
+            VK_C if cmd => {
+                if !self.selected().is_empty() {
+                    set_clipboard_text(self.selected());
+                }
+                return false;
+            }
+            VK_X if cmd => {
+                if let Some(s) = self.cut() {
+                    set_clipboard_text(&s);
+                }
+            }
+            VK_V if cmd => self.insert(&clipboard_text().unwrap_or_default()),
+            _ => return false,
+        }
+        true
     }
 }
 
@@ -463,32 +521,12 @@ impl State {
     }
 
     /// A key for the name field; true when it changed the text or caret.
-    fn field_key(&mut self, key: VIRTUAL_KEY, shift: bool, ctrl: bool) -> bool {
-        let f = &mut self.field;
-        match key {
-            VK_LEFT => f.left(shift, ctrl),
-            VK_RIGHT => f.right(shift, ctrl),
-            VK_HOME => f.move_to(0, shift),
-            VK_END => f.move_to(usize::MAX, shift),
-            VK_BACK => f.backspace(ctrl),
-            VK_DELETE => f.delete(ctrl),
-            VK_A if ctrl => f.select_all(),
-            VK_C if ctrl => {
-                if !f.selected().is_empty() {
-                    set_clipboard_text(f.selected());
-                }
-                return false;
-            }
-            VK_X if ctrl => {
-                if let Some(s) = f.cut() {
-                    set_clipboard_text(&s);
-                }
-            }
-            VK_V if ctrl => f.insert(&clipboard_text().unwrap_or_default()),
-            _ => return false,
+    fn field_key(&mut self, key: VIRTUAL_KEY, shift: bool, cmd: bool, alt: bool) -> bool {
+        let changed = self.field.key(key, shift, cmd, alt);
+        if changed {
+            self.edited();
         }
-        self.edited();
-        true
+        changed
     }
 
     /// After any edit or caret move: the caret shows, and an old error goes.
@@ -1251,9 +1289,15 @@ impl Ui {
         true
     }
 
-    /// A key for the open dialog: Esc closes, Enter is the primary button, the rest edit the
-    /// name field.
-    pub fn dialog_key(&mut self, key: VIRTUAL_KEY, shift: bool, ctrl: bool) -> Option<Action> {
+    /// A key for the open dialog, with Command (or Control) as `cmd` and Option as `alt`: Esc
+    /// closes, Enter is the primary button, the rest edit the name field.
+    pub fn dialog_key(
+        &mut self,
+        key: VIRTUAL_KEY,
+        shift: bool,
+        cmd: bool,
+        alt: bool,
+    ) -> Option<Action> {
         let d = self.dialog.as_mut()?;
         d.typing = true;
         match key {
@@ -1263,7 +1307,7 @@ impl Ui {
             }
             VK_RETURN => self.dialog_click(Target::Primary),
             _ => {
-                if d.has_field() && d.field_key(key, shift, ctrl) {
+                if d.has_field() && d.field_key(key, shift, cmd, alt) {
                     self.relayout = true;
                 }
                 None
@@ -1846,42 +1890,42 @@ mod tests {
     #[test]
     fn deleting_by_character_and_word() {
         let mut f = field("Road Trip 2", 11, 11);
-        f.backspace(false);
+        f.backspace(Reach::Char);
         assert_eq!(f.text, "Road Trip ");
-        f.backspace(true);
+        f.backspace(Reach::Word);
         assert_eq!((f.text.as_str(), f.caret()), ("Road ", 5));
         f.move_to(0, false);
-        f.delete(true);
+        f.delete(Reach::Word);
         assert_eq!(f.text, "");
-        f.backspace(false);
-        f.delete(false);
+        f.backspace(Reach::Char);
+        f.delete(Reach::Char);
         assert_eq!((f.text.as_str(), f.caret()), ("", 0));
 
         let mut f = field("añb", 1, 1);
-        f.delete(false);
+        f.delete(Reach::Char);
         assert_eq!(f.text, "ab");
         let mut f = field("añb", 3, 3);
-        f.backspace(false);
+        f.backspace(Reach::Char);
         assert_eq!((f.text.as_str(), f.caret()), ("ab", 1));
     }
 
     #[test]
     fn caret_moves_and_selects() {
         let mut f = field("one two three", 0, 0);
-        f.right(false, true);
+        f.right(false, Reach::Word);
         assert_eq!(f.caret(), 4);
-        f.right(true, true);
+        f.right(true, Reach::Word);
         assert_eq!(f.selected(), "two ");
-        f.left(true, false);
+        f.left(true, Reach::Char);
         assert_eq!(f.selected(), "two");
         // An arrow without Shift collapses the selection to its side.
-        f.left(false, false);
+        f.left(false, Reach::Char);
         assert_eq!((f.caret(), f.selected()), (4, ""));
         f.move_to(usize::MAX, true);
         assert_eq!(f.selected(), "two three");
-        f.right(false, false);
+        f.right(false, Reach::Char);
         assert_eq!(f.caret(), 13);
-        f.left(false, true);
+        f.left(false, Reach::Word);
         assert_eq!(f.caret(), 8);
         f.move_to(0, true);
         assert_eq!(f.selection(), 0..8);
@@ -1891,7 +1935,7 @@ mod tests {
         let mut f = field("ñ", 0, 0);
         f.move_to(1, false);
         assert_eq!(f.caret(), 0);
-        f.right(false, false);
+        f.right(false, Reach::Char);
         assert_eq!(f.caret(), 2);
     }
 
@@ -1975,13 +2019,38 @@ mod tests {
         );
     }
 
+    /// Command reaches the line's ends and Option a word, as in any macOS field.
+    #[test]
+    fn command_and_option_keys_follow_macos() {
+        let mut ui = Ui::new();
+        ui.open_dialog(Dialog::NewProfile);
+        let text = |ui: &Ui| ui.dialog.as_ref().unwrap().field.text.clone();
+        let caret = |ui: &Ui| ui.dialog.as_ref().unwrap().field.caret();
+        ui.dialog.as_mut().unwrap().field.insert("one two three");
+        ui.dialog_key(VK_LEFT, false, false, true);
+        assert_eq!(caret(&ui), 8, "Option+Left goes back a word");
+        ui.dialog_key(VK_BACK, false, false, true);
+        assert_eq!(text(&ui), "one three", "Option+Backspace deletes a word");
+        ui.dialog_key(VK_RIGHT, true, true, false);
+        assert_eq!(ui.dialog.as_ref().unwrap().field.selected(), "three");
+        ui.dialog_key(VK_LEFT, false, true, false);
+        assert_eq!(caret(&ui), 0, "Command+Left goes to the start");
+        ui.dialog_key(VK_DELETE, false, false, true);
+        assert_eq!(text(&ui), "three", "Option+Delete deletes a word");
+        ui.dialog_key(VK_RIGHT, false, false, false);
+        ui.dialog_key(VK_DELETE, false, true, false);
+        assert_eq!(text(&ui), "t", "Command+Delete deletes to the end");
+        ui.dialog_key(VK_BACK, false, true, false);
+        assert_eq!(text(&ui), "", "Command+Backspace deletes to the start");
+    }
+
     /// Shift+Delete is a forward delete, as in any macOS field, not Windows' cut.
     #[test]
     fn shift_delete_deletes_forward() {
         let mut d = State::new(Dialog::NewProfile);
         d.field.insert("ab");
         d.field.move_to(0, false);
-        assert!(d.field_key(VK_DELETE, true, false));
+        assert!(d.field_key(VK_DELETE, true, false, false));
         assert_eq!(d.field.text, "b");
     }
 
@@ -1994,7 +2063,7 @@ mod tests {
         ui.dialog_char(' ' as u32);
         assert_eq!(ui.dialog.as_ref().unwrap().field.text, "");
         // What the window sends for a dead key's second key: VK_PROCESSKEY, then "é".
-        ui.dialog_key(VIRTUAL_KEY(0xE5), false, false);
+        ui.dialog_key(VIRTUAL_KEY(0xE5), false, false, false);
         ui.dialog_char('é' as u32);
         assert_eq!(ui.dialog.as_ref().unwrap().field.text, "é");
     }
