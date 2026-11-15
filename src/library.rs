@@ -1090,8 +1090,8 @@ impl Library {
         self.playlist_file(name).ok().map(|p| abs(&p))
     }
 
-    /// Renames a playlist with its play count, thumbnail and favourite. Fails if either name is
-    /// invalid or `new` is taken; a change of case only is allowed.
+    /// Renames a playlist with its play count, thumbnail, favourite and track choices. Fails if
+    /// either name is invalid or `new` is taken; a change of case only is allowed.
     pub fn rename_playlist(&mut self, old: &str, new: &str) -> io::Result<()> {
         let from = self.playlist_file(old)?;
         let to = self.playlist_file(new)?;
@@ -1114,6 +1114,9 @@ impl Library {
         if let Some(p) = self.thumbnails.remove(old) {
             self.thumbnails.insert(new.into(), p);
         }
+        if let Some(t) = self.picks.remove(&playlist_scope(old)) {
+            self.picks.insert(playlist_scope(new), t);
+        }
         for p in &mut self.favorites {
             if *p == old_path {
                 p.clone_from(&new_path);
@@ -1129,6 +1132,7 @@ impl Library {
         fs::remove_file(file)?;
         self.playlist_plays.remove(name);
         self.thumbnails.remove(name);
+        self.picks.remove(&playlist_scope(name));
         self.favorites.retain(|p| *p != path);
         Ok(())
     }
@@ -2024,6 +2028,31 @@ mod tests {
         assert_eq!(
             lib.delete_playlist("road trip").unwrap_err().kind(),
             ErrorKind::NotFound
+        );
+    }
+
+    #[test]
+    fn track_choices_follow_a_renamed_playlist_and_go_with_a_deleted_one() {
+        let tmp = TempDir::new();
+        let mut lib = Library::open(&tmp.0, false);
+        lib.create_playlist("Anime").unwrap();
+        lib.set_track_pref(&playlist_scope("Anime"), true, Some("jpn".into()));
+        lib.rename_playlist("Anime", "Shows").unwrap();
+        assert_eq!(
+            lib.track_prefs(&playlist_scope("Shows")).audio.as_deref(),
+            Some("jpn")
+        );
+        assert_eq!(
+            lib.track_prefs(&playlist_scope("Anime")),
+            TrackPrefs::default()
+        );
+
+        // A new playlist with a deleted one's name starts with no choices.
+        lib.delete_playlist("Shows").unwrap();
+        lib.create_playlist("Shows").unwrap();
+        assert_eq!(
+            lib.track_prefs(&playlist_scope("Shows")),
+            TrackPrefs::default()
         );
     }
 
