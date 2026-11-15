@@ -316,8 +316,9 @@ impl Track {
     }
 
     /// What shows at `t` seconds: one picture on the video-sized canvas, or nothing, with the
-    /// time it was first rendered for. That time stays the same while the picture does, so the
-    /// painter can keep its bitmap.
+    /// time it was first rendered for. That time and the picture's pixels (the same allocation)
+    /// stay while the picture does, so the painter can keep its bitmap. A new picture gets new
+    /// pixels even when it starts at the same time, after a seek back or on another track.
     pub fn render(&self, t: f64) -> Option<(f64, BitmapRect)> {
         let lib = lib()?;
         let mut inner = self.0.lock().unwrap();

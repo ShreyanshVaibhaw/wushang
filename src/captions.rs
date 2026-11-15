@@ -58,8 +58,32 @@ pub struct CaptionRenderer {
     /// The text format for the current family, size and weight.
     format: Option<(String, f32, bool, IDWriteTextFormat)>,
     layouts: Vec<CachedLayout>,
-    /// Bitmap cues by start time, with each rect's position on the canvas.
-    bitmaps: Vec<(u64, Vec<(ID2D1Bitmap, D2D_RECT_F)>)>,
+    /// Bitmap cues uploaded for the screen, with each rect's position on the canvas.
+    bitmaps: Vec<CachedBitmap>,
+}
+
+/// A bitmap cue's pictures, known by its start and its first rect's pixels. libass dates a
+/// picture from when it was first rendered, so after a seek or a track switch a different
+/// picture can start at the same time; its pixels are a new allocation. Holding them keeps
+/// that allocation from being reused for another picture while this entry lives.
+struct CachedBitmap {
+    start: u64,
+    pixels: Option<std::sync::Arc<[u8]>>,
+    bitmaps: Vec<(ID2D1Bitmap, D2D_RECT_F)>,
+}
+
+impl CachedBitmap {
+    fn shows(&self, cue: &Cue) -> bool {
+        let CueContent::Bitmap { rects, .. } = &cue.content else {
+            return false;
+        };
+        let same = match (&self.pixels, rects.first()) {
+            (Some(a), Some(b)) => std::sync::Arc::ptr_eq(a, &b.bgra),
+            (None, None) => true,
+            _ => false,
+        };
+        cue.start.to_bits() == self.start && same
+    }
 }
 
 struct CachedLayout {
@@ -104,11 +128,7 @@ impl CaptionRenderer {
         let (left, top, right, bottom) = video;
         let (width, height) = (right - left, bottom - top);
         // Bitmaps of cues that left the screen go now, so a long film doesn't pile them up.
-        self.bitmaps.retain(|(start, _)| {
-            cues.iter().any(|c| {
-                c.start.to_bits() == *start && matches!(c.content, CueContent::Bitmap { .. })
-            })
-        });
+        self.bitmaps.retain(|b| cues.iter().any(|c| b.shows(c)));
         if width < 1.0 || height < 1.0 {
             return Ok(());
         }
@@ -125,14 +145,20 @@ impl CaptionRenderer {
             if *cw == 0 || *ch == 0 {
                 continue;
             }
-            let key = cue.start.to_bits();
-            if !self.bitmaps.iter().any(|(k, _)| *k == key) {
-                self.bitmaps.push((key, upload(ctx, rects)?));
-            }
+            let cached = match self.bitmaps.iter().position(|b| b.shows(cue)) {
+                Some(i) => &self.bitmaps[i],
+                None => {
+                    self.bitmaps.push(CachedBitmap {
+                        start: cue.start.to_bits(),
+                        pixels: rects.first().map(|r| r.bgra.clone()),
+                        bitmaps: upload(ctx, rects)?,
+                    });
+                    self.bitmaps.last().unwrap()
+                }
+            };
             let (sx, sy) = (width / *cw as f32, height / *ch as f32);
-            let (_, bitmaps) = self.bitmaps.iter().find(|(k, _)| *k == key).unwrap();
             let dc: &ID2D1DeviceContext = ctx;
-            for (bitmap, r) in bitmaps {
+            for (bitmap, r) in &cached.bitmaps {
                 let dest = D2D_RECT_F {
                     left: left + r.left * sx,
                     top: top + r.top * sy,
@@ -539,6 +565,55 @@ mod tests {
             count(&pixels, (0, 0, x as u32 - 2, H / 3), BACKGROUND, 0),
             ((x as u32 - 2) * (H / 3)) as usize
         );
+    }
+
+    /// libass dates a picture from when it was first rendered, so after a seek or a switch to
+    /// another .ass track a different picture can have the same start. The new one must show.
+    #[test]
+    fn a_new_picture_with_the_same_start_replaces_the_old() {
+        let picture = |bgra: [u8; 4]| Cue {
+            start: 5.0,
+            end: f64::INFINITY,
+            content: CueContent::Bitmap {
+                width: W,
+                height: H,
+                rects: vec![BitmapRect {
+                    x: 100,
+                    y: 100,
+                    w: 50,
+                    h: 50,
+                    bgra: (0..50 * 50).flat_map(|_| bgra).collect(),
+                }],
+            },
+        };
+        let (orange, green) = (
+            picture([0x18, 0x79, 0xD3, 0xFF]),
+            picture([0, 0xFF, 0, 0xFF]),
+        );
+        unsafe {
+            let canvas = Canvas::new(W, H).unwrap();
+            let ctx = ID2D1DeviceContext5::new();
+            let dwrite: IDWriteFactory6 = DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED).unwrap();
+            let mut captions = CaptionRenderer::new(&ctx, &dwrite, None).unwrap();
+            let video = (0.0, 0.0, W as f32, H as f32);
+            for cue in [&orange, &green] {
+                ctx.begin(&canvas.cg, (W, H), 1.0);
+                ctx.BeginDraw();
+                ctx.Clear(Some(&color(BACKGROUND)));
+                (captions.draw(
+                    &ctx,
+                    video,
+                    std::slice::from_ref(cue),
+                    &CaptionStyle::default(),
+                ))
+                .unwrap();
+                ctx.EndDraw(None, None).unwrap();
+                ctx.end();
+            }
+            let pixels = canvas.pixels();
+            assert_eq!(count(&pixels, (110, 110, 140, 140), 0x00FF00, 1), 30 * 30);
+            assert_eq!(captions.bitmaps.len(), 1);
+        }
     }
 
     /// Writes BGRA pixels as an uncompressed PNG, enough to look at a test render.
