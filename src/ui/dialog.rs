@@ -644,8 +644,8 @@ fn size_text(bytes: u64) -> String {
     }
 }
 
-/// "1:02:03" or "2:05".
-fn duration_text(seconds: f64) -> String {
+/// A length as "2:05", or "1:02:03" from an hour on.
+pub(super) fn duration_text(seconds: f64) -> String {
     let s = seconds.round() as u64;
     if s >= 3600 {
         format!("{}:{:02}:{:02}", s / 3600, s / 60 % 60, s % 60)
@@ -1596,7 +1596,8 @@ fn scale_at(s: f32, x: f32, y: f32) -> Matrix3x2 {
     }
 }
 
-fn centre(r: Rect) -> (f32, f32) {
+/// The middle of `r`.
+pub(super) fn centre(r: Rect) -> (f32, f32) {
     ((r.l + r.r) / 2.0, (r.t + r.b) / 2.0)
 }
 

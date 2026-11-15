@@ -11,7 +11,7 @@
 
 use std::time::Instant;
 
-use super::dialog::TextField;
+use super::dialog::{TextField, centre};
 use super::*;
 use crate::dsp::EQ_PRESETS;
 use crate::prefs::{self, Choices, Prefs};
@@ -1900,10 +1900,6 @@ impl Painter {
 /// An empty search box; it takes 60 characters.
 fn search_field() -> TextField {
     TextField::with_max(60)
-}
-
-fn centre(r: Rect) -> (f32, f32) {
-    ((r.l + r.r) / 2.0, (r.t + r.b) / 2.0)
 }
 
 #[cfg(test)]

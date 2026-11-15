@@ -4,6 +4,7 @@
 //! measured from the design's queue frame, colours sampled from it. The mini player shows the
 //! same list in its own style: a "Queue" title instead of the tabs, and sort, remove and add.
 
+use super::dialog::duration_text;
 use super::*;
 use crate::queue::Repeat;
 
@@ -365,15 +366,6 @@ fn summary(d: &QueueData) -> String {
         (h, m) => format!("{h}h {m}m"),
     };
     format!("{count} - {length}")
-}
-
-/// A row's length: "23:06", or "1:02:03" from an hour on.
-fn duration_text(seconds: f64) -> String {
-    let s = seconds.round() as u64;
-    match s / 3600 {
-        0 => format!("{}:{:02}", s / 60, s % 60),
-        h => format!("{h}:{:02}:{:02}", s / 60 % 60, s % 60),
-    }
 }
 
 /// "3 bookmarks"; nothing for none, since the list itself says so.
