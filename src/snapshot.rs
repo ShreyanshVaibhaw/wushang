@@ -1,7 +1,7 @@
 //! Snapshots: the frame on screen saved as a PNG or JPEG (in ~/Pictures/wushang unless Settings
 //! says otherwise), named after the file and the moment in it, like "Holiday 1m05s.png".
 
-use std::io::BufWriter;
+use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::Sender;
 
@@ -139,17 +139,30 @@ fn write_image(
     let rgb: Vec<u8> = (bgra.as_chunks::<4>().0.iter())
         .flat_map(|&[b, g, r, _]| [r, g, b])
         .collect();
-    let file = BufWriter::new(std::fs::File::create(path)?);
-    if jpeg {
-        image::codecs::jpeg::JpegEncoder::new_with_quality(file, JPEG_QUALITY).write_image(
-            &rgb,
-            *w,
-            *h,
-            ExtendedColorType::Rgb8,
-        )
-    } else {
-        image::codecs::png::PngEncoder::new(file).write_image(&rgb, *w, *h, ExtendedColorType::Rgb8)
+    let mut file = BufWriter::new(std::fs::File::create(path)?);
+    let mut write = || -> image::ImageResult<()> {
+        if jpeg {
+            image::codecs::jpeg::JpegEncoder::new_with_quality(&mut file, JPEG_QUALITY)
+                .write_image(&rgb, *w, *h, ExtendedColorType::Rgb8)?;
+        } else {
+            image::codecs::png::PngEncoder::new(&mut file).write_image(
+                &rgb,
+                *w,
+                *h,
+                ExtendedColorType::Rgb8,
+            )?;
+        }
+        // The last bytes go out here, where a full disk says so; left to the writer's drop,
+        // that error would be lost and the snapshot reported saved.
+        file.flush()?;
+        Ok(())
+    };
+    let written = write();
+    if written.is_err() {
+        // A cut-off picture is no use to anyone.
+        _ = std::fs::remove_file(path);
     }
+    written
 }
 
 #[cfg(test)]
@@ -190,6 +203,19 @@ mod tests {
             ([255, 0, 0], [0, 0, 255])
         );
         assert!(known_folder(Folder::Videos).unwrap().ends_with("Movies"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A snapshot that can't be written leaves no broken file behind.
+    #[test]
+    fn a_failed_snapshot_leaves_no_file() {
+        let dir = std::env::temp_dir().join(format!("wushang-snap-fail-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // Wider than JPEG can hold.
+        let picture = (70_000, 1, vec![0; 70_000 * 4]);
+        let path = dir.join("wide.jpg");
+        assert!(write_image(&path, &picture, true).is_err());
+        assert!(!path.exists(), "{} was left behind", path.display());
         std::fs::remove_dir_all(dir).unwrap();
     }
 }
