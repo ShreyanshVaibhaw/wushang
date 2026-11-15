@@ -287,7 +287,9 @@ fn scale_cover(mut frame: ff::frame::Video, width: u32, height: u32) -> Option<T
     })
 }
 
-/// A newest-first job stack served by worker threads.
+/// A newest-first job stack served by worker threads, so what the user is looking at now wins
+/// over items scrolled past. Duplicate requests for a path already queued, running or done are
+/// ignored, unless it was done and gave nothing.
 struct Queue<T> {
     state: Mutex<State<T>>,
     wake: Condvar,
@@ -295,7 +297,9 @@ struct Queue<T> {
 
 struct State<T> {
     stack: Vec<PathBuf>,
-    /// Every path ever requested, so duplicates are ignored whether queued, running or done.
+    /// The paths requested, so duplicates are ignored whether queued, running or done. A path
+    /// whose job gave nothing leaves it, so asking again tries again: its drive may have been
+    /// asleep or unplugged.
     seen: HashSet<PathBuf>,
     ready: Vec<(PathBuf, Option<T>)>,
     quit: bool,
@@ -337,7 +341,11 @@ impl<T: Send + 'static> Workers<T> {
                         // A panic inside ffmpeg-next on some odd file must not kill the worker.
                         let result =
                             panic::catch_unwind(AssertUnwindSafe(|| job(&path))).unwrap_or(None);
-                        queue.state.lock().unwrap().ready.push((path, result));
+                        let mut s = queue.state.lock().unwrap();
+                        if result.is_none() {
+                            s.seen.remove(&path);
+                        }
+                        s.ready.push((path, result));
                     }
                 })
             })
@@ -359,6 +367,11 @@ impl<T: Send + 'static> Workers<T> {
     fn take_ready(&self) -> Vec<(PathBuf, Option<T>)> {
         std::mem::take(&mut self.queue.state.lock().unwrap().ready)
     }
+
+    /// Lets `path` be requested again, though it was done or is queued or running.
+    fn forget(&self, path: &Path) {
+        self.queue.state.lock().unwrap().seen.remove(path);
+    }
 }
 
 impl<T> Drop for Workers<T> {
@@ -372,7 +385,6 @@ impl<T> Drop for Workers<T> {
     }
 }
 
-/// Background workers. Requests are served newest first (a stack), so what the user is looking at now wins over items scrolled past. Duplicate requests for a path already queued, running or done are ignored.
 /// A still from `secs` into a video, for the seek bar's preview: the keyframe at or before it,
 /// `width` pixels wide in the shape the video shows at. Only keyframes are decoded, in software,
 /// so it takes a fraction of a second even for 4K.
@@ -479,9 +491,18 @@ impl Thumbnailer {
         self.0.push([path.to_path_buf()]);
     }
 
-    /// Finished results since the last call (None = no picture for that path, so the UI stops asking).
+    /// Finished results since the last call (None = no picture for that path, so the UI stops
+    /// asking). A path that got None is rendered again if requested again.
     pub fn take_ready(&self) -> Vec<(PathBuf, Option<Thumbnail>)> {
         self.0.take_ready()
+    }
+
+    /// Renders `path` again the next time it is requested, for a cache that dropped its still:
+    /// the file may have been replaced since.
+    // The UI's thumbnail cache is to call it when it drops an entry.
+    #[allow(dead_code)]
+    pub fn forget(&self, path: &Path) {
+        self.0.forget(path);
     }
 }
 
@@ -742,6 +763,32 @@ mod tests {
         let read = unsafe { ffi::avio_seek((*input.as_ptr()).pb, 0, libc::SEEK_CUR) };
         assert!(read < size / 2, "read {read} of {size} bytes");
         assert!(render(&path, 160, 90).is_none());
+    }
+
+    /// A file that couldn't be read (its drive asleep, say) gets its still when asked again.
+    #[test]
+    fn a_failed_thumbnail_is_tried_again() {
+        let path = std::env::temp_dir().join("wushang-thumbs-later.mp4");
+        _ = std::fs::remove_file(&path);
+        let thumbs = Thumbnailer::new(1, 160, 90);
+        thumbs.request(&path);
+        let got = wait_for(|| thumbs.take_ready(), 1);
+        assert!(got.len() == 1 && got[0].1.is_none());
+
+        std::fs::copy(testdata(CLIPS[0]), &path).unwrap();
+        thumbs.request(&path);
+        let got = wait_for(|| thumbs.take_ready(), 1);
+        assert!(got.first().is_some_and(|(_, t)| t.is_some()));
+
+        // A still made is made once, until the cache that holds it forgets it.
+        thumbs.request(&path);
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(thumbs.take_ready().is_empty());
+        thumbs.forget(&path);
+        thumbs.request(&path);
+        let got = wait_for(|| thumbs.take_ready(), 1);
+        assert!(got.first().is_some_and(|(_, t)| t.is_some()));
+        _ = std::fs::remove_file(&path);
     }
 
     #[test]
