@@ -234,13 +234,14 @@ impl Chain {
     }
 
     /// Runs stereo mode, equalizer and speed over `samples` (modified in place), which start at
-    /// media time `pts`. Returns the output and the media time range it covers.
-    pub fn process(
-        &mut self,
+    /// media time `pts`. Returns the output and the media time range it covers; at normal speed
+    /// the output is `samples` itself.
+    pub fn process<'a>(
+        &'a mut self,
         effects: &Effects,
-        samples: &mut [f32],
+        samples: &'a mut [f32],
         pts: f64,
-    ) -> (&[f32], f64, f64) {
+    ) -> (&'a [f32], f64, f64) {
         let version = effects.eq_version.load(Relaxed);
         if self.eq_version != Some(version) {
             self.eq_version = Some(version);
@@ -248,10 +249,12 @@ impl Chain {
         }
         apply_stereo(effects.stereo(), samples, self.channels);
         self.eq.process(samples);
+        let speed = effects.speed();
+        if let Some((start, end)) = self.stretch.pass(samples, pts, speed) {
+            return (samples, start, end);
+        }
         self.out.clear();
-        let (start, end) = self
-            .stretch
-            .process(samples, pts, effects.speed(), &mut self.out);
+        let (start, end) = self.stretch.process(samples, pts, speed, &mut self.out);
         (&self.out, start, end)
     }
 
@@ -548,6 +551,18 @@ impl Stretcher {
         self.stretching = false;
     }
 
+    /// At normal speed with nothing held back, `input` (starting at media time `pts`) plays as
+    /// it is: counts it and returns the media time range it covers. None while stretching.
+    fn pass(&mut self, input: &[f32], pts: f64, speed: f32) -> Option<(f64, f64)> {
+        if speed != 1.0 || self.stretching {
+            return None;
+        }
+        let frames = (input.len() / self.channels) as u64;
+        self.end += frames;
+        self.first = self.end;
+        Some((pts, pts + frames as f64 / self.rate))
+    }
+
     /// Appends the stretched `input` (starting at media time `pts`) to `out` and returns the
     /// media time range of what it appended. The stretcher holds back about `window + search`
     /// frames, which come out with the next call or `drain`.
@@ -558,13 +573,11 @@ impl Stretcher {
         speed: f32,
         out: &mut Vec<f32>,
     ) -> (f64, f64) {
-        let frames = (input.len() / self.channels) as u64;
-        if speed == 1.0 && !self.stretching {
+        if let Some(times) = self.pass(input, pts, speed) {
             out.extend_from_slice(input);
-            self.end += frames;
-            self.first = self.end;
-            return (pts, pts + frames as f64 / self.rate);
+            return times;
         }
+        let frames = (input.len() / self.channels) as u64;
         self.anchors.push_back((self.end, pts));
         self.input.extend_from_slice(input);
         self.end += frames;
@@ -918,6 +931,25 @@ mod tests {
             let (out, ..) = chain.process(&effects, &mut samples, 0.0);
             assert_eq!(out, &input[..], "preset {preset:?}");
         }
+    }
+
+    /// At normal speed the stretcher passes the samples through, so the chain hands back the
+    /// processed block itself rather than a copy, and its times still run on.
+    #[test]
+    fn normal_speed_passes_the_block_through() {
+        let effects = Effects::new();
+        let mut chain = Chain::new(RATE, 2);
+        let mut block = sine(1000.0, 0.1, 2);
+        let frames = (block.len() / 2) as f64;
+        let ptr = block.as_ptr();
+        let (out, start, end) = chain.process(&effects, &mut block, 1.0);
+        assert_eq!(out.as_ptr(), ptr);
+        assert_eq!((start, end), (1.0, 1.0 + frames / f64::from(RATE)));
+        // Faster, what comes out is the stretcher's own.
+        effects.set_speed(2.0);
+        let mut fast = sine(1000.0, 0.5, 2);
+        let (out, ..) = chain.process(&effects, &mut fast, 2.0);
+        assert_ne!(out.as_ptr(), fast.as_ptr());
     }
 
     #[test]

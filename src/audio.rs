@@ -478,6 +478,9 @@ pub fn spawn_decoder(
         let mut resampler: Option<ff::software::resampling::Context> = None;
         // The effect chain and the ring generation (device format) it was built for.
         let mut chain: Option<(Chain, u64)> = None;
+        // Reused for every frame: what the decoder hands out, and the device's samples made
+        // from it, which the effects then work on in place.
+        let mut frame = ff::frame::Audio::empty();
         let mut samples = Vec::new();
         let mut serial = shared.serial.load(Relaxed);
         let mut next_pts = 0.0;
@@ -502,7 +505,6 @@ pub fn spawn_decoder(
                 }
                 Some(Msg::Eof) => _ = decoder.send_eof(),
             }
-            let mut frame = ff::frame::Audio::empty();
             loop {
                 match decoder.receive_frame(&mut frame) {
                     Ok(()) => {}
@@ -555,11 +557,11 @@ pub fn spawn_decoder(
                     }
                 }
                 let resampler = resampler.as_mut().unwrap();
-                let Some(out) = resample(resampler, &frame, format.channels, format.rate) else {
+                let ch = format.channels;
+                let Some(n) = resample(resampler, &frame, ch, format.rate, &mut samples) else {
                     continue;
                 };
                 let pts = frame.timestamp().map_or(next_pts, |t| t as f64 * time_base);
-                let n = out.samples();
                 next_pts = pts + n as f64 / f64::from(format.rate);
                 // Before an exact seek's target: decoded only because the demuxer lands earlier.
                 if next_pts <= shared.seek_floor() {
@@ -578,15 +580,8 @@ pub fn spawn_decoder(
                     continue;
                 }
                 let pts = pts + first as f64 / f64::from(format.rate);
-                let bytes = &out.data(0)[first * format.channels * 4..last * format.channels * 4];
-                samples.clear();
-                samples.extend(
-                    bytes
-                        .as_chunks::<4>()
-                        .0
-                        .iter()
-                        .map(|b| f32::from_ne_bytes(*b)),
-                );
+                samples.truncate(last * ch);
+                samples.drain(..first * ch);
                 let (c, generation) = chain.as_mut().unwrap();
                 let (out, start, end) = c.process(effects, &mut samples, pts);
                 ring.push(out, (start, end), *generation, serial, &shared);
@@ -609,21 +604,35 @@ pub(crate) fn label_layout(frame: &mut ff::frame::Audio) -> ff::ChannelLayout {
     layout
 }
 
-/// Converts one decoded frame to interleaved f32 at the device's rate and channel count.
+/// Converts one decoded frame to interleaved f32 at the device's rate and channel count, into
+/// `out` in place of what it held, and returns how many frames that is.
 fn resample(
     resampler: &mut ff::software::resampling::Context,
     frame: &ff::frame::Audio,
     channels: usize,
     rate: u32,
-) -> Option<ff::frame::Audio> {
-    // Given an empty frame, ffmpeg-next's run() allocates room for only the input's sample count.
-    // Upsampling 44.1 to 48 kHz then leaves the extra 9% stuck inside swresample and the audio
-    // plays fast, so size the output for the converted count, plus slack for swresample's delay.
+    out: &mut Vec<f32>,
+) -> Option<usize> {
+    // Room for the converted count, plus slack for swresample's delay. With room for only the
+    // input's count, upsampling 44.1 to 48 kHz leaves the extra 9% stuck inside swresample and
+    // the audio plays fast.
     let capacity = frame.samples() * rate as usize / frame.rate() as usize + 64;
-    let layout = ff::ChannelLayout::default(channels as i32);
-    let mut out = ff::frame::Audio::new(DEVICE_FORMAT, capacity, layout);
-    resampler.run(frame, &mut out).ok()?;
-    Some(out)
+    out.clear();
+    out.reserve(capacity * channels);
+    let planes = [out.as_mut_ptr().cast::<u8>()];
+    let converted = unsafe {
+        ff::ffi::swr_convert(
+            resampler.as_mut_ptr(),
+            planes.as_ptr(),
+            capacity as i32,
+            (*frame.as_ptr()).extended_data as *const *const u8,
+            frame.samples() as i32,
+        )
+    };
+    let frames = usize::try_from(converted).ok()?;
+    // swresample wrote that many interleaved frames, at most `capacity`.
+    unsafe { out.set_len(frames * channels) };
+    Some(frames)
 }
 
 #[cfg(test)]
@@ -657,7 +666,7 @@ mod tests {
             48_000,
         )
         .unwrap();
-        assert!(resample(&mut resampler, &frame, 2, 48_000).is_some());
+        assert!(resample(&mut resampler, &frame, 2, 48_000, &mut Vec::new()).is_some());
     }
 
     #[test]
@@ -676,18 +685,27 @@ mod tests {
         )
         .unwrap();
         let mut total = 0;
+        let mut out = Vec::new();
         for _ in 0..44 {
             let mut frame = ff::frame::Audio::new(input_format, 1024, mono());
             frame.set_rate(44_100);
-            frame.plane_mut::<f32>(0).fill(0.0);
-            total += resample(&mut resampler, &frame, 2, 48_000)
-                .unwrap()
-                .samples();
+            frame.plane_mut::<f32>(0).fill(0.5);
+            let frames = resample(&mut resampler, &frame, 2, 48_000, &mut out).unwrap();
+            assert_eq!(out.len(), frames * 2);
+            total += frames;
         }
         let expected = 45_056 * 48_000 / 44_100;
         assert!(
             total.abs_diff(expected) < 64,
             "got {total} samples, expected about {expected}"
+        );
+        // Mono went to both channels, 3 dB down in each (swresample's centre mix), once the
+        // filter has settled.
+        let level = 0.5 * std::f32::consts::FRAC_1_SQRT_2;
+        assert!(
+            out.iter().all(|s| (s - level).abs() < 1e-3),
+            "{:?}",
+            &out[..4]
         );
     }
 
