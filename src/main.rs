@@ -2114,6 +2114,7 @@ fn run() -> Result<(), Box<dyn Error>> {
     let mut pointer_hidden = false;
     // The title bar's tabs as last painted.
     let mut shown_tabs: Vec<TabInfo> = Vec::new();
+    let mut laid_out_fullscreen = false;
     // One pass of the render loop; false ends playback (--play-and-exit). See `run_frames`.
     let mut frame = || -> Result<bool, Box<dyn Error>> {
         // Nothing to show in the mini player once playback ends: the full window comes back,
@@ -2391,6 +2392,12 @@ fn run() -> Result<(), Box<dyn Error>> {
         let (w, h) = win.size();
         let (w, h) = (w as f32, h as f32);
         let fullscreen = win.is_fullscreen();
+        // The title bar leaves out minimize and maximize in fullscreen, which can come and go
+        // without the size changing.
+        if fullscreen != laid_out_fullscreen {
+            laid_out_fullscreen = fullscreen;
+            UI.with_borrow_mut(|ui| ui.relayout = true);
+        }
         let has_video = app.session().is_some_and(|s| s.video_size.is_some());
         let card = app.has_card();
         let panel_data = app.panel_data();
