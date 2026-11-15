@@ -398,13 +398,19 @@ pub(super) fn layout(
     buttons.push((Hit::Back, Rect::around(248.0, HEADER_CY, 32.0)));
     buttons.push((Hit::Forward, Rect::around(284.0, HEADER_CY, 32.0)));
 
-    // The right-hand cluster, from the window edge in.
-    let add = b.can_add();
-    buttons.push((Hit::HeaderMore, Rect::around(w - 32.0, HEADER_CY, 32.0)));
-    if add {
-        buttons.push((Hit::AddHere, Rect::around(w - 68.0, HEADER_CY, 32.0)));
+    // The right-hand cluster, from the window edge in: "..." when the page has a menu, +
+    // where something can be added, then the search box.
+    let mut cx = w - 32.0;
+    for (hit, on) in [
+        (Hit::HeaderMore, super::menu::has_place_menu(&b.place)),
+        (Hit::AddHere, b.can_add()),
+    ] {
+        if on {
+            buttons.push((hit, Rect::around(cx, HEADER_CY, 32.0)));
+            cx -= 36.0;
+        }
     }
-    let search_r = w - if add { 101.0 } else { 65.0 };
+    let search_r = cx + 3.0;
     // The design's 323 DIPs from 1615 wide; narrower windows give the breadcrumb the room.
     let search_w = (w * 0.2).clamp(160.0, SEARCH_W);
     let search = Rect::new(search_r - search_w, 60.0, search_r, 95.0);
@@ -480,8 +486,10 @@ pub(super) fn overlay(p: &Painter, l: &mut Layout, b: &Browse) {
         .push((Hit::Back, Rect::around(x0 + 32.0, cy, 32.0)));
     l.buttons
         .push((Hit::Forward, Rect::around(x0 + 68.0, cy, 32.0)));
-    l.buttons
-        .push((Hit::HeaderMore, Rect::around(x0 + 308.0, cy, 32.0)));
+    if super::menu::has_place_menu(&b.place) {
+        l.buttons
+            .push((Hit::HeaderMore, Rect::around(x0 + 308.0, cy, 32.0)));
+    }
     l.buttons
         .push((Hit::OpenLibrary, Rect::around(x0 + 344.0, cy, 32.0)));
     let tools = t + OVERLAY_TOOLS;
@@ -1025,10 +1033,14 @@ impl Painter {
                     rt.FillRectangle(&caret.d2d(), &r.label);
                 }
             }
-            if b.can_add() {
-                self.icon(ctx, &i.add, w - 80.0, HEADER_CY - 12.0, false);
+            // Where the layout put them, if it did.
+            let shown = |hit| Some(l.button(hit)).filter(|r| r.w() > 0.0);
+            if let Some(add) = shown(Hit::AddHere) {
+                self.icon(ctx, &i.add, add.l + 4.0, add.t + 4.0, false);
             }
-            self.icon(ctx, &i.more_panel, w - 41.0, HEADER_CY - 9.0, false);
+            if let Some(more) = shown(Hit::HeaderMore) {
+                self.icon(ctx, &i.more_panel, more.l + 7.0, more.t + 7.0, false);
+            }
             let divider = Rect::new(CONTENT_L, DIVIDER, w - CONTENT_RIGHT_GAP, DIVIDER + 1.0);
             rt.FillRectangle(&divider.d2d(), &r.line);
         }
@@ -1166,7 +1178,9 @@ impl Painter {
             );
             self.crumbs(rt, s);
             let more = at(Hit::HeaderMore);
-            self.icon(ctx, &i.more_panel, more.l + 7.0, more.t + 7.0, false);
+            if more.w() > 0.0 {
+                self.icon(ctx, &i.more_panel, more.l + 7.0, more.t + 7.0, false);
+            }
             let open = at(Hit::OpenLibrary);
             // The design mirrors it so the arrow points up and right.
             self.icon(

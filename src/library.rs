@@ -287,6 +287,22 @@ pub fn write_replacing(file: &Path, bytes: &[u8]) -> io::Result<()> {
     fs::rename(tmp, file)
 }
 
+/// The file or address a playlist line lists, if it lists one: comments, blank lines and
+/// other protocols list nothing. Relative lines resolve against the playlists folder `dir`.
+fn playlist_entry(line: &str, dir: &Path) -> Option<PathBuf> {
+    let line = line.trim_start_matches('\u{feff}').trim();
+    if line.is_empty() || line.starts_with('#') {
+        None
+    } else if net::is_url(line) {
+        net::normalize_url(line).ok().map(PathBuf::from)
+    } else if line.contains("://") {
+        // Imported playlists must not open capture devices or other FFmpeg protocols.
+        None
+    } else {
+        Some(dir.join(line))
+    }
+}
+
 /// The user's home folder.
 fn home_dir() -> PathBuf {
     env::home_dir().unwrap_or_else(|| PathBuf::from("/"))
@@ -1059,18 +1075,7 @@ impl Library {
         let dir = self.playlist_dir();
         String::from_utf8_lossy(&bytes)
             .lines()
-            .map(|l| l.trim_start_matches('\u{feff}').trim())
-            .filter(|l| !l.is_empty() && !l.starts_with('#'))
-            .filter_map(|line| {
-                if net::is_url(line) {
-                    net::normalize_url(line).ok().map(PathBuf::from)
-                } else if line.contains("://") {
-                    // Imported playlists must not open capture devices or other FFmpeg protocols.
-                    None
-                } else {
-                    Some(dir.join(line))
-                }
-            })
+            .filter_map(|line| playlist_entry(line, &dir))
             .collect()
     }
 
@@ -1134,10 +1139,8 @@ impl Library {
         let file = self.playlist_file(name)?;
         let text = String::from_utf8_lossy(&fs::read(&file)?).into_owned();
         let lines: Vec<&str> = text.lines().collect();
-        let is_item = |l: &str| {
-            let l = l.trim_start_matches('\u{feff}').trim();
-            !l.is_empty() && !l.starts_with('#')
-        };
+        let dir = self.playlist_dir();
+        let is_item = |l: &str| playlist_entry(l, &dir).is_some();
         let at = (0..lines.len())
             .filter(|&i| is_item(lines[i]))
             .nth(index)
@@ -2043,6 +2046,24 @@ mod tests {
         let err = lib.remove_from_playlist("P", 1).unwrap_err();
         assert_eq!(err.kind(), ErrorKind::InvalidInput);
         assert!(lib.remove_from_playlist("Nope", 0).is_err());
+    }
+
+    /// Lines the list leaves out (other protocols, broken addresses) don't count toward the
+    /// index removal takes, so the item shown is the one that goes.
+    #[test]
+    fn remove_from_playlist_counts_as_the_list_does() {
+        let tmp = TempDir::new();
+        let mut lib = Library::open(&tmp.0, false);
+        lib.create_playlist("P").unwrap();
+        let text = "#EXTM3U\nfile:///x.mp3\n/a.mp4\nrtmp://h/live\n/b.mp4\n";
+        fs::write(lib.playlist_file("P").unwrap(), text).unwrap();
+        let shown = [PathBuf::from("/a.mp4"), PathBuf::from("/b.mp4")];
+        assert_eq!(lib.playlist_items("P"), shown);
+        lib.remove_from_playlist("P", 1).unwrap();
+        assert_eq!(lib.playlist_items("P"), [PathBuf::from("/a.mp4")]);
+        // The hidden lines stay as they were.
+        let left = fs::read_to_string(lib.playlist_file("P").unwrap()).unwrap();
+        assert_eq!(left, "#EXTM3U\nfile:///x.mp3\n/a.mp4\nrtmp://h/live\n");
     }
 
     #[test]

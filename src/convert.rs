@@ -524,11 +524,21 @@ impl AudioPath {
     fn encode_ready(&mut self, octx: &mut ff::format::context::Output) -> Result<(), String> {
         let mut decoded = frame::Audio::empty();
         while self.decoder.receive_frame(&mut decoded).is_ok() {
-            if self.resampler.is_none() {
+            // Plain PCM (a WAV) decodes with no channel layout, which swresample refuses.
+            let layout = crate::audio::label_layout(&mut decoded);
+            let (format, rate) = (decoded.format(), decoded.rate());
+            // Made for the first frame, and again when the sound's shape changes midway (a
+            // broadcast moving to another programme), after the old one's last samples.
+            let fits = |r: &software::resampling::Context| {
+                let d = r.input();
+                (d.format, d.channel_layout, d.rate) == (format, layout, rate)
+            };
+            if !self.resampler.as_ref().is_some_and(fits) {
+                self.flush_resampler()?;
                 let resampler = software::resampling::Context::get(
-                    decoded.format(),
-                    decoded.channel_layout(),
-                    decoded.rate(),
+                    format,
+                    layout,
+                    rate,
                     self.format,
                     self.layout,
                     self.rate,
@@ -536,23 +546,50 @@ impl AudioPath {
                 .map_err(|e| format!("can't convert the sound: {e}"))?;
                 self.resampler = Some(resampler);
             }
-            let mut converted = frame::Audio::empty();
+            // Given an empty frame, ffmpeg-next's run() makes room for the input's sample count
+            // only, and upsampling's extra samples would pile up inside swresample: size it for
+            // the converted count, plus slack for swresample's delay.
+            let room = decoded.samples() * self.rate as usize / rate.max(1) as usize + 64;
+            let mut converted = frame::Audio::new(self.format, room, self.layout);
             self.resampler
                 .as_mut()
                 .unwrap()
                 .run(&decoded, &mut converted)
                 .map_err(|e| format!("can't convert the sound: {e}"))?;
-            let samples = converted.samples() as i32;
-            let written = unsafe {
-                let data = (*converted.as_ptr()).extended_data as *const *mut c_void;
-                ff::ffi::av_audio_fifo_write(self.pending.0, data, samples)
-            };
-            if written < samples {
-                return Err("out of memory".into());
-            }
+            self.queue(&converted)?;
             self.send_full_frames(octx, false)?;
         }
         Ok(())
+    }
+
+    /// Adds converted samples to those waiting for a whole encoder frame.
+    fn queue(&mut self, converted: &frame::Audio) -> Result<(), String> {
+        let samples = converted.samples() as i32;
+        let written = unsafe {
+            let data = (*converted.as_ptr()).extended_data as *const *mut c_void;
+            ff::ffi::av_audio_fifo_write(self.pending.0, data, samples)
+        };
+        if written < samples {
+            return Err("out of memory".into());
+        }
+        Ok(())
+    }
+
+    /// Takes the samples the resampler still holds (its filter's delay) and lets it go.
+    fn flush_resampler(&mut self) -> Result<(), String> {
+        let Some(mut resampler) = self.resampler.take() else {
+            return Ok(());
+        };
+        loop {
+            let mut out = frame::Audio::new(self.format, 4096, self.layout);
+            resampler
+                .flush(&mut out)
+                .map_err(|e| format!("can't convert the sound: {e}"))?;
+            if out.samples() == 0 {
+                return Ok(());
+            }
+            self.queue(&out)?;
+        }
     }
 
     /// Hands the encoder every whole frame pending; at the end, the rest padded with silence.
@@ -594,6 +631,7 @@ impl AudioPath {
     fn finish(&mut self, octx: &mut ff::format::context::Output) -> Result<(), String> {
         _ = self.decoder.send_eof();
         self.encode_ready(octx)?;
+        self.flush_resampler()?;
         self.send_full_frames(octx, true)?;
         _ = self.encoder.send_eof();
         let base = ff::Rational(1, self.rate as i32);
@@ -607,12 +645,17 @@ mod tests {
 
     fn convert(target: Target) -> PathBuf {
         let clip = Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/test_h264.mp4");
+        convert_file(&clip, target)
+    }
+
+    fn convert_file(clip: &Path, target: Target) -> PathBuf {
+        let stem = clip.file_stem().unwrap().to_string_lossy();
         let out = std::env::temp_dir().join(format!(
-            "wushang-convert-{}.{}",
+            "wushang-convert-{stem}-{}.{}",
             std::process::id(),
             target.extension()
         ));
-        let job = Job::start(&clip, target, out.clone());
+        let job = Job::start(clip, target, out.clone());
         let result = loop {
             if let Some(r) = job.finished() {
                 break r;
@@ -622,6 +665,71 @@ mod tests {
         assert_eq!(result, Ok(out.clone()));
         assert_eq!(job.progress(), 1.0);
         out
+    }
+
+    /// Seconds of sound in `file`, counted from its decoded samples rather than the header.
+    fn sound_seconds(file: &Path) -> f64 {
+        let mut input = ff::format::input(file).unwrap();
+        let stream = input.streams().best(ff::media::Type::Audio).unwrap();
+        let index = stream.index();
+        let context = codec::Context::from_parameters(stream.parameters()).unwrap();
+        let mut decoder = context.decoder().audio().unwrap();
+        let (mut samples, mut rate) = (0usize, 0u32);
+        let mut frame = frame::Audio::empty();
+        let mut take = |d: &mut ff::decoder::Audio| {
+            while d.receive_frame(&mut frame).is_ok() {
+                samples += frame.samples();
+                rate = frame.rate();
+            }
+        };
+        for (s, packet) in input.packets() {
+            if s.index() == index {
+                _ = decoder.send_packet(&packet);
+                take(&mut decoder);
+            }
+        }
+        _ = decoder.send_eof();
+        take(&mut decoder);
+        samples as f64 / f64::from(rate)
+    }
+
+    /// A plain 16-bit WAV, which decodes with no channel layout, at a rate the encoder doesn't
+    /// take: the sound has to be resampled up, and all of it has to come through.
+    #[test]
+    fn converts_a_plain_wav_at_a_low_rate() {
+        let (rate, seconds) = (22_050u32, 3u32);
+        let n = rate * seconds;
+        let mut wav = Vec::new();
+        let data = n * 2;
+        for part in [
+            &b"RIFF"[..],
+            &(36 + data).to_le_bytes(),
+            b"WAVEfmt ",
+            &16u32.to_le_bytes(),
+            &1u16.to_le_bytes(),
+            &1u16.to_le_bytes(),
+            &rate.to_le_bytes(),
+            &(rate * 2).to_le_bytes(),
+            &2u16.to_le_bytes(),
+            &16u16.to_le_bytes(),
+            b"data",
+            &data.to_le_bytes(),
+        ] {
+            wav.extend_from_slice(part);
+        }
+        for i in 0..n {
+            let t = f64::from(i) / f64::from(rate);
+            let v = ((t * 440.0 * std::f64::consts::TAU).sin() * 8000.0) as i16;
+            wav.extend_from_slice(&v.to_le_bytes());
+        }
+        let clip = std::env::temp_dir().join(format!("wushang-tone-{}.wav", std::process::id()));
+        std::fs::write(&clip, wav).unwrap();
+        let mp3 = convert_file(&clip, Target::Mp3);
+        let got = sound_seconds(&mp3);
+        // An encoder's padding adds a frame or two at most.
+        assert!((3.0..3.2).contains(&got), "{got} s of sound");
+        std::fs::remove_file(&mp3).unwrap();
+        std::fs::remove_file(&clip).unwrap();
     }
 
     #[test]

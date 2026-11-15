@@ -12,10 +12,13 @@
 
 use ffmpeg_next as ff;
 use std::collections::HashMap;
+use std::fs::File;
+use std::io::{self, Read, Seek, SeekFrom};
+use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Once};
 
 const DVD: &str = "dvd://";
 const BLURAY: &str = "bluray://";
@@ -68,25 +71,79 @@ fn strip(path: &Path) -> &str {
         .unwrap_or(p)
 }
 
-/// Byte concatenation is only sufficient for DVDs, whose whole VOBs form the title.
-pub fn url(path: &Path) -> Result<String, String> {
-    let title = main_title(path)?;
-    if !title.intervals.is_empty() {
-        return Err("Blu-ray clips require the playlist demuxer".into());
-    }
-    let parts: Vec<String> = title.vobs.iter().map(|v| v.display().to_string()).collect();
-    Ok(format!("concat:{}", parts.join("|")))
+/// A DVD title's VOBs read as the one stream they are: the title's MPEG program stream cut into
+/// files of up to 1 GB at any byte, even mid-packet, so they join byte for byte. FFmpeg's
+/// `concat:` protocol does the same, but from an address split at `|`, which a folder's name
+/// can hold.
+struct Vobs {
+    parts: Vec<(File, u64)>,
+    pos: u64,
+    len: u64,
 }
 
-/// Open an internally generated concat script, so clip bounds and seek offsets survive.
-/// Local downloaded concat scripts remain blocked by session::open_file.
+impl Vobs {
+    fn open(paths: &[PathBuf]) -> io::Result<Vobs> {
+        let parts = (paths.iter())
+            .map(|p| {
+                let file = File::open(p)?;
+                let len = file.metadata()?.len();
+                Ok((file, len))
+            })
+            .collect::<io::Result<Vec<_>>>()?;
+        let len = parts.iter().map(|(_, n)| n).sum();
+        Ok(Vobs { parts, pos: 0, len })
+    }
+}
+
+impl Read for Vobs {
+    /// Reads from the VOB the position is in, up to its end; the next read goes on in the next.
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let mut start = 0;
+        for (file, len) in &self.parts {
+            if self.pos < start + len {
+                let at = self.pos - start;
+                let want = buf.len().min((len - at) as usize);
+                let n = file.read_at(&mut buf[..want], at)?;
+                self.pos += n as u64;
+                return Ok(n);
+            }
+            start += len;
+        }
+        Ok(0)
+    }
+}
+
+impl Seek for Vobs {
+    fn seek(&mut self, to: SeekFrom) -> io::Result<u64> {
+        let pos = match to {
+            SeekFrom::Start(n) => Some(n),
+            SeekFrom::Current(d) => self.pos.checked_add_signed(d),
+            SeekFrom::End(d) => self.len.checked_add_signed(d),
+        };
+        self.pos = pos.ok_or_else(|| io::Error::from(io::ErrorKind::InvalidInput))?;
+        Ok(self.pos)
+    }
+}
+
+/// Opens a disc's main title: a DVD's VOBs as one MPEG program stream, a Blu-ray's clips through
+/// an internally generated concat script, so clip bounds and seek offsets survive. Local
+/// downloaded concat scripts remain blocked by session::open_file.
 pub fn open(path: &Path, cancel: &Arc<AtomicBool>) -> Result<ff::format::context::Input, String> {
     let title = main_title(path)?;
     let cancel = cancel.clone();
-    let fail = |e| format!("can't play the disc: {e}");
+    let fail = |e: ff::Error| format!("can't play the disc: {e}");
     if title.intervals.is_empty() {
-        return ff::format::input_with_interrupt(&url(path)?, move || cancel.load(Relaxed))
-            .map_err(fail);
+        let vobs = Vobs::open(&title.vobs).map_err(|e| format!("can't play the disc: {e}"))?;
+        let io = ff::format::context::StreamIo::from_read_seek(vobs).map_err(fail)?;
+        let mut options = ff::Dictionary::new();
+        options.set("format_whitelist", "mpeg");
+        return ff::format::input_from_stream_with_interrupt(
+            io,
+            Some("title.vob"),
+            Some(options),
+            move || cancel.load(Relaxed),
+        )
+        .map_err(fail);
     }
     let io = ff::format::context::StreamIo::from_read_seek(std::io::Cursor::new(playlist_script(
         &title,
@@ -374,12 +431,27 @@ fn playlist_title(mpls: &[u8]) -> Option<(Vec<PlayItem>, f64, Vec<f64>)> {
 
 /// Blu-ray images mounted this run, by image, so each is mounted once.
 static MOUNTED: Mutex<Option<HashMap<PathBuf, PathBuf>>> = Mutex::new(None);
+/// Detaching the images at exit is set up on the first mount, whether or not it works: one that
+/// failed must not leave the later ones attached.
+static UNMOUNT_AT_EXIT: Once = Once::new();
 
 /// Mounts the disc image `iso` read-only where Finder doesn't show it, once per run, and gives
 /// back where its files are. The images go when wushang exits.
 fn mount(iso: &Path) -> Result<PathBuf, String> {
+    UNMOUNT_AT_EXIT.call_once(|| {
+        extern "C" fn unmount_all() {
+            let mounted = MOUNTED.lock().map(|m| m.clone()).unwrap_or_default();
+            for at in mounted.unwrap_or_default().values() {
+                _ = Command::new("/usr/bin/hdiutil")
+                    .args(["detach", "-quiet"])
+                    .arg(at)
+                    .status();
+            }
+        }
+        // SAFETY: unmount_all is a plain function that lives for the whole process.
+        unsafe { libc::atexit(unmount_all) };
+    });
     let mut mounted = MOUNTED.lock().unwrap();
-    let first = mounted.is_none();
     let mounted = mounted.get_or_insert_with(HashMap::new);
     if let Some(at) = mounted.get(iso).filter(|at| at.is_dir()) {
         return Ok(at.clone());
@@ -406,18 +478,6 @@ fn mount(iso: &Path) -> Result<PathBuf, String> {
     }
     let plist = String::from_utf8_lossy(&out.stdout);
     let at = mount_point(&plist).ok_or("the image holds no disc wushang can read")?;
-    if first {
-        extern "C" fn unmount_all() {
-            let mounted = MOUNTED.lock().map(|m| m.clone()).unwrap_or_default();
-            for at in mounted.unwrap_or_default().values() {
-                _ = Command::new("/usr/bin/hdiutil")
-                    .args(["detach", "-quiet"])
-                    .arg(at)
-                    .status();
-            }
-        }
-        unsafe { libc::atexit(unmount_all) };
-    }
     mounted.insert(iso.to_path_buf(), at.clone());
     Ok(at)
 }
@@ -663,6 +723,58 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
+    /// A DVD's VOBs join byte for byte, as the one program stream they were cut from, and play
+    /// whatever their folder is called: a `|` in it split FFmpeg's `concat:` address.
+    #[test]
+    fn a_dvd_plays_across_its_vobs_from_any_folder() {
+        let root = std::env::temp_dir()
+            .join(format!("wushang-dvd-pipe-{}", std::process::id()))
+            .join("Film | Extras");
+        let dir = root.join("VIDEO_TS");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("VTS_01_0.IFO"), ifo(1, 3)).unwrap();
+        let clip = Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/test_dvd.vob");
+        let stream = std::fs::read(clip).unwrap();
+        // Cut mid-packet, as a disc's 1 GB VOB files are.
+        let cut = stream.len() / 2 + 7;
+        std::fs::write(dir.join("VTS_01_1.VOB"), &stream[..cut]).unwrap();
+        std::fs::write(dir.join("VTS_01_2.VOB"), &stream[cut..]).unwrap();
+
+        let address = super::address(&root).unwrap();
+        let mut input = open(&address, &Arc::new(AtomicBool::new(false))).unwrap();
+        let video = input.streams().best(ff::media::Type::Video).unwrap();
+        let index = video.index();
+        let context = ff::codec::Context::from_parameters(video.parameters()).unwrap();
+        let mut decoder = context.decoder().video().unwrap();
+        let mut frames = 0;
+        let mut frame = ff::frame::Video::empty();
+        for (s, packet) in input.packets() {
+            if s.index() == index {
+                _ = decoder.send_packet(&packet);
+                while decoder.receive_frame(&mut frame).is_ok() {
+                    frames += 1;
+                }
+            }
+        }
+        _ = decoder.send_eof();
+        while decoder.receive_frame(&mut frame).is_ok() {
+            frames += 1;
+        }
+        // Three seconds at 30 frames a second, the cut costing none.
+        assert_eq!(frames, 90);
+        // And it seeks: from the end back to 2 s, which is in the second VOB.
+        input.seek(2_000_000, ..2_000_000).unwrap();
+        let base = f64::from(input.stream(index).unwrap().time_base());
+        let start = input.stream(index).unwrap().start_time() as f64 * base;
+        let landed = (input.packets())
+            .find(|(s, p)| s.index() == index && p.pts().is_some())
+            .map(|(_, p)| p.pts().unwrap() as f64 * base - start)
+            .unwrap();
+        assert!((1.0..=2.05).contains(&landed), "landed at {landed:.2}");
+        drop(input);
+        std::fs::remove_dir_all(root.parent().unwrap()).unwrap();
+    }
+
     #[test]
     fn reads_the_main_title_and_its_chapters() {
         let root = std::env::temp_dir().join(format!("wushang-dvd-{}", std::process::id()));
@@ -687,11 +799,6 @@ mod tests {
         let address = super::address(&root).unwrap();
         assert_eq!(address, super::address(&dir).unwrap());
         assert!(is_disc_path(&address));
-        let url = url(&address).unwrap();
-        assert!(
-            url.starts_with("concat:") && url.ends_with("VTS_02_2.VOB"),
-            "{url}"
-        );
         assert_eq!(
             super::title(&address),
             format!("wushang-dvd-{}", std::process::id())
@@ -775,7 +882,51 @@ mod tests {
         assert_eq!(super::title(&image), "film");
         // Anything else is no disc.
         std::fs::write(root.join("notes.iso"), b"not an image").unwrap();
-        assert!(super::url(&super::address(&root.join("notes.iso")).unwrap()).is_err());
+        let notes = super::address(&root.join("notes.iso")).unwrap();
+        assert!(open(&notes, &Arc::new(AtomicBool::new(false))).is_err());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// Images mounted this run are detached when wushang exits, even after a first mount that
+    /// failed. Run in a child process, so its exit is the one checked.
+    #[test]
+    fn images_detach_at_exit_after_a_failed_mount() {
+        if let Some(dir) = std::env::var_os("WUSHANG_MOUNT_CHILD") {
+            let dir = PathBuf::from(dir);
+            assert!(mount(&dir.join("notes.iso")).is_err());
+            let at = mount(&dir.join("film.iso")).unwrap();
+            println!("mounted at {}", at.display());
+            return;
+        }
+        let root = std::env::temp_dir().join(format!("wushang-unmount-{}", std::process::id()));
+        _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("disc")).unwrap();
+        std::fs::write(root.join("disc/readme.txt"), b"a disc").unwrap();
+        std::fs::write(root.join("notes.iso"), b"not an image").unwrap();
+        let made = std::process::Command::new("/usr/bin/hdiutil")
+            .args(["makehybrid", "-quiet", "-udf", "-o"])
+            .arg(root.join("film.iso"))
+            .arg(root.join("disc"))
+            .status()
+            .unwrap();
+        assert!(made.success(), "hdiutil makehybrid failed");
+        let child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "disc::tests::images_detach_at_exit_after_a_failed_mount",
+            ])
+            .arg("--nocapture")
+            .env("WUSHANG_MOUNT_CHILD", &root)
+            .output()
+            .unwrap();
+        let out = String::from_utf8_lossy(&child.stdout);
+        assert!(child.status.success(), "{out}");
+        let at = out
+            .lines()
+            .find_map(|l| l.strip_prefix("mounted at "))
+            .map(PathBuf::from)
+            .expect("the child mounted the image");
+        assert!(!at.exists(), "{} is still mounted", at.display());
         std::fs::remove_dir_all(&root).unwrap();
     }
 }

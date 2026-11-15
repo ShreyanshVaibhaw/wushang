@@ -114,6 +114,15 @@ pub struct QueueData {
 }
 
 impl QueueData {
+    /// What row `i` of `tab` shows, which a selection holds on to.
+    fn row_key(&self, tab: Tab, i: usize) -> Option<String> {
+        match tab {
+            Tab::Queue => self.items.get(i).map(|item| item.name.clone()),
+            Tab::Bookmarks => (self.bookmarks.get(i)).map(|(name, at)| format!("{name}\t{at}")),
+            Tab::Chapters => None,
+        }
+    }
+
     fn rows(&self, tab: Tab) -> usize {
         match tab {
             Tab::Queue => self.items.len(),
@@ -171,12 +180,35 @@ pub struct State {
     pub open: bool,
     pub tab: Tab,
     pub scroll: f32,
-    /// The row last clicked, which minus removes.
-    pub selected: Option<usize>,
+    /// The row last clicked, which minus removes, while it still shows what was clicked.
+    pub selected: Option<Selected>,
     /// A queue row pressed and the pointer's y then; moving on from there starts a drag.
     pub press: Option<(usize, f32)>,
     /// While dragging: the row and the gap between rows (0 to len) it would drop into.
     pub drag: Option<(usize, usize)>,
+}
+
+/// A selected row: the panel tab it was picked on, its index, and what it showed then. Rows
+/// removed or moved from their menu, or another tab's queue, show something else at that
+/// index, and the selection lapses rather than move onto another file.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Selected {
+    tab: Tab,
+    row: usize,
+    key: String,
+}
+
+impl Selected {
+    fn new(tab: Tab, row: usize, data: &QueueData) -> Option<Selected> {
+        let key = data.row_key(tab, row)?;
+        Some(Selected { tab, row, key })
+    }
+
+    /// The row it selects among `data`'s rows on `tab`, if it still does.
+    fn row_in(&self, tab: Tab, data: &QueueData) -> Option<usize> {
+        (self.tab == tab && data.row_key(tab, self.row).as_ref() == Some(&self.key))
+            .then_some(self.row)
+    }
 }
 
 /// Where the panel's parts sit; part of `Layout`.
@@ -280,7 +312,7 @@ fn queue_geometry(st: Style, frame: Rect, state: &State, tab: Tab, data: &QueueD
             rows,
             rows_top,
             max_scroll,
-            selected: state.selected,
+            selected: (state.selected.as_ref()).and_then(|s| s.row_in(tab, data)),
             drag: state.drag,
             data: Some(data.clone()),
         }
@@ -364,6 +396,15 @@ impl Ui {
         self.relayout = true;
     }
 
+    /// Opens the settings popup on `panel`, in the queue's place: the two share the spot at the
+    /// right, as opening the queue closes the popup.
+    pub fn show_settings_popup(&mut self, panel: panels::Panel) {
+        self.panels.show(Some(panel), Some(Hit::Settings));
+        self.queue.open = false;
+        (self.queue.press, self.queue.drag) = (None, None);
+        self.relayout = true;
+    }
+
     /// Whether the panel's layout is out of date.
     pub fn queue_stale(&self, data: Option<&QueueData>) -> bool {
         let (g, s) = (&self.layout.queue, &self.queue);
@@ -372,7 +413,9 @@ impl Ui {
         s.open != g.open
             || (s.open
                 && (g.tab != tab
-                    || g.selected != s.selected
+                    || g.selected
+                        != (s.selected.as_ref())
+                            .and_then(|sel| data.and_then(|d| sel.row_in(tab, d)))
                     || g.drag != s.drag
                     || g.data.as_ref() != data))
     }
@@ -404,7 +447,8 @@ impl Ui {
             (Target::Tool(Tool::Add), Tab::Bookmarks) => QueueAction::AddBookmark,
             (Target::Tool(Tool::Add), _) => QueueAction::AddFiles,
             (Target::Tool(Tool::Remove), tab) => {
-                let i = s.selected.take()?;
+                s.selected = None;
+                let i = g.selected?;
                 match tab {
                     Tab::Bookmarks => QueueAction::RemoveBookmark(i),
                     _ => QueueAction::Remove(i),
@@ -412,7 +456,7 @@ impl Ui {
             }
             (Target::Row(i), tab) => {
                 // Chapters have no minus, so nothing to select for.
-                s.selected = (tab != Tab::Chapters).then_some(i);
+                s.selected = Selected::new(tab, i, d);
                 match tab {
                     Tab::Queue => QueueAction::Play(i),
                     Tab::Bookmarks => QueueAction::SeekTo(d.bookmarks.get(i)?.1),
@@ -427,8 +471,9 @@ impl Ui {
 
     /// A press on a queue row may become a drag.
     pub(super) fn queue_press(&mut self, y: f32) {
+        // The tab shown: the mini player's queue is always the queue.
         if let Some(Hit::Queue(Target::Row(i))) = self.hover
-            && self.queue.tab == Tab::Queue
+            && self.layout.queue.tab == Tab::Queue
         {
             self.queue.press = Some((i, y));
         }
@@ -459,7 +504,11 @@ impl Ui {
         // Taking the row out first shifts the gaps after it up by one.
         let to = if gap > from { gap - 1 } else { gap };
         (to != from).then(|| {
-            self.queue.selected = Some(to);
+            // Selected where it lands: the same file at its new place.
+            let data = self.layout.queue.data.as_ref();
+            self.queue.selected = data
+                .and_then(|d| Selected::new(Tab::Queue, from, d))
+                .map(|s| Selected { row: to, ..s });
             Action::Queue(QueueAction::Move(from, to))
         })
     }
@@ -885,6 +934,62 @@ mod tests {
             l.hit(1500.0 + PANEL.more_x, 61.0 + 137.5),
             Some(Hit::Queue(Target::Row(0)))
         );
+    }
+
+    /// The row minus removes is the one highlighted, and only while it still shows what was
+    /// clicked: rows removed or moved from their menu, another tab of the panel, the mini
+    /// player's queue or another tab's queue take the selection away instead of moving it
+    /// onto a different file.
+    #[test]
+    fn the_selection_lapses_when_its_rows_change() {
+        let mut ui = Ui::new();
+        ui.queue = State {
+            open: true,
+            ..Default::default()
+        };
+        let lay = |ui: &mut Ui, d: &QueueData| {
+            let mut l = Layout::new(1920.0, 1080.0, true, false);
+            l.add_queue(&ui.queue, d);
+            ui.layout = l;
+        };
+        let queued = |a: Option<Action>| match a {
+            Some(Action::Queue(q)) => Some(q),
+            _ => None,
+        };
+        let remove = |ui: &mut Ui| queued(ui.queue_click(Target::Tool(Tool::Remove)));
+        let d = data();
+        lay(&mut ui, &d);
+        assert!(ui.queue_click(Target::Row(2)).is_some());
+        lay(&mut ui, &d);
+        assert_eq!(ui.layout.queue.selected, Some(2));
+
+        // Row 0 goes from its menu: row 2 now shows another file, so nothing is selected.
+        let mut fewer = d.clone();
+        fewer.items.remove(0);
+        assert!(ui.queue_stale(Some(&fewer)));
+        lay(&mut ui, &fewer);
+        assert_eq!(ui.layout.queue.selected, None);
+        assert_eq!(remove(&mut ui), None);
+
+        // Bookmarks don't take a queue row's selection, nor the queue a bookmark's.
+        lay(&mut ui, &d);
+        ui.queue_click(Target::Row(0));
+        ui.queue.tab = Tab::Bookmarks;
+        lay(&mut ui, &d);
+        assert_eq!((ui.layout.queue.selected, remove(&mut ui)), (None, None));
+
+        // A row dragged to a new place stays selected there.
+        ui.queue.tab = Tab::Queue;
+        lay(&mut ui, &d);
+        ui.queue_click(Target::Row(1));
+        ui.queue.drag = Some((1, 4));
+        assert_eq!(queued(ui.queue_drop(1)), Some(QueueAction::Move(1, 3)));
+        let mut moved = d.clone();
+        let item = moved.items.remove(1);
+        moved.items.insert(3, item);
+        lay(&mut ui, &moved);
+        assert_eq!(ui.layout.queue.selected, Some(3));
+        assert_eq!(remove(&mut ui), Some(QueueAction::Remove(3)));
     }
 
     #[test]

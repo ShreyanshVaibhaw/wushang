@@ -26,4 +26,6 @@ clip $(pattern testsrc 6) $(tone 6 48000) -c:v libx265 -preset veryfast -pix_fmt
 clip $(pattern testsrc 6) $(tone 6 48000) -c:v libvpx-vp9 -deadline realtime -cpu-used 8 -b:v 2M -pix_fmt yuv420p -c:a libopus -shortest "$out/test_vp9.webm"
 # SVT-AV1 4 ignores log-level for its banner; SVT_LOG=1 keeps only errors.
 SVT_LOG=1 clip $(pattern testsrc 6) $(tone 6 48000) -c:v libsvtav1 -preset 11 -svtav1-params log-level=0 -pix_fmt yuv420p -c:a libopus -shortest "$out/test_av1.mkv"
+# What a DVD's VOBs hold: an MPEG-2 program stream with AC-3 sound, which disc tests cut into VOBs.
+clip -f lavfi -i testsrc=size=720x480:rate=30:duration=3 $(tone 3 48000) -c:v mpeg2video -b:v 2M -c:a ac3 -shortest -f vob "$out/test_dvd.vob"
 echo "testdata ready in $out"

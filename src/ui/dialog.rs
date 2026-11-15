@@ -101,6 +101,11 @@ const FILE_ROWS: usize = 4;
 const TABLE_ROW: f32 = 30.0;
 /// Longest playlist name, in characters.
 const MAX_NAME: usize = 120;
+/// Longest network address, in characters: signed CDN links carry long tokens.
+const MAX_ADDRESS: usize = 8192;
+/// How wide a field's line is measured and drawn, so the format's ellipsis never cuts it: room
+/// for `MAX_ADDRESS` of the widest characters. The field's clip shows its part of it.
+const FIELD_LINE: f32 = MAX_ADDRESS as f32 * 24.0;
 /// The caret's blink half-period.
 const BLINK_MS: u128 = 530;
 /// Largest side of a decoded thumbnail picture, in pixels.
@@ -163,11 +168,19 @@ const SHORTCUTS: [(&str, &str); 30] = [
 
 /// A single-line text field's text, caret and selection. Positions are byte offsets on char
 /// boundaries; the selection runs between `anchor` and `caret`.
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct TextField {
     pub text: String,
     caret: usize,
     anchor: usize,
+    /// The most characters it takes: a name's length, unless made for more.
+    max: usize,
+}
+
+impl Default for TextField {
+    fn default() -> Self {
+        TextField::new("")
+    }
 }
 
 impl TextField {
@@ -177,6 +190,15 @@ impl TextField {
             text: text.to_owned(),
             caret: text.len(),
             anchor: 0,
+            max: MAX_NAME,
+        }
+    }
+
+    /// An empty field that takes up to `max` characters.
+    fn with_max(max: usize) -> Self {
+        TextField {
+            max,
+            ..TextField::default()
         }
     }
 
@@ -230,10 +252,10 @@ impl TextField {
     }
 
     /// Replaces the selection with `s`. Line breaks become spaces and other control characters
-    /// go, since the field holds one line; the text stops at `MAX_NAME` characters.
+    /// go, since the field holds one line; the text stops at the field's most characters.
     pub fn insert(&mut self, s: &str) {
         let sel = self.selection();
-        let room = MAX_NAME
+        let room = (self.max)
             .saturating_sub(self.text.chars().count() - self.text[sel.clone()].chars().count());
         let clean: String = s
             .chars()
@@ -371,14 +393,14 @@ impl State {
         match dialog {
             Dialog::NewPlaylist { files } => state.add_files(files),
             Dialog::RenamePlaylist(name) => state.field = TextField::new(&name),
+            Dialog::Address(_) => state.field = TextField::with_max(MAX_ADDRESS),
             Dialog::Properties(path) => state.rows = properties(&path),
             Dialog::About
             | Dialog::Shortcuts
             | Dialog::DeletePlaylist(_)
             | Dialog::Update(_)
             | Dialog::Downloaded(_)
-            | Dialog::NewProfile
-            | Dialog::Address(_) => {}
+            | Dialog::NewProfile => {}
         }
         state
     }
@@ -1061,7 +1083,7 @@ impl Painter {
         let utf16: Vec<u16> = text.encode_utf16().collect();
         let layout = unsafe {
             self.dwrite
-                .CreateTextLayout(&utf16, &self.dialog.field_text, 10_000.0, 100.0)
+                .CreateTextLayout(&utf16, &self.dialog.field_text, FIELD_LINE, 100.0)
                 .ok()
         };
         let mut stops = Vec::new();
@@ -1782,7 +1804,7 @@ impl Painter {
                     rt.FillRectangle(&band.d2d(), &r.selection);
                 }
                 // Wide enough that the format's ellipsis never cuts the text; the clip does.
-                let text = Rect::new(x0, area.t, x0 + 10_000.0, area.b);
+                let text = Rect::new(x0, area.t, x0 + FIELD_LINE, area.b);
                 self.say(rt, &f.text, &r.field_text, text, &r.heading_fg);
             }
             if d.caret_visible() {
@@ -1807,6 +1829,7 @@ mod tests {
             text: text.into(),
             caret,
             anchor,
+            max: MAX_NAME,
         }
     }
 
@@ -1894,6 +1917,22 @@ mod tests {
             MAX_NAME,
             "a full field takes no more"
         );
+    }
+
+    /// Addresses run far past a name's length (signed CDN links carry long tokens), so the
+    /// address field keeps all of a pasted one.
+    #[test]
+    fn the_address_field_takes_a_long_address() {
+        let url = format!(
+            "https://cdn.example.com/live/index.m3u8?token={}",
+            "a".repeat(400)
+        );
+        let mut state = State::new(Dialog::Address(NetKind::Stream));
+        state.field.insert(&url);
+        assert_eq!(state.field.text, url);
+        let mut state = State::new(Dialog::NewProfile);
+        state.field.insert(&url);
+        assert_eq!(state.field.text.chars().count(), MAX_NAME);
     }
 
     #[test]

@@ -1075,11 +1075,12 @@ fn to_pixels(r: Rect) -> Px {
     }
 }
 
-/// Untagged HD video is BT.709 by convention and SD is BT.601, the same guess VLC and mpv make.
+/// Untagged HD video is BT.709 by convention and SD is BT.601. HD goes by width as well as
+/// height, as mpv's guess does, so wide films cropped to 1280x534 count as HD.
 pub fn is_bt709(frame: &ff::frame::Video) -> bool {
     match frame.color_space() {
         ff::color::Space::BT709 => true,
-        ff::color::Space::Unspecified => frame.height() >= 720,
+        ff::color::Space::Unspecified => frame.width() >= 1280 || frame.height() > 576,
         _ => false,
     }
 }
@@ -1323,6 +1324,19 @@ fn place(w: f64, h: f64, zoom: Zoom, area: Px) -> Px {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Untagged video guesses its colours from its size, as mpv does: HD by width as well as
+    /// height, so a 2.39:1 encode 1280 wide is HD, and PAL's 576 lines are SD.
+    #[test]
+    fn untagged_hd_is_bt709_by_width_too() {
+        let untagged = |w, h| ff::frame::Video::new(ff::format::Pixel::YUV420P, w, h);
+        assert!(is_bt709(&untagged(1280, 534)));
+        assert!(is_bt709(&untagged(1920, 800)));
+        assert!(is_bt709(&untagged(960, 720)));
+        assert!(!is_bt709(&untagged(720, 576)));
+        assert!(!is_bt709(&untagged(1024, 576)));
+        assert!(!is_bt709(&untagged(640, 480)));
+    }
 
     #[test]
     fn letterbox_centres_the_picture() {

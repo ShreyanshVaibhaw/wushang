@@ -430,6 +430,16 @@ impl State {
         self.open.is_some()
     }
 
+    /// The open menu's kind and its top level's labels.
+    #[cfg(test)]
+    pub fn shown(&self) -> Option<(Kind, Vec<&str>)> {
+        let open = self.open.as_ref()?;
+        Some((
+            open.kind,
+            open.items.iter().map(|i| i.label.as_str()).collect(),
+        ))
+    }
+
     /// The pointer moved over `target`, or off the menu. True when something changed.
     pub fn hover(&mut self, target: Option<Target>, now: Instant) -> bool {
         let Some(o) = self.open.as_mut() else {
@@ -1060,26 +1070,43 @@ pub fn entry_menu(
         }
         Entry::Media { path, .. } => Some((Kind::File, file_menu(path, playlists, within))),
         Entry::Folder {
-            place: Place::Playlist(name),
+            place: Place::Podcasts | Place::Radio,
             ..
-        } => Some((Kind::Playlist, playlist_menu(name, items, tracks))),
-        Entry::Folder {
-            place: Place::Podcast(url),
-            ..
-        } => {
+        } => None,
+        Entry::Folder { place, .. } if has_place_menu(place) => place_menu(place, items, tracks),
+        // A list of places (Songs, an album) as an entry: adding and resyncing still apply.
+        Entry::Folder { place, .. } => Some((Kind::Folder, folder_menu(place, tracks))),
+        Entry::Header { .. } | Entry::Action { .. } => None,
+    }
+}
+
+/// The menu of the page at `place`, which the library header's "..." opens: what a right-click
+/// on the place's own entry shows. `items` are a playlist's files. Pages that only list other
+/// places (Home, Recent, Songs...) have none.
+pub fn place_menu(
+    place: &Place,
+    items: &[PathBuf],
+    tracks: Option<(String, TrackPrefs)>,
+) -> Option<(Kind, Vec<Item>)> {
+    match place {
+        Place::Playlist(name) => Some((Kind::Playlist, playlist_menu(name, items, tracks))),
+        Place::Podcast(url) => {
             let forget = MenuAction::ForgetAddress(NetKind::Podcast, url.clone());
             Some((
                 Kind::Folder,
                 vec![Item::new("Remove Podcast", forget).icon(Icon::Delete)],
             ))
         }
-        Entry::Folder {
-            place: Place::Podcasts | Place::Radio,
-            ..
-        } => None,
-        Entry::Folder { place, .. } => Some((Kind::Folder, folder_menu(place, tracks))),
-        Entry::Header { .. } | Entry::Action { .. } => None,
+        Place::Folder(..) | Place::Videos | Place::Music => {
+            Some((Kind::Folder, folder_menu(place, tracks)))
+        }
+        _ => None,
     }
+}
+
+/// Whether the page at `place` has a menu for the header's "...".
+pub fn has_place_menu(place: &Place) -> bool {
+    place_menu(place, &[], None).is_some()
 }
 
 /// "Add to Playlist"'s submenu for `path`.

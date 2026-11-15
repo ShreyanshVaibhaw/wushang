@@ -843,7 +843,7 @@ impl Ui {
                     action.map(Action::Menu)
                 }
                 // Menus open under their button.
-                Some(h @ (Hit::More | Hit::Sort)) => {
+                Some(h @ (Hit::More | Hit::Sort | Hit::HeaderMore)) => {
                     let r = self.layout.button(h);
                     Some(Action::OpenMenu(h, r.l, r.b + 4.0))
                 }

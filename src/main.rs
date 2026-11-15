@@ -622,7 +622,7 @@ impl App {
             }
         };
         let stem = snapshot::stem(&session.path, &session.title);
-        let seconds = session.position().unwrap_or(0.0);
+        let seconds = session.place();
         let path = snapshot::free_path(&dir, &snapshot::file_name(&stem, seconds), ext);
         let name = path
             .file_name()
@@ -1235,11 +1235,7 @@ impl App {
         if !PREFS.with_borrow(|p| p.save_recent) || capture::is_capture_path(&s.path) {
             return;
         }
-        let position = if s.finished() {
-            s.duration
-        } else {
-            s.position().unwrap_or(0.0)
-        };
+        let position = if s.finished() { s.duration } else { s.place() };
         self.library.record_position(&s.path, position, s.duration);
         self.library_changed = true;
     }
@@ -1352,7 +1348,7 @@ impl App {
                 if let QueueAction::RemoveBookmark(i) = action {
                     self.bookmarks.remove(&s.path, i);
                 } else {
-                    self.bookmarks.add(&s.path, s.position().unwrap_or(0.0));
+                    self.bookmarks.add(&s.path, s.place());
                 }
                 if let Err(e) = self.bookmarks.save() {
                     eprintln!("bookmarks: cannot save ({e})");
@@ -1583,6 +1579,11 @@ impl Tab {
             false => ass::Fonts::default(),
         };
         let initial = session.take_initial_subtitles();
+        // A file picked while a stream connected stays picked over the file's own choice.
+        let picked = (self.external_selected)
+            .and_then(|i| self.external.get(i))
+            .map(|(p, _)| p.clone());
+        self.external_selected = None;
         self.external = subs::find_external(&session.path)
             .into_iter()
             .map(|p| (p, None))
@@ -1593,6 +1594,9 @@ impl Tab {
                 self.show_external(Some(0))
             }
             None => {}
+        }
+        if let Some(path) = picked {
+            self.show_subtitle_file(path);
         }
     }
 
@@ -1711,7 +1715,7 @@ impl Tab {
     /// The subtitle track on screen.
     fn subtitles(&self) -> Option<&Arc<Cues>> {
         match self.external_selected {
-            Some(i) => self.external[i].1.as_ref(),
+            Some(i) => self.external.get(i)?.1.as_ref(),
             None => self.embedded.as_ref().map(|(_, c)| c),
         }
     }
@@ -2896,10 +2900,7 @@ fn handle(app: &mut App, win: Window, hit: Hit) {
         Hit::Next => _ = app.step(1),
         Hit::Previous => {
             // Like VLC: back to the start, or to the previous file when already near it.
-            let near_start = app
-                .session()
-                .and_then(Session::position)
-                .is_none_or(|t| t < 3.0);
+            let near_start = app.session().map(Session::place).is_none_or(|t| t < 3.0);
             if !(near_start && app.step(-1)) {
                 app.tab().shared.seek_to(0.0);
             }
@@ -2942,6 +2943,25 @@ fn show_player() {
     }
 }
 
+/// A playlist's files, for its menu; other places have none listed there.
+fn place_items(app: &App, place: &Place) -> Vec<PathBuf> {
+    match place {
+        Place::Playlist(name) => app.library.playlist_items(name),
+        _ => Vec::new(),
+    }
+}
+
+/// The track languages set for a folder or playlist, with the scope they are kept under.
+fn place_tracks(app: &App, place: &Place) -> Option<(String, library::TrackPrefs)> {
+    let scope = match place {
+        Place::Folder(_, dir) => library::folder_scope(dir),
+        Place::Playlist(name) => library::playlist_scope(name),
+        _ => return None,
+    };
+    let prefs = app.library.track_prefs(&scope);
+    Some((scope, prefs))
+}
+
 /// Builds and opens the menu for a click on `hit`.
 fn open_menu(app: &mut App, hit: Hit, at: (f32, f32)) {
     use ui::menu::{self, Kind};
@@ -2968,6 +2988,14 @@ fn open_menu(app: &mut App, hit: Hit, at: (f32, f32)) {
             let items = menu::main_menu(&recent, p.names(), p.current(), &devices, converting);
             (Kind::Main, items)
         }
+        Hit::HeaderMore => {
+            let place = UI.with_borrow(|ui| ui.browse.place.clone());
+            let (items, tracks) = (place_items(app, &place), place_tracks(app, &place));
+            let Some(menu) = menu::place_menu(&place, &items, tracks) else {
+                return;
+            };
+            menu
+        }
         Hit::Sort => UI.with_borrow(|ui| {
             let b = &ui.browse;
             (
@@ -2992,29 +3020,11 @@ fn open_menu(app: &mut App, hit: Hit, at: (f32, f32)) {
             let Some(entry) = UI.with_borrow(|ui| ui.browse.entries.get(i).cloned()) else {
                 return;
             };
-            let items = match &entry {
-                Entry::Folder {
-                    place: Place::Playlist(name),
-                    ..
-                } => app.library.playlist_items(name),
-                _ => Vec::new(),
+            let (items, tracks) = match &entry {
+                Entry::Folder { place, .. } => (place_items(app, place), place_tracks(app, place)),
+                _ => (Vec::new(), None),
             };
             let place = UI.with_borrow(|ui| ui.browse.place.clone());
-            let scope = match &entry {
-                Entry::Folder {
-                    place: Place::Folder(_, dir),
-                    ..
-                } => Some(library::folder_scope(dir)),
-                Entry::Folder {
-                    place: Place::Playlist(name),
-                    ..
-                } => Some(library::playlist_scope(name)),
-                _ => None,
-            };
-            let tracks = scope.map(|s| {
-                let prefs = app.library.track_prefs(&s);
-                (s, prefs)
-            });
             let playlists = app.library.playlists();
             let Some((kind, mut menu)) =
                 menu::entry_menu(&entry, &playlists, &items, &place, tracks)
@@ -3070,9 +3080,7 @@ fn menu_action(app: &mut App, win: Window, action: MenuAction) {
             if app.session().is_some() {
                 UI.with_borrow_mut(|ui| {
                     ui.show(Page::Player);
-                    ui.panels
-                        .show(Some(Panel::Settings(tab)), Some(Hit::Settings));
-                    ui.relayout = true;
+                    ui.show_settings_popup(Panel::Settings(tab));
                 });
             }
         }
@@ -4163,10 +4171,7 @@ fn use_tool(app: &mut App, win: Window, item: ui::ToolItem) {
         }
         // The speed slider is on the settings popup's Playback tab.
         T::Speed => UI.with_borrow_mut(|ui| {
-            let panel = ui::panels::Panel::Settings(ui::panels::SettingsTab::Playback);
-            ui.panels.show(Some(panel), Some(Hit::Settings));
-            ui.queue.open = false;
-            ui.relayout = true;
+            ui.show_settings_popup(Panel::Settings(ui::panels::SettingsTab::Playback));
         }),
         T::Quit => destroy(win),
         T::Preferences => open_preferences(app, Category::Playback),
@@ -4678,6 +4683,123 @@ mod tests {
         assert_eq!(app.tabs.len(), 1);
         assert!(app.tab().is_empty());
         assert_eq!(app.tab().info().title, "New Tab");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A seek while paused stops the clock until the sound plays again: the place saved meanwhile
+    /// is the seek's target, not the start.
+    #[test]
+    fn a_paused_seek_keeps_its_place() {
+        let (mut app, dir, _one) = test_app("paused-seek");
+        let sound = media("test_60s.mp4");
+        app.tab().shared.toggle_mute();
+        assert!(app.play_file(&sound));
+        assert!(passes(&mut app, 10.0, |app| position(app, 0) > 0.2));
+        let shared = app.tab().shared.clone();
+        shared.toggle_pause();
+        shared.seek_to(30.0);
+        assert!(passes(&mut app, 5.0, |app| app
+            .tab()
+            .current
+            .as_ref()
+            .is_some_and(|c| c.pts > 29.0)));
+        assert!(
+            app.session().and_then(Session::position).is_none(),
+            "the clock waits for sound"
+        );
+        let near_30 = |app: &App| {
+            let resume = app.library.resume_position(&sound);
+            assert!(
+                resume.is_some_and(|t| (t - 30.0).abs() < 0.5),
+                "saved {resume:?}"
+            );
+        };
+        app.record(0);
+        near_30(&app);
+
+        // Opened again with autoplay off, it waits paused at that place, and keeps it.
+        PREFS.with_borrow_mut(|p| p.autoplay = false);
+        assert!(app.play_file(&sound));
+        app.record(0);
+        near_30(&app);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A subtitle file picked while a stream connects stays shown once it has: the stream's own
+    /// list of files beside it replaces the tab's, and used to leave the pick pointing past it.
+    #[test]
+    fn a_subtitle_file_picked_while_connecting_stays() {
+        let (mut app, dir, _one) = test_app("sub-while-connecting");
+        let srt = media("tracks.srt");
+        assert!(app.play_file(&media("test_60s_noaudio.mp4")));
+        let tab = app.tab_mut();
+        // As if picked before the session came: the connection finishing starts its subtitles.
+        tab.show_subtitle_file(srt.clone());
+        assert!(tab.subtitles().is_some());
+        tab.start_subtitles(&prefs());
+        assert!(tab.subtitles().is_some(), "the pick is kept");
+        assert_eq!(tab.external.last().map(|(p, _)| p), Some(&srt));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// The audio delay moves the clock ahead of the sound, not playback's place in the file: a
+    /// track switch (a seek by nothing) stays where it is, and a skip goes as far as it says.
+    #[test]
+    fn the_audio_delay_does_not_move_seeks() {
+        let (mut app, dir, _one) = test_app("delay-seek");
+        app.tab().shared.toggle_mute();
+        assert!(app.play_file(&media("test_60s.mp4")));
+        app.apply(Window, PanelAction::SetAudioDelay(2.0));
+        // Long enough for the sound to start and its callbacks to take the delay up.
+        assert!(passes(&mut app, 10.0, |app| position(app, 0) > 1.0));
+        thread::sleep(Duration::from_millis(200));
+        let shared = app.tab().shared.clone();
+        shared.toggle_pause();
+        let at = position(&app, 0);
+        shared.seek_by(0.0);
+        let target = shared.seek_target();
+        assert!(
+            (target - at).abs() < 0.1,
+            "at {at:.2}, seeking to {target:.2}"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// More Settings from the video's menu takes the queue's place: the two share the spot at
+    /// the right, and the popup under the queue took its clicks unseen.
+    #[test]
+    fn more_settings_closes_the_queue() {
+        let (mut app, dir, _one) = test_app("settings-over-queue");
+        assert!(app.play_file(&media("test_60s_noaudio.mp4")));
+        UI.with_borrow_mut(|ui| {
+            ui.show(Page::Player);
+            ui.toggle_queue();
+        });
+        let tab = ui::panels::SettingsTab::Video;
+        menu_action(&mut app, Window, MenuAction::Settings(tab));
+        let (queue, popup) = UI.with_borrow(|ui| (ui.queue.open, ui.panels.open));
+        assert_eq!((queue, popup), (false, Some(Panel::Settings(tab))));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// The library header's "..." opens the menu of the page it is on, as a right-click on that
+    /// page's entry would, and isn't there on pages that have none.
+    #[test]
+    fn the_header_more_button_opens_the_pages_menu() {
+        use ui::menu::Kind;
+        let (mut app, dir, _one) = test_app("header-more");
+        app.library.create_playlist("Mix").unwrap();
+        let mix = Place::Playlist("Mix".into());
+        UI.with_borrow_mut(|ui| {
+            ui.show(Page::Library);
+            ui.browse.go(mix.clone());
+        });
+        open_menu(&mut app, Hit::HeaderMore, (0.0, 0.0));
+        let shown = UI.with_borrow(|ui| ui.menu.shown().map(|(k, l)| (k, l[0].to_owned())));
+        assert_eq!(shown, Some((Kind::Playlist, "Play".to_owned())));
+        assert!(ui::menu::has_place_menu(&mix));
+        assert!(ui::menu::has_place_menu(&Place::Videos));
+        assert!(!ui::menu::has_place_menu(&Place::Recent));
         std::fs::remove_dir_all(dir).unwrap();
     }
 

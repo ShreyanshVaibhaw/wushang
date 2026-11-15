@@ -353,7 +353,8 @@ impl Device {
                     // A new stream's first callback reports no latency; trust it only to start
                     // the clock, or a device switch would nudge the picture ahead for a moment.
                     if latency > 0.0 || shared.clock.get().is_none() {
-                        shared.clock.set(pts - latency * speed + effects.delay());
+                        let heard = pts - latency * speed;
+                        shared.clock.set_with_lead(heard, effects.delay());
                     }
                 }
                 for (o, s) in out.iter_mut().zip(ring.samples.drain(..n)) {
@@ -598,7 +599,7 @@ pub fn spawn_decoder(
 /// WAV or Matroska often comes that way, and the frame itself needs the label too: swresample
 /// rejects a frame whose layout differs from the one it was set up with, which silenced every
 /// such file.
-fn label_layout(frame: &mut ff::frame::Audio) -> ff::ChannelLayout {
+pub(crate) fn label_layout(frame: &mut ff::frame::Audio) -> ff::ChannelLayout {
     let layout = frame.channel_layout();
     if !layout.is_empty() {
         return layout;
@@ -846,6 +847,25 @@ mod tests {
         ]
     }
 
+    /// Switches to `name` and waits for the new output to play: until it is the output named,
+    /// then for its first callbacks. The switch opens it on another thread, and its start moves
+    /// the clock once by the difference in the outputs' latency (the sound queued in the old one
+    /// never plays), so a rate measured across it counts that jump. Reopening the default shows
+    /// no change of name, and the settling wait alone covers it.
+    fn switch_and_settle(device: &Device, name: Option<&str>) {
+        device.switch_to(name);
+        let start = Instant::now();
+        while device.current_output().as_deref() != name {
+            assert!(
+                start.elapsed() < Duration::from_secs(10),
+                "{name:?} never opened"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        // Its first callbacks, which set the clock from the new latency.
+        thread::sleep(Duration::from_millis(500));
+    }
+
     /// Clock rate in media seconds per second, measured over `seconds`.
     fn clock_rate(shared: &Shared, seconds: f64) -> f64 {
         let start = Instant::now();
@@ -892,7 +912,7 @@ mod tests {
         device.effects().set_delay(0.0);
         thread::sleep(Duration::from_millis(100)); // let a callback apply it
 
-        device.switch_to(None);
+        switch_and_settle(&device, None);
         let rate = clock_rate(&shared, 3.0);
         eprintln!("across a device reopen: clock ran at {rate:.3}");
         assert!((rate - 1.5).abs() < 0.1, "clock ran at {rate}");
@@ -901,7 +921,7 @@ mod tests {
         // leaves the current one playing, so the rate holds either way.
         let devices = output_devices();
         if let Some(other) = devices.get(1) {
-            device.switch_to(Some(other));
+            switch_and_settle(&device, Some(other));
             let rate = clock_rate(&shared, 3.0);
             eprintln!(
                 "on {other:?}: clock ran at {rate:.3}, current {:?}",

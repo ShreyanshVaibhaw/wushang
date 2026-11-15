@@ -505,10 +505,15 @@ impl Session {
     }
 
     /// Where playback is in the media. The clock runs ahead by the audio delay (that is how the
-    /// delay shifts the picture), so take it back off.
+    /// delay shifts the picture), which this leaves out.
     pub fn position(&self) -> Option<f64> {
-        let delay = self.audio.effects().delay();
-        self.shared.clock.get().map(|t| t - delay)
+        self.shared.clock.media()
+    }
+
+    /// Where playback is, or, while the clock waits (paused after a seek, or paused before the
+    /// sound starts), where the last seek went: the place to resume or bookmark from.
+    pub fn place(&self) -> f64 {
+        self.position().unwrap_or_else(|| self.shared.seek_target())
     }
 
     fn open_video(&self, stream: usize) -> Result<ff::decoder::Video, String> {

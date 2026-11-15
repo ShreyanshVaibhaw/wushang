@@ -45,6 +45,9 @@ pub struct Clock(Mutex<ClockState>);
 
 struct ClockState {
     pts: f64,
+    /// How far `pts` runs ahead of the media: the audio delay, which moves the picture (that
+    /// follows the clock) ahead of the sound.
+    lead: f64,
     at: Instant,
     paused: bool,
     valid: bool,
@@ -52,10 +55,23 @@ struct ClockState {
     speed: f64,
 }
 
+impl ClockState {
+    fn now(&self) -> Option<f64> {
+        self.valid.then(|| {
+            if self.paused {
+                self.pts
+            } else {
+                self.pts + self.at.elapsed().as_secs_f64() * self.speed
+            }
+        })
+    }
+}
+
 impl Clock {
     fn new() -> Self {
         Clock(Mutex::new(ClockState {
             pts: 0.0,
+            lead: 0.0,
             at: Instant::now(),
             paused: false,
             valid: false,
@@ -64,21 +80,28 @@ impl Clock {
     }
 
     pub fn set(&self, pts: f64) {
+        self.set_with_lead(pts, 0.0);
+    }
+
+    /// Sets the clock to media time `pts` plus `lead`, the audio delay: what the picture
+    /// follows. `media` takes the lead back off.
+    pub fn set_with_lead(&self, pts: f64, lead: f64) {
         let mut s = self.0.lock().unwrap();
-        s.pts = pts;
+        s.pts = pts + lead;
+        s.lead = lead;
         s.at = Instant::now();
         s.valid = true;
     }
 
+    /// The time the picture follows: the media time plus the audio delay.
     pub fn get(&self) -> Option<f64> {
+        self.0.lock().unwrap().now()
+    }
+
+    /// Where playback is in the media, without the audio delay's lead.
+    pub fn media(&self) -> Option<f64> {
         let s = self.0.lock().unwrap();
-        s.valid.then(|| {
-            if s.paused {
-                s.pts
-            } else {
-                s.pts + s.at.elapsed().as_secs_f64() * s.speed
-            }
-        })
+        s.now().map(|t| t - s.lead)
     }
 
     pub fn set_paused(&self, paused: bool) {
@@ -300,7 +323,7 @@ impl Shared {
 
     pub fn seek_by(&self, delta: f64) {
         let mut seek = self.seek.lock().unwrap();
-        let from = self.clock.get().unwrap_or(seek.last);
+        let from = self.clock.media().unwrap_or(seek.last);
         seek.last = (from + delta).max(0.0);
         seek.pending = Some(seek.last);
         // No move at all re-reads where playback is (a recording starting), exactly.
@@ -309,6 +332,12 @@ impl Shared {
         } else {
             SeekKind::Jump(delta > 0.0)
         };
+    }
+
+    /// Where the last seek went (0 before any): playback's place while the clock waits for the
+    /// first sound or frame after it.
+    pub fn seek_target(&self) -> f64 {
+        self.seek.lock().unwrap().last
     }
 
     /// The seek the demuxer should do, and how it lands.
