@@ -1487,7 +1487,7 @@ fn list_dir(dir: &Path) -> (Named, Named) {
 
 /// Which folders hold media, searched for by one background thread so a listing never waits on
 /// it: a drive root can hold thousands of folders, and the window froze for minutes walking them.
-/// A subfolder lists until the search finds no media in it. A listing shows the answers it has
+/// A subfolder lists until the search finds it holds no media. A listing shows the answers it has
 /// at once and checks those older than `MEDIA_RECHECK` again, so a folder that gains or loses its
 /// media shows or goes the next time its parent is opened. `forget` (Resync) drops them all.
 #[derive(Default)]
@@ -1569,7 +1569,8 @@ fn search_dirs(state: &Mutex<DirSearch>) {
             };
             dir
         };
-        let has = has_media(&dir, MEDIA_SEARCH_DEPTH);
+        // Only a folder known to hold no media goes from the listing.
+        let has = has_media(&dir, MEDIA_SEARCH_DEPTH) != Some(false);
         let mut s = state.lock().unwrap();
         // A folder listed before its first answer only changes the listing if it goes.
         let was = s.known.get(&dir).is_none_or(|&(had, _)| had);
@@ -1593,15 +1594,37 @@ pub fn music_files(roots: &[PathBuf]) -> Vec<PathBuf> {
     out
 }
 
-/// Whether `dir` or its subfolders, `depth` levels in all, hold any media file.
-fn has_media(dir: &Path, depth: usize) -> bool {
-    fn search(dir: &Path, depth: usize, folders: &mut Folders) -> bool {
+/// Whether `dir` or its subfolders, `depth` levels in all, hold any media file. None when the
+/// search stopped before it could tell: subfolders deeper than `depth`, or more folders than a
+/// walk lists, are left unsearched, and the media may be in them.
+fn has_media(dir: &Path, depth: usize) -> Option<bool> {
+    fn search(dir: &Path, depth: usize, folders: &mut Folders) -> Option<bool> {
+        if folders.full() {
+            return None;
+        }
         if !folders.first_visit(dir) {
-            return false;
+            // Searched already, by another path to it.
+            return Some(false);
         }
         let (dirs, files) = list_dir(dir);
-        files.iter().any(|(_, p)| media_kind(p).is_some())
-            || depth > 1 && dirs.iter().any(|(_, d)| search(d, depth - 1, folders))
+        if files.iter().any(|(_, p)| media_kind(p).is_some()) {
+            return Some(true);
+        }
+        if dirs.is_empty() {
+            return Some(false);
+        }
+        if depth <= 1 {
+            return None;
+        }
+        let mut unknown = false;
+        for (_, d) in &dirs {
+            match search(d, depth - 1, folders) {
+                Some(true) => return Some(true),
+                Some(false) => {}
+                None => unknown = true,
+            }
+        }
+        (!unknown).then_some(false)
     }
     search(dir, depth, &mut Folders::default())
 }
@@ -1619,7 +1642,12 @@ impl Folders {
     /// Whether to go into `dir`: not seen before, by where it really is, and under the cap.
     fn first_visit(&mut self, dir: &Path) -> bool {
         let real = fs::canonicalize(dir).unwrap_or_else(|_| dir.to_owned());
-        self.0.len() < Self::MAX && self.0.insert(real)
+        !self.full() && self.0.insert(real)
+    }
+
+    /// Whether the walk has listed as many folders as it may.
+    fn full(&self) -> bool {
+        self.0.len() >= Self::MAX
     }
 }
 
@@ -1750,6 +1778,7 @@ mod tests {
             "Shows/.hidden/x.mp4",
             "Shows/Deep/a/b/c/d.mp3",
             "Shows/TooDeep/a/b/c/d/e.mp3",
+            "Shows/Bare/a/b/c/notes.txt",
         ] {
             tmp.touch(f);
         }
@@ -1758,9 +1787,11 @@ mod tests {
 
         let place = Place::Folder(Section::Videos, shows.clone());
         // Subfolders list at once, and those without media drop out once the search is done.
+        // One whose media may be deeper than the search goes stays, since it isn't known to be
+        // empty.
         assert_eq!(
             labels(&lib.entries(&place)),
-            "Deep|Empty|season 1|Season 2|Season 10|TooDeep|e1.mkv|E2.mp4|E10.mp4"
+            "Bare|Deep|Empty|season 1|Season 2|Season 10|TooDeep|e1.mkv|E2.mp4|E10.mp4"
         );
         lib.media_dirs.settle();
         assert!(lib.media_folders_changed());
@@ -1768,7 +1799,7 @@ mod tests {
         let entries = lib.entries(&place);
         assert_eq!(
             labels(&entries),
-            "Deep|season 1|Season 2|Season 10|e1.mkv|E2.mp4|E10.mp4"
+            "Deep|season 1|Season 2|Season 10|TooDeep|e1.mkv|E2.mp4|E10.mp4"
         );
         // A video added to an empty folder shows once its answer is old and the folder is
         // listed again.
@@ -2421,7 +2452,7 @@ mod tests {
             std::os::unix::fs::symlink(&m, m.join(format!("loop{i}"))).unwrap();
         }
         assert_eq!(music_files(std::slice::from_ref(&m)), [song]);
-        assert!(has_media(&m, MEDIA_SEARCH_DEPTH));
+        assert_eq!(has_media(&m, MEDIA_SEARCH_DEPTH), Some(true));
     }
 
     #[test]
