@@ -3906,18 +3906,9 @@ fn on_event(event: Event) {
             }
             // Typing goes to the library's search box while it has focus.
             UI.with_borrow_mut(|ui| {
-                let b = &mut ui.browse;
-                if !b.searching {
-                    return;
+                if ui.browse.searching && ui.browse.search_char(c) {
+                    ui.relayout = true;
                 }
-                match char::from_u32(c) {
-                    Some('\u{8}') => _ = b.search.pop(),
-                    Some(c) if !c.is_control() => b.search.push(c),
-                    _ => return,
-                }
-                b.scroll = 0.0;
-                b.apply();
-                ui.relayout = true;
             });
         }
         Event::Key {
@@ -3926,7 +3917,9 @@ fn on_event(event: Event) {
             ctrl,
             alt,
         } => {
-            let typing = UI.with_borrow(|ui| ui.dialog.is_some() || ui.preferences.is_some());
+            let typing = UI.with_borrow(|ui| {
+                ui.dialog.is_some() || ui.preferences.is_some() || ui.browse.searching
+            });
             if alt && !typing {
                 // Option + Left/Right is Alt's very short skip. Other Option keys type
                 // characters, as Alt keys on Windows did nothing here.
@@ -3995,7 +3988,7 @@ fn act(win: Window, shared: &Shared, action: Option<Action>) {
         ui.dirty = true;
         // A click anywhere else takes focus from an empty search box.
         if ui.browse.searching
-            && ui.browse.search.is_empty()
+            && ui.browse.search.text.is_empty()
             && !matches!(action, Action::Click(Hit::Search))
         {
             ui.browse.searching = false;
@@ -4329,15 +4322,10 @@ fn on_key(win: Window, shared: &Shared, key: VIRTUAL_KEY, shift: bool, ctrl: boo
     }
     // While searching, keys type; Esc clears the search and Enter keeps it.
     if UI.with_borrow(|ui| ui.browse.searching) {
-        UI.with_borrow_mut(|ui| match key {
-            VK_ESCAPE => {
-                ui.browse.search.clear();
-                ui.browse.searching = false;
-                ui.browse.apply();
+        UI.with_borrow_mut(|ui| {
+            if ui.browse.search_key(key, shift, ctrl, alt) {
                 ui.relayout = true;
             }
-            VK_RETURN => ui.browse.searching = false,
-            _ => {}
         });
         return;
     }

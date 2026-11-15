@@ -2,6 +2,7 @@
 //! grid or list, and the mini player card. Sizes are DIPs from the design's 1920x1080 library
 //! frames ("Videos > Shows > The Wand > S01"), colours sampled from them.
 
+use super::dialog::TextField;
 use super::*;
 use crate::library::{Crumb, Entry, Library, MediaKind, Place};
 
@@ -190,7 +191,8 @@ pub struct Browse {
     pub scroll: f32,
     pub grid: bool,
     pub sort: SortMode,
-    pub search: String,
+    pub search: TextField,
+    /// The search box has focus: typing goes to it.
     pub searching: bool,
     /// The place or the library changed: reload the entries.
     pub stale: bool,
@@ -213,7 +215,7 @@ impl Browse {
             scroll: 0.0,
             grid: true,
             sort: SortMode::default(),
-            search: String::new(),
+            search: TextField::default(),
             searching: false,
             stale: true,
             context: None,
@@ -245,7 +247,7 @@ impl Browse {
 
     fn arrived(&mut self) {
         self.scroll = 0.0;
-        self.search.clear();
+        self.search = TextField::default();
         self.searching = false;
         self.stale = true;
     }
@@ -270,7 +272,7 @@ impl Browse {
 
     /// Re-filters and re-sorts after the search text or sort order changed.
     pub fn apply(&mut self) {
-        let needle = self.search.to_lowercase();
+        let needle = self.search.text.to_lowercase();
         let searching = !needle.is_empty();
         let (actions, mut rest): (Vec<Entry>, Vec<Entry>) = self
             .all
@@ -292,6 +294,39 @@ impl Browse {
         }
         self.entries = actions;
         self.entries.append(&mut rest);
+    }
+
+    /// A character typed into the search box; true when it went in.
+    pub fn search_char(&mut self, c: u32) -> bool {
+        let Some(c) = char::from_u32(c).filter(|c| !c.is_control()) else {
+            return false;
+        };
+        self.search.insert(c.encode_utf8(&mut [0; 4]));
+        self.scroll = 0.0;
+        self.apply();
+        true
+    }
+
+    /// A key while the search box has focus, with Command (or Control) as `cmd` and Option as
+    /// `alt`: Esc clears the search and leaves the box, Enter keeps it and leaves, the rest edit
+    /// it as a dialog's field. True when the page changed.
+    pub fn search_key(&mut self, key: VIRTUAL_KEY, shift: bool, cmd: bool, alt: bool) -> bool {
+        let before = self.search.text.clone();
+        match key {
+            VK_ESCAPE => {
+                self.search = TextField::default();
+                self.searching = false;
+            }
+            VK_RETURN => self.searching = false,
+            _ if self.search.key(key, shift, cmd, alt) => {}
+            _ => return false,
+        }
+        // New results start at the top.
+        if self.search.text != before {
+            self.scroll = 0.0;
+            self.apply();
+        }
+        true
     }
 
     /// Folders and files on the page, as the header counts them.
@@ -751,6 +786,8 @@ pub(super) struct Resources {
     /// The overlay panel's list, a shade lighter than the page.
     list_bg: ID2D1SolidColorBrush,
     search_bg: ID2D1SolidColorBrush,
+    /// The search box's selected text.
+    selection: ID2D1SolidColorBrush,
     line: ID2D1SolidColorBrush,
     label: ID2D1SolidColorBrush,
     dim: ID2D1SolidColorBrush,
@@ -813,6 +850,7 @@ impl Resources {
             panel: brush(BG_PANEL, 1.0)?,
             list_bg: brush(0x0F0F0F, 1.0)?,
             search_bg: brush(BG_SEARCH, 1.0)?,
+            selection: brush(ACCENT, 0.35)?,
             line: brush(LINE, 1.0)?,
             label: brush(FG_LABEL, 1.0)?,
             dim: brush(FG_DIM, 1.0)?,
@@ -1058,15 +1096,29 @@ impl Painter {
             rt.FillRoundedRectangle(&rounded(field, 6.0), &r.search_bg);
             self.icon(ctx, &i.search, field.l + 5.0, HEADER_CY - 12.0, false);
             let text_area = Rect::new(field.l + 40.0, field.t, field.r - 10.0, field.b);
-            if b.search.is_empty() && !b.searching {
+            let f = &b.search;
+            if f.text.is_empty() && !b.searching {
                 self.text_in(rt, "Search", &r.placeholder, text_area, &r.faint);
             } else {
-                self.text_in(rt, &b.search, &r.name, text_area, &r.label);
+                rt.PushAxisAlignedClip(&text_area.d2d(), D2D1_ANTIALIAS_MODE_ALIASED);
+                // Scrolled to keep the caret in view once the text outgrows the box.
+                let caret_x = self.measure(&f.text[..f.caret()], &r.name);
+                let x0 = text_area.l - (caret_x - (text_area.w() - 2.0)).max(0.0);
+                let sel = f.selection();
+                if b.searching && !sel.is_empty() {
+                    let a = self.measure(&f.text[..sel.start], &r.name);
+                    let z = self.measure(&f.text[..sel.end], &r.name);
+                    let band = Rect::new(x0 + a, HEADER_CY - 10.0, x0 + z, HEADER_CY + 10.0);
+                    rt.FillRectangle(&band.d2d(), &r.selection);
+                }
+                let line = Rect::new(x0, text_area.t, x0 + 10_000.0, text_area.b);
+                self.text_in(rt, &f.text, &r.name, line, &r.label);
                 if b.searching {
-                    let x = text_area.l + self.measure(&b.search, &r.name) + 1.0;
+                    let x = (x0 + caret_x).round() + 1.0;
                     let caret = Rect::new(x, HEADER_CY - 9.0, x + 1.0, HEADER_CY + 9.0);
                     rt.FillRectangle(&caret.d2d(), &r.label);
                 }
+                rt.PopAxisAlignedClip();
             }
             // Where the layout put them, if it did.
             let shown = |hit| Some(l.button(hit)).filter(|r| r.w() > 0.0);
@@ -1577,5 +1629,29 @@ mod tests {
         let max = ui.layout.browse.max_scroll;
         ui.scroll(-60.0);
         assert_eq!(ui.browse.scroll, max - 60.0);
+    }
+
+    /// The search box edits as a dialog's field does, and new results start at the top.
+    #[test]
+    fn the_search_box_edits_like_a_field() {
+        let mut b = Browse::new();
+        b.place = Place::Videos;
+        b.all = vec![dir("road trip"), dir("road works"), dir("home")];
+        b.searching = true;
+        for c in "road trip".chars() {
+            assert!(b.search_char(c as u32));
+        }
+        assert!(!b.search_char(8), "Backspace comes as a key");
+        assert_eq!(labels(&b.entries), ["road trip"]);
+        b.scroll = 300.0;
+        assert!(b.search_key(VK_BACK, false, false, true));
+        assert_eq!(b.search.text, "road ");
+        assert_eq!(labels(&b.entries), ["road trip", "road works"]);
+        assert_eq!(b.scroll, 0.0);
+        assert!(b.search_key(VK_LEFT, true, true, false));
+        assert_eq!(b.search.selected(), "road ");
+        assert!(b.search_key(VK_ESCAPE, false, false, false));
+        assert_eq!((b.search.text.as_str(), b.searching), ("", false));
+        assert_eq!(b.entries.len(), 3);
     }
 }
