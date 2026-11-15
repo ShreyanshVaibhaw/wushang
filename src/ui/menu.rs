@@ -1406,27 +1406,6 @@ impl Painter {
         }
     }
 
-    unsafe fn menu_text(
-        &self,
-        rt: &ID2D1RenderTarget,
-        text: &str,
-        format: &IDWriteTextFormat,
-        r: Rect,
-        brush: &ID2D1SolidColorBrush,
-    ) {
-        let utf16: Vec<u16> = text.encode_utf16().collect();
-        unsafe {
-            rt.DrawText(
-                &utf16,
-                format,
-                &r.d2d(),
-                brush,
-                D2D1_DRAW_TEXT_OPTIONS_CLIP,
-                DWRITE_MEASURING_MODE_NATURAL,
-            )
-        };
-    }
-
     unsafe fn menu_row(
         &self,
         rt: &ID2D1RenderTarget,
@@ -1460,7 +1439,7 @@ impl Painter {
             let mut right = f.r - 16.0;
             if !item.key.is_empty() {
                 let kr = Rect::new(f.l + LABEL_X, r.t, f.r - KEY_R, r.b);
-                self.menu_text(rt, item.key, &m.key_text, kr, &m.key);
+                self.put(rt, item.key, &m.key_text, kr, &m.key);
                 right = f.r - KEY_R - self.measure(item.key, &m.key_text) - 12.0;
             }
             // In a menu with icons, an icon-less row's check takes the icon's place, as in the
@@ -1482,7 +1461,7 @@ impl Painter {
             } else {
                 &m.label
             };
-            self.menu_text(
+            self.put(
                 rt,
                 &item.label,
                 &m.text,

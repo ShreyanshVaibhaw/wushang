@@ -1778,20 +1778,6 @@ impl Painter {
         }
     }
 
-    unsafe fn text(&self, rt: &ID2D1RenderTarget, text: &str, format: &IDWriteTextFormat, r: Rect) {
-        let utf16: Vec<u16> = text.encode_utf16().collect();
-        unsafe {
-            rt.DrawText(
-                &utf16,
-                format,
-                &r.d2d(),
-                &self.fg,
-                D2D1_DRAW_TEXT_OPTIONS_CLIP,
-                DWRITE_MEASURING_MODE_NATURAL,
-            )
-        };
-    }
-
     /// The subtitle timeline: a thin line along the seek bar's bottom under each subtitle,
     /// lines closer than a pixel merged.
     unsafe fn sub_marks(&self, rt: &ID2D1RenderTarget, s: &Scene, t: Rect) {
@@ -1890,7 +1876,7 @@ impl Painter {
                 } else {
                     s.title
                 };
-                self.text(rt, title, &self.title, area);
+                self.put(rt, title, &self.title, area, &self.fg);
             }
             self.new_tab_button(rt, ctx, s);
             let full = if s.fullscreen {
@@ -1917,7 +1903,13 @@ impl Painter {
     unsafe fn control_bar(&self, rt: &ID2D1RenderTarget, ctx: &ID2D1DeviceContext5, s: &Scene) {
         let l = s.layout;
         unsafe {
-            self.text(rt, &clock_text(s.position), &self.times, l.current);
+            self.put(
+                rt,
+                &clock_text(s.position),
+                &self.times,
+                l.current,
+                &self.fg,
+            );
             let total = if s.live {
                 "Live".to_owned()
             } else if s.time_left {
@@ -1926,7 +1918,7 @@ impl Painter {
             } else {
                 clock_text(s.duration)
             };
-            self.text(rt, &total, &self.times, l.duration);
+            self.put(rt, &total, &self.times, l.duration, &self.fg);
             // Seek bar: dark track, a played section and an orange handle at its end.
             let t = l.track;
             rt.FillRoundedRectangle(&rounded(t, 6.0), &self.track);
@@ -1992,7 +1984,7 @@ impl Painter {
                 }
             }
             let label = Rect::new(tip.l, tip.b - LABEL, tip.r, tip.b);
-            self.text(rt, &clock_text(at), &self.times, label);
+            self.put(rt, &clock_text(at), &self.times, label, &self.fg);
         }
     }
 
@@ -2028,11 +2020,11 @@ impl Painter {
                 ToolItem::Folder => {
                     self.icon(ctx, &i.folder, r.l + 2.0, cy - 12.0, true);
                     let tr = Rect::new(r.l + 30.0, cy - 20.0, r.r, cy + 20.0);
-                    self.text(rt, s.folder, &self.folder, tr);
+                    self.put(rt, s.folder, &self.folder, tr, &self.fg);
                 }
                 ToolItem::FileName => {
                     let tr = Rect::new(r.l, cy - 20.0, r.r, cy + 20.0);
-                    self.text(rt, s.file, &self.folder, tr);
+                    self.put(rt, s.file, &self.folder, tr, &self.fg);
                 }
                 ToolItem::ArtistName | ToolItem::PlaylistName => {
                     let text = match p.item {
@@ -2042,7 +2034,7 @@ impl Painter {
                     if !text.is_empty() {
                         self.hover_box(rt, s, Hit::Tool(p.item));
                         let tr = Rect::new(r.l + 6.0, cy - 20.0, r.r - 6.0, cy + 20.0);
-                        self.text(rt, text, &self.folder, tr);
+                        self.put(rt, text, &self.folder, tr, &self.fg);
                     }
                 }
                 ToolItem::Thumbnail => self.bar_thumbnail(rt, ctx, s, r, cy),
@@ -2172,7 +2164,7 @@ impl Painter {
             _ => return,
         };
         let r = Rect::new(cx - 8.0, cy - 4.0, cx + 8.0, cy + 8.0);
-        unsafe { self.text(rt, n, &self.skip_text, r) };
+        unsafe { self.put(rt, n, &self.skip_text, r, &self.fg) };
     }
 }
 
