@@ -150,6 +150,13 @@ pub fn open_file(path: &Path) -> Result<ff::format::context::Input, String> {
         .map_err(|e| format!("cannot open {path:?}: {e}"))
 }
 
+/// Opens the playing file at `path` again, for the subtitle preroll's second reader, with
+/// `open_file`'s limits: a second reader must not follow a playlist the first one refused.
+fn reopener(path: &Path) -> player::Reopen {
+    let path = path.to_owned();
+    Arc::new(move || open_file(&path))
+}
+
 /// Every demuxer this FFmpeg has except those `open_file` leaves out, comma-separated. The
 /// Windows build's slim FFmpeg has none of the others; Homebrew's has them all.
 fn local_formats() -> &'static str {
@@ -463,11 +470,7 @@ impl Session {
             }
         });
         // Plain files only: a stream or a disc would be read twice over.
-        let reopen = (!capture && !disc && url.is_none()).then(|| {
-            let path = path.to_owned();
-            let open = move || ff::format::input(&path).map_err(|e| e.to_string());
-            Arc::new(open) as player::Reopen
-        });
+        let reopen = (!capture && !disc && url.is_none()).then(|| reopener(path));
         let copies = vec![session.record.clone(), session.stream.clone()];
         session.demuxer = Some(player::spawn_demuxer(
             input,
@@ -1079,6 +1082,12 @@ mod tests {
         drop(plain);
         assert!(open_file(&fake).is_err());
         assert!(open_file(&segment).is_ok(), "real files still open");
+        // The second reader the subtitle preroll opens is held to the same rules.
+        assert!(
+            reopener(&fake)().is_err(),
+            "the reopened file followed the playlist"
+        );
+        assert!(reopener(&segment)().is_ok());
         assert!(
             open_file(Path::new("concat:a|b")).is_err(),
             "no protocol names"
