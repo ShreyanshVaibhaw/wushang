@@ -30,17 +30,15 @@ const DASH: u32 = 0x3A3A3A;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Target {
+    /// Anywhere else, the palette's and groups' empty parts among it. Drops go by
+    /// [`Geometry::drop_at`], not by target.
     Body,
     Close,
     Cancel,
     Save,
-    /// The palette outside its items: a drop there takes the item out of the bars.
-    Box,
     Palette(Item),
     /// An item in the bars, by zone and index.
     Placed(Zone, usize),
-    /// A group's empty part.
-    Zone(Zone),
 }
 
 /// An item on its way somewhere, and where the pointer is.
@@ -121,16 +119,11 @@ impl Geometry {
                 .cells
                 .iter()
                 .find(|(_, r)| r.contains(x, y))
-                .map_or(Target::Box, |(item, _)| Target::Palette(*item));
+                .map_or(Target::Body, |(item, _)| Target::Palette(*item));
         }
-        if let Some(p) = self.placed.iter().find(|p| p.r.contains(x, y)) {
-            return Target::Placed(p.zone, p.index);
-        }
-        ZONES
-            .iter()
-            .zip(self.zones)
-            .find(|(_, r)| r.contains(x, y))
-            .map_or(Target::Body, |(z, _)| Target::Zone(*z))
+        (self.placed.iter())
+            .find(|p| p.r.contains(x, y))
+            .map_or(Target::Body, |p| Target::Placed(p.zone, p.index))
     }
 
     /// Where an item dropped at (x, y) goes: the palette takes it out, a group takes it
