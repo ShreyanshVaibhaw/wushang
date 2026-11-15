@@ -11,7 +11,7 @@
 
 use std::time::Instant;
 
-use super::dialog::{Reach, TextField};
+use super::dialog::TextField;
 use super::*;
 use crate::dsp::EQ_PRESETS;
 use crate::prefs::{self, Choices, Prefs};
@@ -598,7 +598,7 @@ impl State {
             scroll: 0.0,
             list: None,
             list_scroll: 0.0,
-            search: TextField::default(),
+            search: search_field(),
             focused: false,
             blink: Instant::now(),
             blink_on: true,
@@ -1233,7 +1233,7 @@ impl Ui {
             Target::Category(c) => {
                 st.category = c;
                 st.scroll = 0.0;
-                st.search = TextField::default();
+                st.search = search_field();
                 None
             }
             Target::Pick(ctl, i) => {
@@ -1309,23 +1309,18 @@ impl Ui {
         match key {
             VK_ESCAPE if st.list.is_some() => st.list = None,
             VK_ESCAPE if !f.text.is_empty() => {
-                *f = TextField::default();
+                *f = search_field();
                 st.scroll = 0.0;
             }
             VK_ESCAPE => self.close_preferences(),
-            VK_LEFT => f.left(shift, Reach::of(cmd, alt)),
-            VK_RIGHT => f.right(shift, Reach::of(cmd, alt)),
-            VK_HOME => f.move_to(0, shift),
-            VK_END => f.move_to(usize::MAX, shift),
-            VK_BACK => f.backspace(Reach::of(cmd, alt)),
-            VK_DELETE => f.delete(Reach::of(cmd, alt)),
-            VK_A if cmd => f.select_all(),
+            _ if f.key(key, shift, cmd, alt) => {}
             _ => return,
         }
         if let Some(st) = self.preferences.as_mut() {
             st.blink = Instant::now();
             // New results start at the top.
             if st.search.text != before {
+                st.focused = true;
                 st.scroll = 0.0;
                 st.list = None;
             }
@@ -1339,7 +1334,6 @@ impl Ui {
         };
         if let Some(c) = char::from_u32(c).filter(|c| !c.is_control())
             && st.typing
-            && st.search.text.chars().count() < 60
         {
             st.search.insert(c.encode_utf8(&mut [0; 4]));
             st.focused = true;
@@ -1900,6 +1894,11 @@ impl Painter {
             rt.PopAxisAlignedClip();
         }
     }
+}
+
+/// An empty search box; it takes 60 characters.
+fn search_field() -> TextField {
+    TextField::with_max(60)
 }
 
 fn centre(r: Rect) -> (f32, f32) {

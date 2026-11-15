@@ -215,7 +215,7 @@ impl TextField {
     }
 
     /// An empty field that takes up to `max` characters.
-    fn with_max(max: usize) -> Self {
+    pub fn with_max(max: usize) -> Self {
         TextField {
             max,
             ..TextField::default()
