@@ -1008,6 +1008,8 @@ impl Ui {
     pub fn end_pointer(&mut self) {
         self.pressed = None;
         self.drag = None;
+        // A queue row's press or drag too, which the next move would start again.
+        (self.queue.press, self.queue.drag) = (None, None);
         self.seek_preview = None;
         self.dirty = true;
     }

@@ -928,6 +928,22 @@ mod tests {
     /// clicked: rows removed or moved from their menu, another tab of the panel, the mini
     /// player's queue or another tab's queue take the selection away instead of moving it
     /// onto a different file.
+    /// A row's drag ends with the page it was on: the queue pressed on the player page must
+    /// not be dragged from another page, where the drop would move its row to the top unseen.
+    #[test]
+    fn a_page_change_ends_a_row_drag() {
+        let mut ui = Ui::new();
+        ui.show(Page::Player);
+        ui.queue = State {
+            open: true,
+            press: Some((2, 300.0)),
+            drag: Some((2, 3)),
+            ..Default::default()
+        };
+        ui.show(Page::Library);
+        assert_eq!((ui.queue.press, ui.queue.drag), (None, None));
+    }
+
     #[test]
     fn the_selection_lapses_when_its_rows_change() {
         let mut ui = Ui::new();
