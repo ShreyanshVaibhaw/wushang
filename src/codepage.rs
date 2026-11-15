@@ -4,17 +4,21 @@
 //! numbers; encoding_rs does the decoding, with the WHATWG versions of each (the same tables, and
 //! for 936, 949 and 950 their supersets GB18030, UHC and Big5-HKSCS).
 //!
-//! A language tag (from "movie.ru.srt") settles it when it names one. Otherwise every candidate
+//! A UTF-16 byte order mark settles it first. A language tag (from "movie.ru.srt") settles it when it names one. Otherwise every candidate
 //! decodes the text and the most plausible result wins: words in one script, Latin words with
 //! some plain ASCII in them, and for the CJK code pages strict decoding into CJK characters.
 
 const UTF8: u32 = 65001;
+const UTF16LE: u32 = 1200;
+const UTF16BE: u32 = 1201;
 
 /// The encoding behind a Windows code page number, None for one wushang doesn't know.
 fn encoding(cp: u32) -> Option<&'static encoding_rs::Encoding> {
     use encoding_rs::*;
     Some(match cp {
         UTF8 => UTF_8,
+        UTF16LE => UTF_16LE,
+        UTF16BE => UTF_16BE,
         874 => WINDOWS_874,
         932 => SHIFT_JIS,
         936 => GBK,
@@ -87,6 +91,13 @@ pub fn detect(text: &[u8], language: Option<&str>) -> u32 {
     if std::str::from_utf8(text).is_ok() {
         return UTF8;
     }
+    // Notepad's "Unicode" is UTF-16 with a byte order mark. Read as a code page, every other
+    // byte would be a NUL, and libass stops at the first one.
+    match encoding_rs::Encoding::for_bom(text) {
+        Some((e, _)) if e == encoding_rs::UTF_16LE => return UTF16LE,
+        Some((e, _)) if e == encoding_rs::UTF_16BE => return UTF16BE,
+        _ => {}
+    }
     if let Some(cp) = language.and_then(for_language)
         && decode(text, cp, true).is_some()
     {
@@ -117,9 +128,14 @@ pub fn detect(text: &[u8], language: Option<&str>) -> u32 {
     }
 }
 
-/// `text` in code page `cp` as a string; with `strict`, None when it isn't valid in it.
+/// `text` in code page `cp` as a string, without the code page's byte order mark if it starts
+/// with one; with `strict`, None when it isn't valid in it.
 pub fn decode(text: &[u8], cp: u32, strict: bool) -> Option<String> {
     let encoding = encoding(cp)?;
+    let text = match encoding_rs::Encoding::for_bom(text) {
+        Some((e, bom)) if e == encoding => &text[bom..],
+        _ => text,
+    };
     if strict {
         encoding
             .decode_without_bom_handling_and_without_replacement(text)
@@ -309,6 +325,18 @@ mod tests {
             );
         }
         assert_eq!(detect("plain ascii and UTF-8: été".as_bytes(), None), UTF8);
+    }
+
+    #[test]
+    fn a_byte_order_mark_means_utf16() {
+        let units: Vec<u16> = "\u{feff}Café, Привет".encode_utf16().collect();
+        let le: Vec<u8> = units.iter().flat_map(|u| u.to_le_bytes()).collect();
+        let be: Vec<u8> = units.iter().flat_map(|u| u.to_be_bytes()).collect();
+        for bytes in [le, be] {
+            let cp = detect(&bytes, Some("ru"));
+            assert_eq!(decode(&bytes, cp, true).as_deref(), Some("Café, Привет"));
+            assert_eq!(decode(&bytes, cp, false).as_deref(), Some("Café, Привет"));
+        }
     }
 
     #[test]

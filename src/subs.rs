@@ -382,7 +382,7 @@ pub fn load_external(
         && crate::ass::styling()
         && let Ok(bytes) = std::fs::read(path)
     {
-        // libass reads UTF-8; old .ssa files are often in a Windows code page.
+        // libass reads UTF-8; old .ssa files are often in a Windows code page, or UTF-16.
         let text = match std::str::from_utf8(&bytes) {
             Ok(_) => bytes,
             Err(_) => {
@@ -1262,20 +1262,17 @@ mod tests {
         assert!(cues.active(2.5).is_empty() && cues.active(0.5).is_empty());
     }
 
-    #[test]
-    fn loads_ass() {
-        let dir = temp_dir("ass");
-        let path = dir.join("movie.ass");
-        let ass = "\u{feff}[Script Info]\nScriptType: v4.00+\nPlayResX: 1920\nPlayResY: 1080\n\n\
+    /// A styled script with events from 1.25 to 3 s and from 5.5 to 7 s.
+    const ASS: &str = "[Script Info]\nScriptType: v4.00+\nPlayResX: 1920\nPlayResY: 1080\n\n\
             [V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\n\
             Style: Default,Arial,60,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,2,0,2,10,10,40,1\n\n\
             [Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n\
             Dialogue: 0,0:00:05.50,0:00:07.00,Default,,0,0,0,,Later, with commas\n\
             Dialogue: 0,0:00:01.25,0:00:03.00,Default,,0,0,0,,{\\i1}Leaning{\\i0} in\\Nnext line\n";
-        std::fs::write(&path, ass).unwrap();
-        // libass draws the file, one picture per moment on the video-sized canvas.
-        let cues = load_external(&path, (1920, 1080), &crate::ass::Fonts::default()).unwrap();
-        let shown = |t: f64| match cues.active(t).as_slice() {
+
+    /// Whether `cues` show one libass picture at `t`.
+    fn shows_picture(cues: &Cues, t: f64) -> bool {
+        match cues.active(t).as_slice() {
             [
                 Cue {
                     content:
@@ -1289,7 +1286,16 @@ mod tests {
             ] => rects.len() == 1,
             [] => false,
             other => panic!("{other:?}"),
-        };
+        }
+    }
+
+    #[test]
+    fn loads_ass() {
+        let path = temp_dir("ass").join("movie.ass");
+        std::fs::write(&path, format!("\u{feff}{ASS}")).unwrap();
+        // libass draws the file, one picture per moment on the video-sized canvas.
+        let cues = load_external(&path, (1920, 1080), &crate::ass::Fonts::default()).unwrap();
+        let shown = |t: f64| shows_picture(&cues, t);
         assert!(!shown(1.0) && shown(2.0) && !shown(4.0) && shown(6.0) && !shown(7.5));
 
         // Without libass, and for every other text format, the events are read as text.
@@ -1303,6 +1309,35 @@ mod tests {
         assert_eq!(
             parse_ass_event("Dialogue: 0,0:00:05.50,0:00:07.00,Default,,0,0,0,,Later, with commas"),
             vec![vec![span("Later, with commas", false, false)]]
+        );
+    }
+
+    /// Notepad's "Unicode" is UTF-16 with a byte order mark. Read byte by byte, every other
+    /// byte is a NUL, and libass stops at the first one.
+    #[test]
+    fn loads_utf16_ass() {
+        let dir = temp_dir("ass-utf16");
+        let units: Vec<u16> = format!("\u{feff}{ASS}").encode_utf16().collect();
+        let le: Vec<u8> = units.iter().flat_map(|u| u.to_le_bytes()).collect();
+        let be: Vec<u8> = units.iter().flat_map(|u| u.to_be_bytes()).collect();
+        for (name, bytes) in [("le.ass", le), ("be.ass", be)] {
+            let path = dir.join(name);
+            std::fs::write(&path, bytes).unwrap();
+            let cues = load_external(&path, (1920, 1080), &crate::ass::Fonts::default()).unwrap();
+            let shown = |t: f64| shows_picture(&cues, t);
+            assert!(
+                cues.ass.is_some() && !shown(1.0) && shown(2.0) && shown(6.0),
+                "{name} lost its events"
+            );
+        }
+        let srt = "\u{feff}1\r\n00:00:01,000 --> 00:00:02,000\r\nCafé\r\n\r\n";
+        let bytes: Vec<u8> = srt.encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
+        let path = dir.join("movie.srt");
+        std::fs::write(&path, bytes).unwrap();
+        let cues = load_external(&path, (1920, 1080), &crate::ass::Fonts::default()).unwrap();
+        assert_eq!(
+            text(&cues.active(1.5)[0]),
+            &vec![vec![span("Café", false, false)]]
         );
     }
 
