@@ -16,7 +16,8 @@ use ffmpeg_next as ff;
 
 /// Frames decoded after the seek before settling for the last one, about 2 s at 30 fps.
 const MAX_FRAMES: u32 = 60;
-/// Video packets read without reaching the target before giving up on the stream.
+/// Packets read, of any stream, without reaching the target before giving up on the video. Every
+/// packet counts: a DVB radio recording names a video stream that never sends one.
 const MAX_PACKETS: u32 = 600;
 /// The still comes from 10% into the video, but never later than this.
 const LATEST_SECS: f64 = 30.0;
@@ -156,9 +157,10 @@ fn decode_until(input: &mut ff::format::context::Input, target: f64) -> Option<f
     let mut eof = false;
     while !eof && packets < MAX_PACKETS {
         let mut packet = ff::Packet::empty();
-        match packet.read(input) {
+        let read = packet.read(input);
+        packets += 1;
+        match read {
             Ok(()) if packet.stream() == index => {
-                packets += 1;
                 // A corrupt packet only costs its own frame.
                 _ = decoder.send_packet(&packet);
             }
@@ -684,6 +686,62 @@ mod tests {
         thumbs.request(&testdata(CLIPS[1]));
         std::thread::sleep(Duration::from_millis(300));
         assert!(thumbs.take_ready().is_empty());
+    }
+
+    /// A DVB radio recording: an MPEG-TS whose programme names a video stream that never sends
+    /// a packet, beside `packets` MP2 frames of silence (72 s for 3000).
+    fn radio_ts(name: &str, packets: i64) -> PathBuf {
+        let path = std::env::temp_dir().join(format!("wushang-thumbs-{name}"));
+        let mut out = ff::format::output_as(&path, "mpegts").unwrap();
+        for (kind, id) in [
+            (Type::Video, ff::codec::Id::MPEG2VIDEO),
+            (Type::Audio, ff::codec::Id::MP2),
+        ] {
+            let mut stream = out.add_stream(ff::encoder::find(id)).unwrap();
+            unsafe {
+                let par = (*stream.as_mut_ptr()).codecpar;
+                (*par).codec_type = kind.into();
+                (*par).codec_id = id.into();
+                if kind == Type::Video {
+                    ((*par).width, (*par).height) = (720, 576);
+                } else {
+                    (*par).sample_rate = 48000;
+                    ffi::av_channel_layout_default(&mut (*par).ch_layout, 2);
+                }
+            }
+        }
+        out.write_header().unwrap();
+        // MPEG-1 Layer II, 192 kb/s, 48 kHz, stereo: 576 bytes a frame, all bands silent.
+        let mut frame = vec![0u8; 576];
+        frame[..4].copy_from_slice(&[0xff, 0xfd, 0xa4, 0x00]);
+        let time_base = f64::from(out.stream(1).unwrap().time_base());
+        for i in 0..packets {
+            let mut packet = ff::Packet::copy(&frame);
+            let ts = (i as f64 * 1152.0 / 48000.0 / time_base) as i64;
+            packet.set_stream(1);
+            packet.set_pts(Some(ts));
+            packet.set_dts(Some(ts));
+            packet.write_interleaved(&mut out).unwrap();
+        }
+        out.write_trailer().unwrap();
+        path
+    }
+
+    /// Looking for a video frame stops after `MAX_PACKETS` of any stream, so a file whose video
+    /// stream sends no packets isn't read to its end.
+    #[test]
+    fn a_video_stream_without_packets_is_not_read_to_the_end() {
+        ff::init().unwrap();
+        let path = radio_ts("radio.ts", 3000);
+        let size = std::fs::metadata(&path).unwrap().len() as i64;
+        let mut input = open(&path).unwrap();
+        // Back to the start, dropping what opening read ahead.
+        input.seek(0, ..1).unwrap();
+        assert!(decode_until(&mut input, f64::INFINITY).is_none());
+        // avio_tell, an inline function the bindings leave out.
+        let read = unsafe { ffi::avio_seek((*input.as_ptr()).pb, 0, libc::SEEK_CUR) };
+        assert!(read < size / 2, "read {read} of {size} bytes");
+        assert!(render(&path, 160, 90).is_none());
     }
 
     #[test]
