@@ -539,6 +539,13 @@ const EXTENSIONS: [&str; 9] = [
     "srt", "ass", "ssa", "vtt", "sub", "idx", "smi", "sami", "sup",
 ];
 
+/// Whether `path` is named like a subtitle file `find_external` would pick up.
+pub fn is_subtitle_file(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| EXTENSIONS.contains(&e.to_ascii_lowercase().as_str()))
+}
+
 /// Subtitle files that belong to `video`: same stem (also "stem.en.srt" style suffixes) in its
 /// folder or in a "Subs"/"Subtitles" subfolder, plus any subtitle in "Subs/<stem>/" as release
 /// packs lay them out. The video's folder comes first, then by name.

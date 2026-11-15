@@ -603,6 +603,24 @@ impl App {
         self.sync_active();
     }
 
+    /// A file dropped on the window: a subtitle file joins the file open, on a playlist's page
+    /// (`playlist`) a file joins the playlist, and anything else plays. Returns whether it
+    /// plays.
+    fn open_dropped(&mut self, path: PathBuf, playlist: Option<String>) -> bool {
+        if subs::is_subtitle_file(&path) && self.session().is_some() {
+            self.tab_mut().show_subtitle_file(path);
+            return false;
+        }
+        if let Some(name) = playlist {
+            match self.library.add_to_playlist(&name, &path) {
+                Ok(()) => UI.with_borrow_mut(|ui| ui.browse.stale = true),
+                Err(e) => eprintln!("library: cannot add to {name}: {e}"),
+            }
+            return false;
+        }
+        self.play_file(&path)
+    }
+
     /// Plays a file opened from outside the library, queued with the rest of its folder.
     fn play_file(&mut self, path: &Path) -> bool {
         if net::is_address(path) {
@@ -2108,17 +2126,11 @@ fn run() -> Result<(), Box<dyn Error>> {
             fit_mini(win, UI.with_borrow(|ui| ui.queue.open));
         }
         if let Some(path) = OPEN.lock().unwrap().take() {
-            // Dropped on an open playlist, a file joins it; anywhere else it plays.
             let playlist = UI.with_borrow(|ui| match &ui.browse.place {
                 Place::Playlist(name) if ui.page == Page::Library => Some(name.clone()),
                 _ => None,
             });
-            if let Some(name) = playlist {
-                match app.library.add_to_playlist(&name, &path) {
-                    Ok(()) => UI.with_borrow_mut(|ui| ui.browse.stale = true),
-                    Err(e) => eprintln!("library: cannot add to {name}: {e}"),
-                }
-            } else if app.play_file(&path) {
+            if app.open_dropped(path, playlist) {
                 show_player();
             }
         }
@@ -4815,6 +4827,20 @@ mod tests {
         assert!(ui::menu::has_place_menu(&mix));
         assert!(ui::menu::has_place_menu(&Place::Videos));
         assert!(!ui::menu::has_place_menu(&Place::Recent));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A subtitle file dropped on the window joins the file playing, rather than replacing it.
+    #[test]
+    fn a_dropped_subtitle_file_joins_the_video() {
+        let (mut app, dir, _one) = test_app("drop-subs");
+        let video = media("test_60s_noaudio.mp4");
+        assert!(app.play_file(&video));
+        let srt = media("tracks.srt");
+        app.open_dropped(srt.clone(), None);
+        assert_eq!(app.session().map(|s| s.path.clone()), Some(video));
+        assert!(app.tab().subtitles().is_some());
+        assert_eq!(app.tab().external.last().map(|(p, _)| p), Some(&srt));
         std::fs::remove_dir_all(dir).unwrap();
     }
 
