@@ -61,7 +61,9 @@ impl Target {
 }
 
 /// A conversion running in the background. Dropping it (quitting mid-conversion) cancels it
-/// and waits for the thread, so the unfinished file is gone by then.
+/// and waits a moment for the thread, which removes the unfinished file. A thread stuck on an
+/// input that doesn't answer (a share gone quiet) isn't waited for: the file goes from here,
+/// and the thread is let go, so quitting isn't held up.
 pub struct Job {
     pub output: PathBuf,
     /// Thousandths done, by the input's timestamps.
@@ -109,11 +111,23 @@ impl Job {
     }
 }
 
+/// How long dropping a job waits for its thread to stop.
+const STOP_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+
 impl Drop for Job {
     fn drop(&mut self) {
         self.cancel();
-        if let Some(t) = self.thread.take() {
+        let Some(t) = self.thread.take() else {
+            return;
+        };
+        let deadline = std::time::Instant::now() + STOP_WAIT;
+        while !t.is_finished() && std::time::Instant::now() < deadline {
+            thread::sleep(std::time::Duration::from_millis(10));
+        }
+        if t.is_finished() {
             _ = t.join();
+        } else {
+            _ = std::fs::remove_file(&self.output);
         }
     }
 }
@@ -902,6 +916,34 @@ mod tests {
         }
         drop(job);
         assert!(!out.exists(), "{} was left behind", out.display());
+    }
+
+    /// Dropping a job whose input never answers (a share gone quiet) doesn't wait for it, so
+    /// quitting isn't held up. The input here is a pipe nothing writes to.
+    #[test]
+    fn dropping_a_stuck_job_returns() {
+        let dir = std::env::temp_dir().join(format!("wushang-stuck-{}", std::process::id()));
+        _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let pipe = dir.join("never.mp4");
+        let made = std::process::Command::new("/usr/bin/mkfifo")
+            .arg(&pipe)
+            .status()
+            .unwrap();
+        assert!(made.success());
+        let job = Job::start(&pipe, Target::Mp4, dir.join("out.mp4"));
+        thread::sleep(std::time::Duration::from_millis(200));
+        let (tx, rx) = channel();
+        thread::spawn(move || {
+            drop(job);
+            _ = tx.send(());
+        });
+        let returned = rx.recv_timeout(std::time::Duration::from_secs(10)).is_ok();
+        // Let the job's thread go: a writer opening the pipe ends its wait.
+        drop(std::fs::OpenOptions::new().write(true).open(&pipe));
+        assert!(returned, "dropping the job waited for its input");
+        assert!(!dir.join("out.mp4").exists());
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     /// The picture and the sound keep their places against each other, and the copy starts at 0.
