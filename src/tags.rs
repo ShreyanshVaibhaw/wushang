@@ -11,7 +11,43 @@ use std::path::{Path, PathBuf};
 use crate::library::Track;
 
 const FILE: &str = "tags.txt";
-const HEADER: &str = "# wushang tags v1";
+/// Version 2 escapes the path, which version 1 wrote as it was.
+const HEADER: &str = "# wushang tags v2";
+
+/// `path` with backslashes, tabs and line breaks written as `\\`, `\t`, `\n` and `\r`, so any
+/// file name (macOS allows all of them) stays on its own line and in its own field.
+fn escape(path: &str) -> String {
+    let mut out = String::with_capacity(path.len());
+    for c in path.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '\t' => out.push_str("\\t"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// The path `escape` wrote, None for an escape it never writes.
+fn unescape(s: &str) -> Option<String> {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        out.push(match c {
+            '\\' => match chars.next()? {
+                '\\' => '\\',
+                't' => '\t',
+                'n' => '\n',
+                'r' => '\r',
+                _ => return None,
+            },
+            c => c,
+        });
+    }
+    Some(out)
+}
 
 /// A file's size and modification time (in nanoseconds since 1970): when either changes, its
 /// tags may have too.
@@ -32,13 +68,19 @@ pub fn stamp(path: &Path) -> Option<Stamp> {
 pub fn load(dir: &Path) -> HashMap<PathBuf, (Stamp, Track)> {
     let text = fs::read_to_string(dir.join(FILE)).unwrap_or_default();
     let tag = |s: &str| (!s.is_empty()).then(|| s.to_owned());
+    // Version 1 files have their paths as they were.
+    let escaped = text.lines().next() == Some(HEADER);
     text.lines()
         .filter_map(|line| {
             let f: Vec<&str> = line.split('\t').collect();
             let [path, size, time, duration, title, artist, album, genre] = f[..] else {
                 return None;
             };
-            let path = PathBuf::from(path);
+            let path = PathBuf::from(if escaped {
+                unescape(path)?
+            } else {
+                path.to_owned()
+            });
             let track = Track {
                 path: path.clone(),
                 title: tag(title),
@@ -61,7 +103,8 @@ pub fn save(dir: &Path, tracks: &HashMap<PathBuf, (Stamp, Track)>) -> io::Result
         let Some(path) = path.to_str() else { continue };
         _ = writeln!(
             out,
-            "{path}\t{size}\t{time}\t{}\t{}\t{}\t{}\t{}",
+            "{}\t{size}\t{time}\t{}\t{}\t{}\t{}\t{}",
+            escape(path),
             t.duration,
             clean(&t.title),
             clean(&t.artist),
@@ -115,5 +158,42 @@ mod tests {
             .is_some_and(|(size, time)| size > 0 && time > 1_600_000_000_000_000_000)
         );
         assert!(load(Path::new("/Volumes/Z/nowhere")).is_empty());
+    }
+
+    /// Tabs, line breaks and backslashes are legal in macOS file names. Such a name keeps its
+    /// tags, and can't split its line into an entry for another file.
+    #[test]
+    fn any_file_name_keeps_its_line() {
+        let dir = std::env::temp_dir().join(format!("wushang-tags-names-{}", std::process::id()));
+        let track = |path: &Path| Track {
+            path: path.to_owned(),
+            title: Some("T".into()),
+            artist: None,
+            album: None,
+            genre: None,
+            duration: 1.0,
+        };
+        let names = [
+            "/Music/a\tb.mp3",
+            "/Music/c\\d\\t.mp3",
+            "/Music/x\n/Music/forged.mp3\t1\t2\t3\tForged\t\t\t",
+            "/Music/cr\r.mp3",
+        ];
+        let tracks: HashMap<_, _> = names
+            .iter()
+            .map(|n| (PathBuf::from(n), ((7, 8), track(Path::new(n)))))
+            .collect();
+        save(&dir, &tracks).unwrap();
+        let loaded = load(&dir);
+        assert_eq!(loaded.len(), names.len(), "{:?}", loaded.keys());
+        for name in names {
+            let (stamp, t) = &loaded[Path::new(name)];
+            assert_eq!((*stamp, t.path.as_path()), ((7, 8), Path::new(name)));
+        }
+        // A file from before escaping reads as it was written.
+        let v1 = "# wushang tags v1\n/Music/old\\one.mp3\t1\t2\t3\tOld\t\t\t\n";
+        fs::write(dir.join(FILE), v1).unwrap();
+        assert!(load(&dir).contains_key(Path::new("/Music/old\\one.mp3")));
+        fs::remove_dir_all(dir).unwrap();
     }
 }
