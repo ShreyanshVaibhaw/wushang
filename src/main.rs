@@ -81,8 +81,8 @@ static DURATION: AtomicU64 = AtomicU64::new(0);
 static QUIT: AtomicBool = AtomicBool::new(false);
 /// A file dropped on the window; the render loop opens it.
 static OPEN: Mutex<Option<PathBuf>> = Mutex::new(None);
-/// Files opened from Finder or the Dock while running, in order; the render loop plays them, as
-/// a second launch did on Windows.
+/// Files opened from Finder or the Dock while running, in order; the render loop plays them in
+/// a new tab.
 static OPEN_PLAY: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
 static RESIZED: AtomicBool = AtomicBool::new(false);
 /// Screens changed (HDR mode, brightness, layout) or the window moved: check for HDR again.
@@ -958,6 +958,21 @@ impl App {
             }
         }
         played
+    }
+
+    /// Plays files opened from Finder or the Dock while running in a new tab, so what plays
+    /// already plays on: one file with the rest of its folder queued, several in their order.
+    fn play_opened(&mut self, opened: Vec<PathBuf>) -> bool {
+        let Some(first) = opened.first().cloned() else {
+            return false;
+        };
+        self.in_new_tab(|app| {
+            if opened.len() > 1 {
+                app.play(&first, opened)
+            } else {
+                app.play_file(&first)
+            }
+        })
     }
 
     /// The subtitle look: Settings', at the size of the tab on screen.
@@ -2054,15 +2069,8 @@ fn run() -> Result<(), Box<dyn Error>> {
             }
         }
         let opened = std::mem::take(&mut *OPEN_PLAY.lock().unwrap());
-        if let Some(first) = opened.first().cloned() {
-            let played = if opened.len() > 1 {
-                app.play(&first, opened)
-            } else {
-                app.play_file(&first)
-            };
-            if played {
-                show_player();
-            }
+        if !opened.is_empty() && app.play_opened(opened) {
+            show_player();
         }
         // What the last file picker was opened for.
         for (then, paths) in PICKED.with_borrow_mut(std::mem::take) {
@@ -4955,6 +4963,33 @@ mod tests {
         assert_eq!(tab.queue.current(), Some(1));
         assert_eq!(tab.playing_playlist.as_deref(), Some("Mix"));
         assert!(tab.session.as_ref().is_some_and(|s| s.path == short));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A file opened from Finder while another plays opens in a new tab, and the first plays
+    /// on; into an empty tab on screen it goes as it is.
+    #[test]
+    fn files_opened_from_finder_open_in_a_new_tab() {
+        let (mut app, dir, _one) = test_app("finder-open");
+        let (first, second) = (media("test_60s_noaudio.mp4"), media("test_subs.mkv"));
+        assert!(app.play_opened(vec![first.clone()]));
+        assert_eq!((app.tabs.len(), app.active), (1, 0));
+
+        assert!(app.play_opened(vec![second.clone()]));
+        assert_eq!((app.tabs.len(), app.active), (2, 1));
+        let path = |app: &App, i: usize| app.tabs[i].session.as_ref().map(|s| s.path.clone());
+        assert_eq!(path(&app, 0), Some(first.clone()));
+        assert_eq!(path(&app, 1), Some(second.clone()));
+        assert!(on_screen(&app));
+
+        // Several at once share one tab, queued in their order.
+        assert!(app.play_opened(vec![second.clone(), first.clone()]));
+        assert_eq!((app.tabs.len(), app.active), (3, 2));
+        assert_eq!(app.tab().queue.items(), [second, first]);
+
+        // One that can't open leaves the tabs as they were.
+        assert!(!app.play_opened(vec![media("missing.mp4")]));
+        assert_eq!((app.tabs.len(), app.active), (3, 2));
         std::fs::remove_dir_all(dir).unwrap();
     }
 

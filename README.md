@@ -76,7 +76,7 @@ Esc or the folder name in the player's title bar goes back to the library, and t
 
 In the player, the sidebar button opens the design's overlay panel over the video: a rail of section icons and a compact list of the same library, with history, breadcrumb and sort.
 Clicking a file there plays it with the panel still open; a click on the video or Esc closes it, and the arrow button at its top right opens the full library page.
-Dropping a file on the window or on wushang's Dock icon plays it, or adds it to the playlist on screen.
+Dropping a file on the window plays it, or adds it to the playlist on screen; dropped on wushang's Dock icon, it plays in a new tab.
 "Create playlist" and the header's + open the New Playlist dialog from the design: a name, an optional thumbnail picture, and files picked or dropped on the window.
 On a playlist's page the header's + adds files to it.
 Playlists are standard M3U files.
@@ -212,6 +212,7 @@ Esc or ⌘M also leaves the mini player window.
 
 Up to 8 files can play at once, each in a tab of its own.
 ⌘T (File > New Tab, or the + by the window buttons) picks files to play in a new tab, and "Play in New Tab" in a library entry's right-click menu plays that file in one, with its folder as the tab's queue.
+A file opened from Finder (a double-click, Open With, or a drop on the Dock icon) while wushang runs plays in a new tab too, so what plays already plays on; several opened together share one tab, queued in their order.
 Opening a file any other way plays it in the tab on screen, as before.
 With two or more tabs open, they take the title's place in the player's title bar.
 Click a tab to show it, or use ⇧⌘] and ⇧⌘[ (or ⌃Tab and ⌃⇧Tab) for the next and previous tab, ⌘1 to ⌘8 for that tab and ⌘9 for the last.
