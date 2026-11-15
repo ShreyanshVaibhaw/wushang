@@ -3230,7 +3230,8 @@ fn menu_action(app: &mut App, win: Window, action: MenuAction) {
         }
         // Files join the queue, or play when nothing is open.
         MenuAction::AddToQueue(paths) => {
-            if app.session().is_some() {
+            // A stream still connecting has a queue to add to as much as one playing.
+            if !app.tab().is_empty() {
                 app.add_to_queue(paths);
             } else if let Some(first) = paths.first().cloned()
                 && app.play(&first, paths)
@@ -4859,6 +4860,22 @@ mod tests {
         app.pause_all();
         assert!(app.tab().reverse.is_none());
         assert!(app.tab().shared.paused.load(Relaxed));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// "Add to Queue" while a stream connects adds to its queue, and the stream goes on
+    /// connecting, rather than the file playing in its place.
+    #[test]
+    fn add_to_queue_keeps_a_stream_that_connects() {
+        let (mut app, dir, _one) = test_app("queue-while-connecting");
+        // Nothing answers there for a while: it stays connecting through the test.
+        let slow = PathBuf::from("http://10.255.255.1/live.ts");
+        assert!(app.play_file(&slow));
+        assert!(app.tab().opening.is_some());
+        let file = media("test_60s_noaudio.mp4");
+        menu_action(&mut app, Window, MenuAction::AddToQueue(vec![file.clone()]));
+        assert!(app.tab().opening.is_some(), "the stream still connects");
+        assert!(app.tab().queue.items().contains(&file));
         std::fs::remove_dir_all(dir).unwrap();
     }
 
