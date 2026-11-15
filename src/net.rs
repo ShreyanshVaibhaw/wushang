@@ -99,9 +99,7 @@ pub fn normalize_url(raw: &str) -> Result<String, String> {
         return Err(format!("wushang can't open {scheme} addresses."));
     }
     // No scheme: a dotted host, optionally with a port and a path.
-    let host = url.split(['/', '?', '#']).next().unwrap_or("");
-    let host = host.rsplit('@').next().unwrap_or(host);
-    let host = host.split(':').next().unwrap_or(host);
+    let host = host_of(&format!("http://{url}")).unwrap_or_default();
     if host.contains('.')
         && host
             .chars()
@@ -112,15 +110,40 @@ pub fn normalize_url(raw: &str) -> Result<String, String> {
     Err("That doesn't look like a stream address.".into())
 }
 
+/// An address taken apart, as every reading of one here does it.
+struct UrlParts<'a> {
+    scheme: &'a str,
+    /// `user:password` or `user`, when the address carries any.
+    credentials: Option<&'a str>,
+    /// The host with any port: `example.com:8080`, `[::1]:80`.
+    server: &'a str,
+    /// From the first `/`, `?` or `#` after the server on, or empty.
+    rest: &'a str,
+}
+
+/// `url`'s parts, None without a "://". A server can't contain an '@', so the credentials
+/// run to the last one, as browsers read them.
+fn split_url(url: &str) -> Option<UrlParts<'_>> {
+    let (scheme, after) = url.split_once("://")?;
+    let (authority, rest) = after.split_at(after.find(['/', '?', '#']).unwrap_or(after.len()));
+    let (credentials, server) = match authority.rsplit_once('@') {
+        Some((credentials, server)) => (Some(credentials), server),
+        None => (None, authority),
+    };
+    Some(UrlParts {
+        scheme,
+        credentials,
+        server,
+        rest,
+    })
+}
+
 /// The server part of an address: `example.com`, without scheme, credentials or port.
 pub fn host_of(url: &str) -> Option<String> {
-    let rest = url.split_once("://")?.1;
-    let authority = rest.split(['/', '?', '#']).next()?;
-    let authority = authority.rsplit('@').next()?;
-    let host = if let Some(v6) = authority.strip_prefix('[') {
-        v6.split(']').next()?
-    } else {
-        authority.split(':').next()?
+    let server = split_url(url)?.server;
+    let host = match server.strip_prefix('[') {
+        Some(v6) => v6.split(']').next()?,
+        None => server.split(':').next()?,
     };
     (!host.is_empty()).then(|| host.to_owned())
 }
@@ -130,10 +153,7 @@ pub fn host_of(url: &str) -> Option<String> {
 pub fn url_name(url: &str) -> String {
     let no_query = url.split(['?', '#']).next().unwrap_or(url);
     // Only the path counts, so `user:password@host` never becomes the name on screen.
-    let path = match no_query.split_once("://") {
-        Some((_, rest)) => rest.split_once('/').map_or("", |(_, path)| path),
-        None => no_query,
-    };
+    let path = split_url(no_query).map_or(no_query, |p| p.rest);
     let last = path.rsplit('/').next().unwrap_or("");
     let name = percent_decode(last);
     if name.is_empty() || name == url {
@@ -145,19 +165,11 @@ pub fn url_name(url: &str) -> String {
 
 /// The address with any password hidden, for logs and error messages.
 pub fn redact(url: &str) -> String {
-    let Some((scheme, rest)) = url.split_once("://") else {
+    let Some(p) = split_url(url) else {
         return url.to_owned();
     };
-    let Some(at) = rest.find('@') else {
-        return url.to_owned();
-    };
-    let (userinfo, tail) = rest.split_at(at);
-    // An '@' in the path is not credentials.
-    if userinfo.contains(['/', '?', '#']) {
-        return url.to_owned();
-    }
-    match userinfo.split_once(':') {
-        Some((user, _)) => format!("{scheme}://{user}:***{tail}"),
+    match p.credentials.and_then(|c| c.split_once(':')) {
+        Some((user, _)) => format!("{}://{user}:***@{}{}", p.scheme, p.server, p.rest),
         None => url.to_owned(),
     }
 }
@@ -441,21 +453,26 @@ fn resolve(base: &str, href: &str) -> String {
     if is_url(href) || href.contains("://") {
         return href.to_owned();
     }
-    let Some((scheme, rest)) = base.split_once("://") else {
+    let Some(UrlParts {
+        scheme,
+        server,
+        rest,
+        ..
+    }) = split_url(base)
+    else {
         return href.to_owned();
     };
-    let (authority, path) = rest.split_at(rest.find(['/', '?', '#']).unwrap_or(rest.len()));
     if let Some(path) = href.strip_prefix("//") {
         return format!("{scheme}://{path}");
     }
     if href.starts_with('/') {
-        return format!("{scheme}://{authority}{href}");
+        return format!("{scheme}://{server}{href}");
     }
     // The feed's folder comes from its path alone: "https://example.com" has none, and a
     // slash in the query is no folder.
-    let path = path.split(['?', '#']).next().unwrap_or("");
+    let path = rest.split(['?', '#']).next().unwrap_or("");
     let dir = path.rsplit_once('/').map_or("", |(d, _)| d);
-    format!("{scheme}://{authority}{dir}/{href}")
+    format!("{scheme}://{server}{dir}/{href}")
 }
 
 /// Fetches `url` (http or https) and returns the body as text. Follows redirects,
@@ -484,26 +501,24 @@ fn get(
     deadline: Duration,
     max: usize,
 ) -> Result<(Vec<u8>, String), String> {
-    let (scheme, rest) = url
-        .split_once("://")
-        .ok_or_else(|| format!("{} is not a web address", redact(url)))?;
+    // A user name and password in the address are never sent anywhere.
+    let UrlParts {
+        scheme,
+        server,
+        rest,
+        ..
+    } = split_url(url).ok_or_else(|| format!("{} is not a web address", redact(url)))?;
     let secure = match scheme.to_ascii_lowercase().as_str() {
         "http" => false,
         "https" => true,
         _ => return Err(format!("only http and https load, not {scheme}")),
     };
-    let (authority, path) = match rest.find(['/', '?', '#']) {
-        Some(i) => (&rest[..i], &rest[i..]),
-        None => (rest, "/"),
-    };
-    // A user name and password in the address are never sent anywhere.
-    let authority = authority.rsplit('@').next().unwrap_or(authority);
     let host = host_of(url).unwrap_or_default();
-    let path = path.split('#').next().unwrap_or(path);
-    let path = if path.starts_with('?') {
-        format!("/{path}")
-    } else {
+    let path = rest.split('#').next().unwrap_or("");
+    let path = if path.starts_with('/') {
         path.to_owned()
+    } else {
+        format!("/{path}")
     };
     let stage = Some(timeout.clamp(Duration::from_secs(1), Duration::from_secs(60)));
 
@@ -524,7 +539,7 @@ fn get(
         .build()
         .into();
     let mut response = agent
-        .get(format!("{scheme}://{authority}{path}"))
+        .get(format!("{scheme}://{server}{path}"))
         .call()
         .map_err(|e| match e {
             ureq::Error::StatusCode(status) => {
@@ -722,6 +737,22 @@ mod tests {
             "https://user:***@example.com/live"
         );
         assert_eq!(redact("https://example.com/a@b"), "https://example.com/a@b");
+        // Every reading of an address takes its server after the last '@', as browsers do, so
+        // a password with an '@' in it is hidden whole.
+        assert_eq!(
+            redact("https://user:p@ss@example.com/live"),
+            "https://user:***@example.com/live"
+        );
+        assert_eq!(
+            host_of("https://user:p@ss@example.com/live").as_deref(),
+            Some("example.com")
+        );
+        assert_eq!(host_of("http://[::1]:8080/x").as_deref(), Some("::1"));
+        assert_eq!(
+            host_of("https://example.com?x=a@b").as_deref(),
+            Some("example.com")
+        );
+        assert_eq!(url_name("https://example.com?x=/a.mp3"), "example.com");
     }
 
     const RSS: &str = r#"<?xml version="1.0"?>
