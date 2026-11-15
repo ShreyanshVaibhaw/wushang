@@ -3174,7 +3174,7 @@ fn menu_action(app: &mut App, win: Window, action: MenuAction) {
             }
             UI.with_borrow_mut(|ui| ui.browse.stale = true);
         }
-        MenuAction::ShowInExplorer(path) => platform::reveal_in_finder(&path),
+        MenuAction::ShowInFinder(path) => platform::reveal_in_finder(&path),
         MenuAction::GoToSource(path) => {
             if let Some(dir) = path.parent() {
                 let place = Place::Folder(section_of(&path), dir.to_owned());

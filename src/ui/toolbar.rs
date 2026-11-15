@@ -350,7 +350,7 @@ impl Toolbar {
         }
     }
 
-    /// Reads `dir`\toolbar.txt; a missing or unreadable file keeps the design's bars.
+    /// Reads toolbar.txt in `dir`; a missing or unreadable file keeps the design's bars.
     pub fn load(dir: &Path) -> Toolbar {
         let Ok(text) = fs::read_to_string(dir.join(FILE)) else {
             return Toolbar::default();
@@ -700,6 +700,9 @@ mod tests {
         t.save(&dir).unwrap();
         assert_eq!(Toolbar::load(&dir), t);
         fs::remove_dir_all(dir).unwrap();
-        assert_eq!(Toolbar::load(Path::new("Z:\\nowhere")), Toolbar::default());
+        assert_eq!(
+            Toolbar::load(Path::new("/Volumes/Z/nowhere")),
+            Toolbar::default()
+        );
     }
 }

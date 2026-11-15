@@ -719,8 +719,9 @@ impl Ui {
     }
 
     pub fn on_move(&mut self, x: f32, y: f32) -> Option<Action> {
-        // Windows also sends WM_MOUSEMOVE when the cursor is hidden or the window changes under
-        // a still pointer. Only real movement counts as activity, or the bars would never hide.
+        // A press passes its position through here, and AppKit can report a drag or move where
+        // the pointer already was. Only real movement counts as activity, or the bars would
+        // never hide.
         if (x, y) != self.pointer {
             self.pointer = (x, y);
             self.last_activity = Instant::now();

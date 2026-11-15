@@ -120,7 +120,7 @@ pub enum MenuAction {
     AddToQueue(Vec<PathBuf>),
     AddToPlaylist(String, Vec<PathBuf>),
     NewPlaylist(Vec<PathBuf>),
-    ShowInExplorer(PathBuf),
+    ShowInFinder(PathBuf),
     /// Opens the file's folder in the library.
     GoToSource(PathBuf),
     /// Picks a subtitle file and plays the file with it.
@@ -1186,11 +1186,7 @@ fn file_menu(path: &Path, playlists: &[String], within: Option<&str>) -> Vec<Ite
         Item::submenu("Convert", convert_menu(path)).icon(Icon::Convert),
         Item::new("Add to Queue", MenuAction::AddToQueue(one())).icon(Icon::Queue),
         Item::submenu("Add to Playlist", add).icon(Icon::Playlist),
-        Item::new(
-            "Show in Finder",
-            MenuAction::ShowInExplorer(path.to_owned()),
-        )
-        .icon(Icon::Folder),
+        Item::new("Show in Finder", MenuAction::ShowInFinder(path.to_owned())).icon(Icon::Folder),
         Item::new("Go to Source", MenuAction::GoToSource(path.to_owned())).icon(Icon::GoTo),
         Item::new(
             "Add Subtitle Tracks",
