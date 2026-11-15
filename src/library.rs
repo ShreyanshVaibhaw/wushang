@@ -1513,7 +1513,8 @@ fn stem_of(path: &Path) -> String {
 ///
 /// `.` and `..` are taken out by name alone (`a/sub/../b` is `a/b`), and links aren't followed:
 /// the library is keyed by paths as they were opened, and following links would change the key
-/// of files already in it, losing where they stopped.
+/// of files already in it, losing where they stopped. A `..` after a symlink stays, as taking
+/// it out by name would name another file.
 pub fn abs(path: &Path) -> PathBuf {
     use std::path::Component;
     if crate::net::is_address(path) {
@@ -1524,6 +1525,14 @@ pub fn abs(path: &Path) -> PathBuf {
     for part in path.components() {
         match part {
             Component::CurDir => {}
+            // After a symlink `..` is its target's parent, so it stays for the system to follow,
+            // and so do the ones after it. Only paths with `..` are looked at, which are rare.
+            Component::ParentDir
+                if out.ends_with("..")
+                    || fs::symlink_metadata(&out).is_ok_and(|m| m.file_type().is_symlink()) =>
+            {
+                out.push("..");
+            }
             // `pop` leaves the root, as `/..` is `/`.
             Component::ParentDir => _ = out.pop(),
             part => out.push(part),
@@ -2854,6 +2863,26 @@ mod tests {
         let url = Path::new("https://example.com/live/index.m3u8");
         assert_eq!(abs(url), url);
         assert!(abs(Path::new("clip.mp4")).is_absolute());
+    }
+
+    /// After a symlink, `..` is the parent of the link's target, not of the link: there it stays,
+    /// so the path still names the file the system opens.
+    #[test]
+    fn dots_after_a_symlink_stay() {
+        let tmp = TempDir::new();
+        let film = tmp.touch("2026/film.mkv");
+        fs::create_dir_all(tmp.0.join("2026/Show")).unwrap();
+        std::os::unix::fs::symlink(tmp.0.join("2026/Show"), tmp.0.join("latest")).unwrap();
+        let through = tmp.0.join("latest/../film.mkv");
+        let kept = abs(&through);
+        assert_eq!(kept, through);
+        assert_eq!(
+            fs::canonicalize(&kept).unwrap(),
+            fs::canonicalize(film).unwrap()
+        );
+        // And `..` after a kept one stays too.
+        let further = tmp.0.join("latest/../../x");
+        assert_eq!(abs(&further), further);
     }
 
     /// A file opened as `../film.mkv` from a subfolder is the same file as `film.mkv` opened
