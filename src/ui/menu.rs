@@ -29,6 +29,8 @@ const PLAIN_X: f32 = 18.0;
 const KEY_R: f32 = 20.0;
 const MARK_R: f32 = 31.0;
 const SUB_W: f32 = 265.0;
+/// Between a button and the menu it opens.
+const BUTTON_GAP: f32 = 4.0;
 /// Gap between a menu and its submenu.
 const SUB_GAP: f32 = 2.0;
 /// Room kept between a menu and the window's edges.
@@ -339,6 +341,9 @@ struct Open {
     kind: Kind,
     items: Vec<Item>,
     at: (f32, f32),
+    /// Where the menu's bottom goes when it has to open upwards: `at`'s y for a point, the top
+    /// of the button it opened from, which it mustn't cover.
+    up: f32,
     /// The row of each level whose submenu is open; levels = path.len() + 1.
     path: Vec<usize>,
     /// The highlighted row of each level.
@@ -407,6 +412,20 @@ pub struct State {
 impl State {
     /// Opens `items` with its top-left corner at (x, y), or flipped to stay in the window.
     pub fn open(&mut self, kind: Kind, items: Vec<Item>, x: f32, y: f32) {
+        self.open_at(kind, items, (x, y), y);
+    }
+
+    /// Opens `items` under `button`, or above it when there's no room below.
+    pub fn open_from(&mut self, kind: Kind, items: Vec<Item>, button: Rect) {
+        self.open_at(
+            kind,
+            items,
+            (button.l, button.b + BUTTON_GAP),
+            button.t - BUTTON_GAP,
+        );
+    }
+
+    fn open_at(&mut self, kind: Kind, items: Vec<Item>, at: (f32, f32), up: f32) {
         // The sorting options open on the current choice, as in the design.
         let active = (kind == Kind::Sort)
             .then(|| items.iter().position(|i| i.checked))
@@ -414,7 +433,8 @@ impl State {
         self.open = Some(Open {
             kind,
             items,
-            at: (x, y),
+            at,
+            up,
             path: Vec::new(),
             active: vec![active],
             scroll: vec![0.0],
@@ -614,9 +634,10 @@ impl State {
 }
 
 /// Where a `w` x `h` menu opened at (x, y) goes: right of and below the point, flipped left or up
-/// where it would leave `bounds`, and pushed inside when it fits neither way. A menu taller than
+/// where it would leave `bounds`, and pushed inside when it fits neither way. Flipped up, its
+/// bottom is at `up`: `y` for a point, above the button for a button's menu. A menu taller than
 /// `bounds` gets their height and scrolls.
-pub fn place(x: f32, y: f32, w: f32, h: f32, bounds: Rect) -> Rect {
+pub fn place(x: f32, (y, up): (f32, f32), w: f32, h: f32, bounds: Rect) -> Rect {
     let h = h.min(bounds.h());
     let l = if x + w <= bounds.r {
         x
@@ -627,8 +648,8 @@ pub fn place(x: f32, y: f32, w: f32, h: f32, bounds: Rect) -> Rect {
     };
     let t = if y + h <= bounds.b {
         y
-    } else if y - h >= bounds.t {
-        y - h
+    } else if up - h >= bounds.t {
+        up - h
     } else {
         (bounds.b - h).max(bounds.t)
     };
@@ -683,7 +704,7 @@ impl Geometry {
             let items = o.level_items(level);
             let content = 2.0 * PAD + items.iter().map(Item::height).sum::<f32>();
             let frame = match levels.last() {
-                None => place(o.at.0, o.at.1, o.kind.width(), content, bounds),
+                None => place(o.at.0, (o.at.1, o.up), o.kind.width(), content, bounds),
                 Some(parent) => {
                     let row = o.path[level - 1];
                     let r = parent.rows.iter().find(|(i, _)| *i == row).map(|(_, r)| *r);
@@ -1488,21 +1509,26 @@ mod tests {
     fn menus_open_at_the_point_and_flip_at_the_edges() {
         // Room on both sides: right of and below the point.
         assert_eq!(
-            place(100.0, 50.0, 265.0, 300.0, WINDOW),
+            place(100.0, (50.0, 50.0), 265.0, 300.0, WINDOW),
             Rect::new(100.0, 50.0, 365.0, 350.0)
         );
         // Near the right edge it opens to the left, near the bottom upwards.
         assert_eq!(
-            place(900.0, 600.0, 265.0, 300.0, WINDOW),
+            place(900.0, (600.0, 600.0), 265.0, 300.0, WINDOW),
             Rect::new(635.0, 300.0, 900.0, 600.0)
         );
         // Fits neither way: pushed inside.
         assert_eq!(
-            place(200.0, 350.0, 265.0, 500.0, WINDOW),
+            place(200.0, (350.0, 350.0), 265.0, 500.0, WINDOW),
             Rect::new(200.0, 200.0, 465.0, 700.0)
         );
+        // A button's menu that can't open below stands on the button instead of covering it.
+        assert_eq!(
+            place(100.0, (640.0, 600.0), 265.0, 300.0, WINDOW),
+            Rect::new(100.0, 300.0, 365.0, 600.0)
+        );
         // Taller than the window: as tall as the window, scrolling.
-        assert_eq!(place(10.0, 10.0, 290.0, 900.0, WINDOW).h(), 700.0);
+        assert_eq!(place(10.0, (10.0, 10.0), 290.0, 900.0, WINDOW).h(), 700.0);
     }
 
     #[test]

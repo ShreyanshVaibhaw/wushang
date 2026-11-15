@@ -842,10 +842,10 @@ impl Ui {
                     self.menu_changed();
                     action.map(Action::Menu)
                 }
-                // Menus open under their button.
+                // Menus open from their button; `open_menu` places them by it.
                 Some(h @ (Hit::More | Hit::Sort | Hit::HeaderMore)) => {
                     let r = self.layout.button(h);
-                    Some(Action::OpenMenu(h, r.l, r.b + 4.0))
+                    Some(Action::OpenMenu(h, r.l, r.b))
                 }
                 Some(h @ (Hit::Audio | Hit::Subtitles | Hit::Settings)) => {
                     // Its own button closes a popup; another button switches to its popup.
@@ -897,7 +897,8 @@ impl Ui {
         }
     }
 
-    /// Opens a menu at (x, y) for `hit`; an entry stays highlighted under its menu.
+    /// Opens a menu at (x, y) for `hit`, or under (or above) the button `hit` is; an entry stays
+    /// highlighted under its menu.
     pub fn open_menu(
         &mut self,
         kind: menu::Kind,
@@ -905,7 +906,12 @@ impl Ui {
         at: (f32, f32),
         hit: Hit,
     ) {
-        self.menu.open(kind, items, at.0, at.1);
+        match hit {
+            Hit::More | Hit::Sort | Hit::HeaderMore => {
+                self.menu.open_from(kind, items, self.layout.button(hit))
+            }
+            _ => self.menu.open(kind, items, at.0, at.1),
+        }
         self.browse.context = match hit {
             Hit::Entry(i) => Some(i),
             _ => None,
@@ -2260,6 +2266,27 @@ mod tests {
         // Empty space on the control bar is the bar, not a click on the video.
         assert_eq!(shown.hit(1600.0, 1075.0), None);
         assert_eq!(shown.hit(960.0, 500.0), Some(Hit::Video));
+    }
+
+    #[test]
+    fn a_menu_from_the_control_bar_opens_above_its_button() {
+        let mut ui = Ui::new();
+        ui.page = Page::Player;
+        ui.toolbar.title.retain(|i| *i != ToolItem::More);
+        ui.toolbar.left.insert(0, ToolItem::More);
+        ui.layout = Layout::player(1280.0, 720.0, true, false, &ui.toolbar);
+        let r = ui.layout.button(Hit::More);
+        let (x, y) = ((r.l + r.r) / 2.0, (r.t + r.b) / 2.0);
+        ui.on_down(x, y);
+        let Some(Action::OpenMenu(hit, mx, my)) = ui.on_up(x, y) else {
+            panic!("the button opens its menu");
+        };
+        let profiles = ["Default".to_owned()];
+        let items = menu::main_menu(&[], &profiles, "Default", &[], menu::Converting::Nothing);
+        ui.open_menu(menu::Kind::Main, items, (mx, my), hit);
+        assert!(ui.over_menu(x, r.t - 8.0), "the menu stands on the button");
+        // The button stays clear, so a second click on it closes the menu.
+        assert_eq!(ui.layout.hit(x, y), Some(Hit::More));
     }
 
     #[test]
