@@ -20,6 +20,7 @@ use objc2_foundation::{
 };
 use objc2_quartz_core::{CALayer, CAMetalLayer};
 
+use super::keys::VIRTUAL_KEY;
 use super::{Event, dispatch, keys};
 
 #[derive(Default)]
@@ -404,8 +405,8 @@ impl View {
         }
     }
 
-    /// A key down: the input method sees it first, then the interface gets the key (unless
-    /// it went into a composition), then what it typed.
+    /// A key down: the input method sees it first, then the interface gets the key (as
+    /// VK_PROCESSKEY when it went into a composition), then what it typed.
     fn key(&self, event: &NSEvent) {
         let iv = self.ivars();
         let flags = event.modifierFlags();
@@ -419,7 +420,7 @@ impl View {
             self.interpretKeyEvents(&NSArray::from_slice(&[event]));
         }
         let composed = composing || iv.composed.get() || !iv.marked.borrow().is_empty();
-        if !composed && let Some(key) = keys::from_event(event) {
+        if let Some(key) = sent_key(keys::from_event(event), composed) {
             dispatch(Event::Key {
                 key,
                 shift: flags.contains(NSEventModifierFlags::Shift),
@@ -431,6 +432,17 @@ impl View {
             dispatch(Event::Char(c));
         }
     }
+}
+
+/// Windows' code for a key an input method took.
+const VK_PROCESSKEY: VIRTUAL_KEY = VIRTUAL_KEY(0xE5);
+
+/// The key a key down sends. One the input method took into its composition goes as
+/// VK_PROCESSKEY, as WM_KEYDOWN sends it on Windows: nothing acts on it (Enter picking a
+/// candidate mustn't press a dialog's button), but the interface still hears a key go down
+/// before the text it commits, so a dialog opened by a click takes that text.
+fn sent_key(key: Option<VIRTUAL_KEY>, composed: bool) -> Option<VIRTUAL_KEY> {
+    if composed { Some(VK_PROCESSKEY) } else { key }
 }
 
 /// Adds `add` to the fractions in `acc` and takes out the whole steps.
@@ -483,4 +495,21 @@ fn dropped_files(info: &ProtocolObject<dyn NSDraggingInfo>) -> Vec<PathBuf> {
             })
             .collect()
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::d2d::{VK_A, VK_RETURN};
+
+    /// A key the input method took (a dead key, or Enter picking a candidate) still says a key
+    /// went down, so a dialog opened by a click takes the text it commits, but as a key nothing
+    /// acts on.
+    #[test]
+    fn a_composed_key_goes_as_processkey() {
+        assert_eq!(sent_key(Some(VK_A), false), Some(VK_A));
+        assert_eq!(sent_key(Some(VK_A), true), Some(VK_PROCESSKEY));
+        assert_eq!(sent_key(Some(VK_RETURN), true), Some(VK_PROCESSKEY));
+        assert_eq!(sent_key(None, false), None);
+    }
 }

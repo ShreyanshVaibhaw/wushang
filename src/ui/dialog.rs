@@ -1981,6 +1981,20 @@ mod tests {
         );
     }
 
+    /// The character of the key that opened a dialog stays out of its field (the Space that
+    /// picked a menu item); after any key, even one an input method took, typing lands.
+    #[test]
+    fn typing_lands_once_a_key_went_down() {
+        let mut ui = Ui::new();
+        ui.open_dialog(Dialog::NewProfile);
+        ui.dialog_char(' ' as u32);
+        assert_eq!(ui.dialog.as_ref().unwrap().field.text, "");
+        // What the window sends for a dead key's second key: VK_PROCESSKEY, then "é".
+        ui.dialog_key(VIRTUAL_KEY(0xE5), false, false);
+        ui.dialog_char('é' as u32);
+        assert_eq!(ui.dialog.as_ref().unwrap().field.text, "é");
+    }
+
     #[test]
     fn number_formats() {
         assert_eq!(size_text(512), "512 bytes");

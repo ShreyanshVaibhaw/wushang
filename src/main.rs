@@ -3958,6 +3958,9 @@ fn on_event(event: Event) {
                 {
                     let skip = f64::from(PREFS.with_borrow(|p| p.skip[0]));
                     shared.seek_by(if key == VK_LEFT { -skip } else { skip });
+                } else if typing {
+                    // The key of a character Option types, which opens a dialog's typing gate.
+                    on_key(win, shared, key, shift, false);
                 } else {
                     return;
                 }
