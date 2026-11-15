@@ -471,14 +471,9 @@ impl State {
             VK_HOME => f.move_to(0, shift),
             VK_END => f.move_to(usize::MAX, shift),
             VK_BACK => f.backspace(ctrl),
-            VK_DELETE if shift => {
-                if let Some(s) = f.cut() {
-                    set_clipboard_text(&s);
-                }
-            }
             VK_DELETE => f.delete(ctrl),
             VK_A if ctrl => f.select_all(),
-            VK_C | VK_INSERT if ctrl => {
+            VK_C if ctrl => {
                 if !f.selected().is_empty() {
                     set_clipboard_text(f.selected());
                 }
@@ -490,7 +485,6 @@ impl State {
                 }
             }
             VK_V if ctrl => f.insert(&clipboard_text().unwrap_or_default()),
-            VK_INSERT if shift => f.insert(&clipboard_text().unwrap_or_default()),
             _ => return false,
         }
         self.edited();
@@ -1979,6 +1973,16 @@ mod tests {
             p.save(),
             Some(DialogAction::CreateProfile("Late Night".into()))
         );
+    }
+
+    /// Shift+Delete is a forward delete, as in any macOS field, not Windows' cut.
+    #[test]
+    fn shift_delete_deletes_forward() {
+        let mut d = State::new(Dialog::NewProfile);
+        d.field.insert("ab");
+        d.field.move_to(0, false);
+        assert!(d.field_key(VK_DELETE, true, false));
+        assert_eq!(d.field.text, "b");
     }
 
     /// The character of the key that opened a dialog stays out of its field (the Space that

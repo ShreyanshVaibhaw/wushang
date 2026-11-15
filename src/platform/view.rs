@@ -211,7 +211,7 @@ define_class!(
                     VK_O | VK_R | VK_D | VK_N | VK_F | VK_P | VK_M | VK_I | VK_Q | VK_OEM_5
                         | VK_OEM_COMMA | VK_A
                         | VK_C | VK_V | VK_X | VK_LEFT | VK_RIGHT | VK_UP | VK_DOWN | VK_BACK
-                        | VK_DELETE | VK_HOME | VK_END | VK_INSERT | VK_RETURN
+                        | VK_DELETE | VK_HOME | VK_END | VK_RETURN
                         // Tabs: new, close, next and previous, and Command+1 to 9.
                         | VK_T | VK_W | VK_OEM_4 | VK_OEM_6 | VK_TAB | VK_1 | VK_2 | VK_3
                         | VK_4 | VK_5 | VK_6 | VK_7 | VK_8 | VK_9
