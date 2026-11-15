@@ -334,6 +334,22 @@ struct Opening {
     cancel: Arc<AtomicBool>,
     /// For a tab `in_new_tab` made for it, the tab on screen before, to show again if it fails.
     back: Option<Weak<Shared>>,
+    /// Opened by moving on through the queue: how many more of its files to try if this one
+    /// fails, passing it over. None for a file asked for, whose failure stops there.
+    skips: Option<usize>,
+}
+
+/// What came of a file a tab was opening.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Opened {
+    /// It plays, or the queue's next file opens in its place.
+    Playing,
+    /// It didn't open, and the tab is left empty.
+    Failed,
+    /// It didn't open, and nothing after it in the queue did: the queue's end.
+    Ended,
+    /// It didn't open in a tab made for it, which went.
+    Gone,
 }
 
 impl App {
@@ -449,6 +465,7 @@ impl App {
             ready,
             cancel,
             back: None,
+            skips: None,
         });
         true
     }
@@ -543,7 +560,7 @@ impl App {
 
     /// Starts what tab `i` was opening once it has opened: None until then, else whether it
     /// plays. A tab `in_new_tab` made whose stream failed goes again.
-    fn finish_opening(&mut self, i: usize) -> Option<bool> {
+    fn finish_opening(&mut self, i: usize) -> Option<Opened> {
         let tab = &mut self.tabs[i];
         let input = tab.opening.as_ref()?.ready.try_recv().ok()?;
         let o = tab.opening.take()?;
@@ -551,11 +568,25 @@ impl App {
         if i == self.active {
             self.notice = None;
         }
-        let played = self.start(i, &o.path, input.map(|input| (input, o.cancel)));
-        if !played && let Some(back) = o.back {
-            self.drop_new_tab(i, &back);
+        if self.start(i, &o.path, input.map(|input| (input, o.cancel))) {
+            return Some(Opened::Playing);
         }
-        Some(played)
+        if let Some(back) = o.back {
+            self.drop_new_tab(i, &back);
+            return Some(Opened::Gone);
+        }
+        Some(match o.skips {
+            None => Opened::Failed,
+            Some(tries) => {
+                let next = self.tabs[i].queue.next();
+                if self.open_from_queue(i, next, tries) {
+                    Opened::Playing
+                } else {
+                    self.stop(i);
+                    Opened::Ended
+                }
+            }
+        })
     }
 
     /// Closes tab `i`, which `in_new_tab` made for a file that never opened, as long as `back`,
@@ -778,9 +809,11 @@ impl App {
     /// clock from video when it has no sound, and moves on at the end of a file. Returns whether
     /// it reached the end of its queue and stopped.
     fn play_unseen(&mut self, i: usize) -> bool {
-        // A new tab whose stream failed may have gone.
-        if self.finish_opening(i) == Some(false) {
-            return false;
+        match self.finish_opening(i) {
+            // A new tab whose stream failed may have gone.
+            Some(Opened::Gone | Opened::Failed) => return false,
+            Some(Opened::Ended) => return true,
+            Some(Opened::Playing) | None => {}
         }
         let tab = &mut self.tabs[i];
         tab.step_reverse();
@@ -1252,10 +1285,30 @@ impl App {
 
     /// At the end of tab `i`'s file: the same one again under Repeat One, else the next.
     fn advance(&mut self, i: usize) -> bool {
-        self.tabs[i]
-            .queue
-            .on_end()
-            .is_some_and(|p| self.open(i, &p))
+        let tries = self.tabs[i].queue.items().len();
+        let path = self.tabs[i].queue.on_end();
+        self.open_from_queue(i, path, tries)
+    }
+
+    /// Opens `path`, which moving on through tab `i`'s queue reached, passing over files that
+    /// can't open (moved or deleted), as VLC's playlist does. At most `tries` files are tried,
+    /// so a queue of missing files under Repeat All still ends. A file that opens later (a
+    /// stream, or in a tab out of sight) carries the rest of the tries, for `finish_opening`.
+    fn open_from_queue(&mut self, i: usize, mut path: Option<PathBuf>, mut tries: usize) -> bool {
+        while let Some(p) = path {
+            if self.open(i, &p) {
+                if let Some(o) = self.tabs[i].opening.as_mut() {
+                    o.skips = Some(tries.saturating_sub(1));
+                }
+                return true;
+            }
+            tries = tries.saturating_sub(1);
+            if tries == 0 {
+                return false;
+            }
+            path = self.tabs[i].queue.next();
+        }
+        false
     }
 
     /// Appends files to the queue, for the panel's + and the menus' "Add to Queue".
@@ -2129,8 +2182,12 @@ fn run() -> Result<(), Box<dyn Error>> {
         fetch_network(&mut app);
         app.take_recordings();
         app.watch_conversion();
-        if app.finish_opening(app.active).is_some() {
+        if let Some(opened) = app.finish_opening(app.active) {
             UI.with_borrow_mut(|ui| ui.dirty = true);
+            // The queue ran out of files that open: its end, which may quit, per Settings.
+            if opened == Opened::Ended && app.quit_at_end() {
+                destroy(win);
+            }
         }
         // While a dropped stream opens again, the notice says so; it fades once it plays.
         if app.tab().shared.reconnecting.load(Relaxed) {
@@ -4892,6 +4949,56 @@ mod tests {
 
     /// A tab out of sight opens its next file on a thread, never holding up the window, and
     /// when the last file of all ends there, wushang quits if Settings say so.
+    /// A file of the queue that can't open (moved or deleted) is passed over, on screen and out
+    /// of sight, as in VLC's playlist; a queue with nothing left that opens ends.
+    #[test]
+    fn a_missing_file_in_the_queue_is_passed_over() {
+        let (mut app, dir, _one) = test_app("missing-in-queue");
+        let (short, gone) = (media("test_subs.mkv"), dir.join("gone.mp4"));
+        let next = media("test_h264.mp4");
+        PREFS.with_borrow_mut(|p| p.at_end = 1);
+        let queue = vec![short.clone(), gone.clone(), next.clone()];
+        assert!(app.play(&short, queue.clone()));
+        assert!(app.advance(0), "the missing file's neighbour plays");
+        assert_eq!(app.session().map(|s| s.path.clone()), Some(next.clone()));
+        // Every file left is gone: the queue ends.
+        let all_gone = vec![short.clone(), gone.clone(), dir.join("gone 2.mp4")];
+        assert!(app.play(&short, all_gone));
+        assert!(!app.advance(0));
+
+        // Out of sight, where the next file opens in the background.
+        assert!(app.play(&short, queue));
+        assert!(app.in_new_tab(|app| app.play_file(&media("test_60s_noaudio.mp4"))));
+        assert!(app.advance(0));
+        let on = |app: &App| (app.tabs[0].session.as_ref()).is_some_and(|s| s.path == next);
+        assert!(passes(&mut app, 10.0, on), "{:?}", app.tabs[0].info().title);
+        app.tabs[0].shared.seek_to(5.9);
+        app.stop(1);
+        let start = Instant::now();
+        let mut ended = false;
+        while !ended && start.elapsed() < Duration::from_secs(10) {
+            ended = app.play_out_of_sight();
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(ended && app.quit_at_end());
+
+        // Out of sight with every file left gone, the background opens fail one by one, and
+        // that is its queue's end too.
+        app.tabs[0].queue = Queue::new(
+            vec![short.clone(), gone.clone(), dir.join("gone 2.mp4")],
+            Some(&short),
+        );
+        assert!(app.advance(0));
+        let start = Instant::now();
+        let mut ended = false;
+        while !ended && start.elapsed() < Duration::from_secs(10) {
+            ended = app.play_out_of_sight();
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(ended && app.tabs[0].is_empty());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     #[test]
     fn a_tab_out_of_sight_moves_on_by_itself() {
         let (mut app, dir, _one) = test_app("unseen");
