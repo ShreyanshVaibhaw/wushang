@@ -288,7 +288,7 @@ struct VideoPath {
     origin: f64,
     decoder: decoder::Video,
     encoder: encoder::Video,
-    /// Made from the first frame, whose format the decoder only knows then.
+    /// Made for the frames' size and format, which the decoder only knows once it has them.
     scaler: Option<software::scaling::Context>,
     size: (u32, u32),
     /// The encoder counts in frames.
@@ -383,7 +383,14 @@ impl VideoPath {
     fn encode_ready(&mut self, octx: &mut ff::format::context::Output) -> Result<(), String> {
         let mut decoded = frame::Video::empty();
         while self.decoder.receive_frame(&mut decoded).is_ok() {
-            if self.scaler.is_none() {
+            // Made for the first frame, and again when the picture changes size or pixel format
+            // midway (a broadcast moving to another programme); the encoder keeps its size.
+            let fits = |s: &software::scaling::Context| {
+                let d = s.input();
+                (d.format, d.width, d.height)
+                    == (decoded.format(), decoded.width(), decoded.height())
+            };
+            if !self.scaler.as_ref().is_some_and(fits) {
                 let scaler = software::scaling::Context::get(
                     decoded.format(),
                     decoded.width(),
@@ -818,6 +825,70 @@ mod tests {
         }
         output.write_trailer().unwrap();
         ts
+    }
+
+    /// An MPEG-2 TS whose picture changes size and pixel format a second in, as a broadcast's
+    /// does when it moves to another programme.
+    fn changing_picture_ts() -> PathBuf {
+        let ts = std::env::temp_dir().join(format!("wushang-reshaped-{}.ts", std::process::id()));
+        let mut output = ff::format::output_as(&ts, "mpegts").unwrap();
+        let codec = encoder::find(codec::Id::MPEG2VIDEO).unwrap();
+        let base = ff::Rational(1, 25);
+        let open = |(w, h): (u32, u32), format: Pixel| {
+            let mut enc = codec::Context::new_with_codec(codec)
+                .encoder()
+                .video()
+                .unwrap();
+            enc.set_width(w);
+            enc.set_height(h);
+            enc.set_format(format);
+            enc.set_time_base(base);
+            enc.set_frame_rate(Some(base.invert()));
+            enc.open_as(codec).unwrap()
+        };
+        let shapes = [((320, 240), Pixel::YUV420P), ((176, 144), Pixel::YUV422P)];
+        let mut ost = output.add_stream(codec).unwrap();
+        ost.set_parameters(open(shapes[0].0, shapes[0].1));
+        output.write_header().unwrap();
+        let out_base = output.stream(0).unwrap().time_base();
+        let mut pts = 0;
+        for ((w, h), format) in shapes {
+            let mut enc = open((w, h), format);
+            let mut write = |enc: &mut encoder::Video| {
+                let mut packet = ff::Packet::empty();
+                while enc.receive_packet(&mut packet).is_ok() {
+                    packet.set_stream(0);
+                    packet.rescale_ts(base, out_base);
+                    packet.write_interleaved(&mut output).unwrap();
+                }
+            };
+            for _ in 0..25 {
+                let mut picture = frame::Video::new(format, w, h);
+                for plane in 0..picture.planes() {
+                    picture.data_mut(plane).fill(128);
+                }
+                picture.set_pts(Some(pts));
+                pts += 1;
+                enc.send_frame(&picture).unwrap();
+                write(&mut enc);
+            }
+            enc.send_eof().unwrap();
+            write(&mut enc);
+        }
+        output.write_trailer().unwrap();
+        ts
+    }
+
+    #[test]
+    fn converts_a_picture_that_changes_shape_midway() {
+        let ts = changing_picture_ts();
+        let mp4 = convert_file(&ts, Target::Mp4);
+        let input = ff::format::input(&mp4).unwrap();
+        let seconds = input.duration() as f64 / f64::from(ff::ffi::AV_TIME_BASE);
+        assert!((1.8..2.2).contains(&seconds), "{seconds} s of picture");
+        drop(input);
+        std::fs::remove_file(&mp4).unwrap();
+        std::fs::remove_file(&ts).unwrap();
     }
 
     /// Quitting mid-conversion drops the job, which mustn't leave a half-written file behind.
