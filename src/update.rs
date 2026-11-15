@@ -32,18 +32,6 @@ pub struct Release {
     pub version: String,
     /// The file to download: the disk image, or the zip when the release has no image.
     pub zip: String,
-    /// The Windows build's installer; never set on macOS, kept so callers read the same.
-    pub msi: Option<String>,
-}
-
-/// What an update download saved.
-pub enum Saved {
-    /// An installer to run when wushang exits. Never made on macOS; kept so main reads the same
-    /// on both builds.
-    #[allow(dead_code)]
-    Installer(PathBuf),
-    /// The download, in Downloads and selected in Finder, for the user to copy over.
-    Zip(PathBuf),
 }
 
 /// Asks GitHub for the latest release on a thread of its own. The receiver gets it only when it
@@ -75,11 +63,7 @@ fn newer(json: &str, current: &str) -> Option<Release> {
             .cloned()
     };
     let zip = asset(DMG_SUFFIX).or_else(|| asset(ZIP_SUFFIX))?;
-    (version_parts(&version)? > version_parts(current)?).then_some(Release {
-        version,
-        zip,
-        msi: None,
-    })
+    (version_parts(&version)? > version_parts(current)?).then_some(Release { version, zip })
 }
 
 /// "1.2.3" as [1, 2, 3], padded to three parts. A pre-release tag like "1.2.0-beta" is None, so
@@ -125,16 +109,16 @@ fn json_strings(json: &str, key: &str) -> Vec<String> {
     out
 }
 
-/// Downloads `release` on a thread into Downloads and selects it in Finder. The receiver gets
-/// what was saved, or why it failed.
-pub fn download(release: &Release) -> Receiver<Result<Saved, String>> {
+/// Downloads `release` on a thread into Downloads and selects it in Finder, for the user to
+/// copy over. The receiver gets where it was saved, or why it failed.
+pub fn download(release: &Release) -> Receiver<Result<PathBuf, String>> {
     let (send, recv) = channel();
     let release = release.clone();
     thread::spawn(move || _ = send.send(save(&release)));
     recv
 }
 
-fn save(release: &Release) -> Result<Saved, String> {
+fn save(release: &Release) -> Result<PathBuf, String> {
     let suffix = if release.zip.ends_with(DMG_SUFFIX) {
         DMG_SUFFIX
     } else {
@@ -150,7 +134,7 @@ fn save(release: &Release) -> Result<Saved, String> {
     if let Err(e) = Command::new("/usr/bin/open").arg("-R").arg(&path).spawn() {
         eprintln!("update: can't show the download in Finder: {e}");
     }
-    Ok(Saved::Zip(path))
+    Ok(path)
 }
 
 /// Saves the downloaded `bytes` of `release` in `dir`.
@@ -199,16 +183,6 @@ fn quarantine(path: &std::path::Path, origin: &str) -> Result<(), String> {
             )
         })
 }
-
-/// Would run a downloaded installer once wushang exits; macOS updates have none.
-pub fn install_on_exit(_installer: PathBuf) {}
-
-/// The last thing main does. Nothing is left to run on macOS.
-pub fn finish() {}
-
-/// Run at start, for the update leftovers the Windows build cleans up. A macOS update leaves
-/// nothing behind but the download the user asked for.
-pub fn clean_up() {}
 
 #[cfg(test)]
 mod tests {
@@ -269,7 +243,6 @@ mod tests {
             r.zip,
             "https://github.com/ShreyanshVaibhaw/wushang/releases/download/v1.2.0/wushang-1.2.0-macos-arm64.dmg"
         );
-        assert_eq!(r.msi, None);
         // Without an image, the zip; with neither (a Windows-only release), nothing.
         let no_dmg = JSON.replace("arm64.dmg", "arm64.dmg.sig");
         assert_eq!(

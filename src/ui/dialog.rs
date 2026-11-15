@@ -63,8 +63,8 @@ pub enum DialogAction {
     /// Play the stream or add the feed at the typed address; on success close the dialog, else
     /// report with [`Ui::dialog_error`].
     OpenAddress(NetKind, String),
-    /// Download the release; on success install it or show [`Dialog::Downloaded`], else report
-    /// with [`Ui::dialog_error`].
+    /// Download the release; on success show [`Dialog::Downloaded`], else report with
+    /// [`Ui::dialog_error`].
     DownloadUpdate(crate::update::Release),
 }
 
@@ -426,7 +426,7 @@ pub struct State {
     thumbnail_picked: bool,
     /// The last press in the field, to spot a double-click.
     last_press: Option<Instant>,
-    /// Update: downloading and installing, so Install is off.
+    /// Update: downloading, so Download is off.
     busy: bool,
 }
 
@@ -904,10 +904,7 @@ impl Painter {
                     87.0,
                     w - PAD,
                 );
-                let installer = release.msi.is_some();
-                let help = if d.busy && installer {
-                    "Downloading. wushang closes, updates and opens again.".to_owned()
-                } else if d.busy {
+                let help = if d.busy {
                     "Downloading to your Downloads folder.".to_owned()
                 } else {
                     format!(
@@ -924,8 +921,7 @@ impl Painter {
                 if d.busy {
                     b.footer(top, None, "Downloading...", false)
                 } else {
-                    let go = if installer { "Install" } else { "Download" };
-                    b.footer(top, Some((Target::Cancel, "Later")), go, true)
+                    b.footer(top, Some((Target::Cancel, "Later")), "Download", true)
                 }
             }
             Dialog::Downloaded(file) => {
@@ -1387,7 +1383,7 @@ impl Ui {
                 self.close_dialog();
                 DialogAction::DeletePlaylist(name)
             }
-            // Enter reaches here even while Install is off.
+            // Enter reaches here even while Download is off.
             Target::Primary if matches!(d.dialog, Dialog::Update(_)) && d.busy => return None,
             Target::Primary if matches!(d.dialog, Dialog::Update(_)) => {
                 let Dialog::Update(release) = d.dialog.clone() else {

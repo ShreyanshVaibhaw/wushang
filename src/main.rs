@@ -154,7 +154,6 @@ const DEFAULT_ZOOM: usize = 1;
 
 fn main() {
     let result = run();
-    update::finish();
     platform::finish();
     if let Err(e) = result {
         eprintln!("wushang: {e}");
@@ -192,7 +191,7 @@ struct App {
     library: Library,
     library_changed: bool,
     /// An update downloading: what it saved, or why it failed.
-    downloading: Option<mpsc::Receiver<Result<update::Saved, String>>>,
+    downloading: Option<mpsc::Receiver<Result<PathBuf, String>>>,
     /// Lengths of the queues' files, probed in the background.
     durations: HashMap<PathBuf, f64>,
     queue_prober: thumbs::Prober,
@@ -2021,7 +2020,6 @@ fn run() -> Result<(), Box<dyn Error>> {
     let prober = thumbs::Prober::new();
     let mut tracks: HashMap<PathBuf, (tags::Stamp, Track)> = HashMap::new();
     let mut music_scan = (!play_and_exit).then(|| scan_music(app.library.roots(Section::Music)));
-    update::clean_up();
     let mut update_check = (!play_and_exit && prefs().check_updates).then(update::check);
     let mut update_offer: Option<update::Release> = None;
     let mut tracks_changed = false;
@@ -2269,20 +2267,8 @@ fn run() -> Result<(), Box<dyn Error>> {
         {
             app.downloading = None;
             match result {
-                // Quit as usual, saving everything, and let msiexec update and start wushang.
-                // With the dialog closed meanwhile, nothing happens until the next offer.
-                Ok(update::Saved::Installer(msi)) => {
-                    if UI.with_borrow(|ui| {
-                        ui.dialog
-                            .as_ref()
-                            .is_some_and(|d| matches!(d.dialog, Dialog::Update(_)))
-                    }) {
-                        update::install_on_exit(msi);
-                        destroy(win);
-                    }
-                }
                 // The download is selected in Finder already, to drag into Applications.
-                Ok(update::Saved::Zip(zip)) => open_dialog(&app, Dialog::Downloaded(zip)),
+                Ok(saved) => open_dialog(&app, Dialog::Downloaded(saved)),
                 Err(e) => UI.with_borrow_mut(|ui| ui.dialog_error(e)),
             }
         }
