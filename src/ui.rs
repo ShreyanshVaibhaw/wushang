@@ -19,8 +19,9 @@ mod tabs;
 pub mod theme;
 pub mod toolbar;
 
+use std::cell::Cell;
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use crate::d2d::*;
@@ -1336,6 +1337,51 @@ fn text_format(
     }
 }
 
+/// How many thumbnails the painter keeps: a few screens of the library, at 360 KB a video.
+const THUMB_CACHE: usize = 256;
+
+/// Thumbnails by file (None for a file with no picture), the ones drawn most lately and at most
+/// `THUMB_CACHE` of them. A file that dropped out is asked for again when it next shows.
+#[derive(Default)]
+struct Thumbs {
+    /// Each with the lookup that last drew it.
+    map: HashMap<PathBuf, (Option<ID2D1Bitmap>, Cell<u64>)>,
+    /// Counts lookups and insertions, the cache's clock.
+    clock: Cell<u64>,
+}
+
+impl Thumbs {
+    /// `path`'s entry, None when the cache has none; looking it up to draw it keeps it.
+    fn get(&self, path: &Path) -> Option<&Option<ID2D1Bitmap>> {
+        let (bitmap, used) = self.map.get(path)?;
+        used.set(self.tick());
+        Some(bitmap)
+    }
+
+    fn insert(&mut self, path: PathBuf, bitmap: Option<ID2D1Bitmap>) {
+        let used = Cell::new(self.tick());
+        self.map.insert(path, (bitmap, used));
+        while self.map.len() > THUMB_CACHE {
+            let oldest = (self.map.iter())
+                .min_by_key(|(_, (_, used))| used.get())
+                .map(|(path, _)| path.clone());
+            if let Some(path) = oldest {
+                self.map.remove(&path);
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.map.len()
+    }
+
+    fn tick(&self) -> u64 {
+        self.clock.set(self.clock.get() + 1);
+        self.clock.get()
+    }
+}
+
 /// Device-bound drawing resources, created once per Direct2D context.
 pub struct Painter {
     factory: ID2D1Factory1,
@@ -1373,8 +1419,7 @@ pub struct Painter {
     tools_on: HashMap<ToolItem, Svg>,
     /// The seconds on the skip items.
     skip_text: IDWriteTextFormat,
-    /// Thumbnails by file; None means the file has no picture.
-    thumbs: HashMap<PathBuf, Option<ID2D1Bitmap>>,
+    thumbs: Thumbs,
     /// The still for the seek bar's preview, from the file playing.
     seek_still: Option<ID2D1Bitmap>,
     /// Visible files without a thumbnail yet, collected while painting.
@@ -1453,7 +1498,7 @@ impl Painter {
             picture: None,
             factory,
             dwrite,
-            thumbs: HashMap::new(),
+            thumbs: Thumbs::default(),
             seek_still: None,
             wanted: Vec::new(),
             bar_wanted: Default::default(),
@@ -2390,6 +2435,21 @@ mod tests {
         assert_eq!(full.button(Hit::Fullscreen), fs);
         // The new-tab button moves up to the buttons that are left.
         assert_eq!(full.new_tab.unwrap().r, fs.l - tabs::NEW_GAP);
+    }
+
+    #[test]
+    fn the_thumbnail_cache_keeps_only_what_was_drawn_lately() {
+        let (ctx, mut p) = render_check::painter();
+        let path = |i: usize| PathBuf::from(format!("/videos/{i}.mp4"));
+        let pixels = [0u8; 4 * 4 * 4];
+        // Scrolling past 5000 videos, with the first one on screen all along.
+        for i in 0..5000 {
+            p.add_thumbnail(&ctx, path(i), Some((4, 4, &pixels)));
+            assert!(p.thumbs.get(&path(0)).is_some(), "the one on screen stays");
+        }
+        assert!(p.thumbs.len() <= THUMB_CACHE, "{} kept", p.thumbs.len());
+        assert!(p.thumbs.get(&path(1)).is_none(), "scrolled past long ago");
+        assert!(p.thumbs.get(&path(4999)).is_some());
     }
 
     #[test]

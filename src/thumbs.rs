@@ -495,10 +495,8 @@ impl Thumbnailer {
         self.0.take_ready()
     }
 
-    /// Renders `path` again the next time it is requested, for a cache that dropped its still:
-    /// the file may have been replaced since.
-    // The UI's thumbnail cache is to call it when it drops an entry.
-    #[allow(dead_code)]
+    /// Renders `path` again the next time it is requested, for a cache that dropped its still
+    /// or may: the file may have been replaced since.
     pub fn forget(&self, path: &Path) {
         self.0.forget(path);
     }

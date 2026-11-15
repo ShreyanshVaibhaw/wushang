@@ -2218,6 +2218,8 @@ fn run() -> Result<(), Box<dyn Error>> {
             still_for = None;
         }
         for (path, thumb) in thumbnailer.take_ready() {
+            // The painter's cache keeps it now; once that drops it, it can be asked for again.
+            thumbnailer.forget(&path);
             renderer.add_thumbnail(
                 path,
                 thumb.as_ref().map(|t| (t.width, t.height, &t.bgra[..])),
