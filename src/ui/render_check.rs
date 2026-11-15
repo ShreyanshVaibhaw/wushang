@@ -229,8 +229,7 @@ fn render_check_library() {
 }
 
 /// The pixel at DIP (x, y), as 0xRRGGBB.
-#[cfg(test)]
-pub(super) fn pixel_at(canvas: &Canvas, x: f32, y: f32) -> u32 {
+fn pixel_at(canvas: &Canvas, x: f32, y: f32) -> u32 {
     let (px, py) = ((x * SCALE) as u32, (y * SCALE) as u32);
     let i = ((py * canvas.width + px) * 4) as usize;
     let p = canvas.pixels();
