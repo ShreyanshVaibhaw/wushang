@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering::Relaxed;
 use std::sync::atomic::{AtomicBool, AtomicU32};
 use std::sync::mpsc::{Receiver, channel};
-use std::thread;
+use std::thread::{self, JoinHandle};
 
 use ff::format::Pixel;
 use ff::format::stream::Disposition;
@@ -60,13 +60,15 @@ impl Target {
     }
 }
 
-/// A conversion running in the background.
+/// A conversion running in the background. Dropping it (quitting mid-conversion) cancels it
+/// and waits for the thread, so the unfinished file is gone by then.
 pub struct Job {
     pub output: PathBuf,
     /// Thousandths done, by the input's timestamps.
     progress: Arc<AtomicU32>,
     cancel: Arc<AtomicBool>,
     done: Receiver<Result<PathBuf, String>>,
+    thread: Option<JoinHandle<()>>,
 }
 
 impl Job {
@@ -76,7 +78,7 @@ impl Job {
         let (send, done) = channel();
         let (input, out) = (input.to_owned(), output.clone());
         let (p, c) = (progress.clone(), cancel.clone());
-        thread::spawn(move || {
+        let thread = thread::spawn(move || {
             let result = run(&input, target, &out, &p, &c);
             if result.is_err() {
                 _ = std::fs::remove_file(&out);
@@ -88,6 +90,7 @@ impl Job {
             progress,
             cancel,
             done,
+            thread: Some(thread),
         }
     }
 
@@ -103,6 +106,15 @@ impl Job {
     /// The finished file or what went wrong, once the job is over.
     pub fn finished(&self) -> Option<Result<PathBuf, String>> {
         self.done.try_recv().ok()
+    }
+}
+
+impl Drop for Job {
+    fn drop(&mut self) {
+        self.cancel();
+        if let Some(t) = self.thread.take() {
+            _ = t.join();
+        }
     }
 }
 
@@ -806,6 +818,19 @@ mod tests {
         }
         output.write_trailer().unwrap();
         ts
+    }
+
+    /// Quitting mid-conversion drops the job, which mustn't leave a half-written file behind.
+    #[test]
+    fn dropping_a_job_leaves_no_file() {
+        let clip = Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/test_60s.mp4");
+        let out = std::env::temp_dir().join(format!("wushang-dropped-{}.mp4", std::process::id()));
+        let job = Job::start(&clip, Target::Mp4, out.clone());
+        while job.progress() == 0.0 {
+            thread::sleep(std::time::Duration::from_millis(10));
+        }
+        drop(job);
+        assert!(!out.exists(), "{} was left behind", out.display());
     }
 
     /// The picture and the sound keep their places against each other, and the copy starts at 0.
