@@ -591,7 +591,7 @@ impl Library {
 
     /// What a page shows, in display order.
     pub fn entries(&self, place: &Place) -> Vec<Entry> {
-        let mut entries = self.raw_entries(place, LOOKUP_WAIT);
+        let mut entries = self.raw_entries(place, PAGE);
         let watched: HashMap<&Path, f64> = self
             .recent
             .iter()
@@ -615,9 +615,9 @@ impl Library {
 
     /// Entries without watch progress, which [`Library::entries`] fills in. `wait` is how long a
     /// folder listing or Home's checks may wait for the file system the first time.
-    fn raw_entries(&self, place: &Place, wait: std::time::Duration) -> Vec<Entry> {
+    fn raw_entries(&self, place: &Place, patience: Patience) -> Vec<Entry> {
         match place {
-            Place::Home => self.home(wait),
+            Place::Home => self.home(patience.wait),
             Place::Videos | Place::Music => {
                 let section = place.section();
                 let mut out = vec![action("Add", Action::AddFolder(section))];
@@ -682,7 +682,7 @@ impl Library {
                 .map(|r| self.file_media(&r.path))
                 .collect(),
             Place::Folder(section, dir) => {
-                let Some((dirs, files)) = self.media_dirs.listing(dir, wait) else {
+                let Some((dirs, files)) = self.media_dirs.listing(dir, patience) else {
                     return vec![notice("Loading...")];
                 };
                 let dirs = (self.media_dirs.keep(dirs).into_iter())
@@ -1023,7 +1023,7 @@ impl Library {
 
     /// The playable files of a place in display order (the play queue for next and previous).
     pub fn media_in(&self, place: &Place) -> Vec<PathBuf> {
-        let entries = self.raw_entries(place, QUEUE_WAIT).into_iter();
+        let entries = self.raw_entries(place, QUEUE).into_iter();
         entries
             .filter_map(|e| match e {
                 Entry::Media { path, .. } => Some(path),
@@ -1350,7 +1350,7 @@ impl Library {
     /// moment the first time. None until then; the page is redone when they come (see
     /// [`Library::media_folders_changed`]).
     pub fn modified_times(&self, paths: &[PathBuf]) -> Option<Vec<Option<SystemTime>>> {
-        self.media_dirs.times(paths, LOOKUP_WAIT)
+        self.media_dirs.times(paths, PAGE)
     }
 
     /// Lists every folder and searches it for media again the next time it shows (Resync).
@@ -1657,6 +1657,26 @@ const QUEUE_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
 /// How old an answer gets before the page that uses it has it asked again, showing the old
 /// answer meanwhile.
 const LOOK_AGAIN: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// How long a caller waits for the file system's answers, and whether one older than
+/// `LOOK_AGAIN` will do meanwhile.
+#[derive(Clone, Copy, Debug)]
+struct Patience {
+    wait: std::time::Duration,
+    fresh: bool,
+}
+
+/// A page shows at once with what it knows, and is redone when newer answers come.
+const PAGE: Patience = Patience {
+    wait: LOOKUP_WAIT,
+    fresh: false,
+};
+/// A play queue is made once and nothing redoes it, so it waits for the folder as it is now,
+/// taking the old listing only when the new one doesn't come in time.
+const QUEUE: Patience = Patience {
+    wait: QUEUE_WAIT,
+    fresh: true,
+};
 /// Answers kept; the oldest goes beyond that.
 const MAX_ANSWERS: usize = 1000;
 
@@ -1702,9 +1722,10 @@ impl MediaDirs {
     }
 
     /// The answer to `ask` known now, if any. One not known yet, or older than `LOOK_AGAIN`, is
-    /// asked for on a thread of its own unless a thread is on it already; those not known at all
-    /// go into `asked`, for [`MediaDirs::wait_for`].
-    fn look(&self, ask: &Ask, asked: &mut Vec<Ask>) -> Option<Answer> {
+    /// asked for on a thread of its own unless a thread is on it already. Those a thread is
+    /// answering and the caller has no answer for go into `asked`, for
+    /// [`MediaDirs::wait_for`]; with `fresh`, those it has only an old answer for too.
+    fn look(&self, ask: &Ask, asked: &mut Vec<Ask>, fresh: bool) -> Option<Answer> {
         let mut s = self.state();
         let known = s.answers.get(ask).cloned();
         let old = known
@@ -1715,9 +1736,10 @@ impl MediaDirs {
             let spawned = std::thread::Builder::new().spawn(move || answer(&shared, question));
             if spawned.is_err() {
                 s.asking.remove(ask);
-            } else if known.is_none() {
-                asked.push(ask.clone());
             }
+        }
+        if s.asking.contains(ask) && (known.is_none() || (fresh && old)) {
+            asked.push(ask.clone());
         }
         known.map(|(answer, _)| answer)
     }
@@ -1745,42 +1767,38 @@ impl MediaDirs {
 
     /// What is at `path`, if known yet; see [`MediaDirs::look`].
     fn found(&self, path: &Path, asked: &mut Vec<Ask>) -> Option<Found> {
-        match self.look(&Ask::Kind(path.to_owned()), asked)? {
+        match self.look(&Ask::Kind(path.to_owned()), asked, false)? {
             Answer::Kind(found) => Some(found),
             _ => None,
         }
     }
 
-    /// The answer to `ask`: the last one, or if there is none yet, the one that comes within
-    /// `wait`.
-    fn answer_within(&self, ask: &Ask, wait: std::time::Duration) -> Option<Answer> {
+    /// The answer to `ask`: the last one, or if there is none yet (or, as `patience` says, only
+    /// an old one), the one that comes within its wait, else the old one.
+    fn answer_within(&self, ask: &Ask, patience: Patience) -> Option<Answer> {
         let mut asked = Vec::new();
-        let known = self.look(ask, &mut asked);
-        if known.is_none() && self.wait_for(asked, wait) {
+        let known = self.look(ask, &mut asked, patience.fresh);
+        if self.wait_for(asked, patience.wait) {
             return self.state().answers.get(ask).map(|(a, _)| a.clone());
         }
         known
     }
 
     /// `dir`'s listing; see [`MediaDirs::answer_within`].
-    fn listing(&self, dir: &Path, wait: std::time::Duration) -> Option<(Named, Named)> {
+    fn listing(&self, dir: &Path, patience: Patience) -> Option<(Named, Named)> {
         let ask = Ask::List(dir.to_owned(), SHOW_HIDDEN.load(Relaxed));
-        match self.answer_within(&ask, wait)? {
+        match self.answer_within(&ask, patience)? {
             Answer::List(dirs, files) => Some((dirs, files)),
             _ => None,
         }
     }
 
     /// When each of `paths` was last modified; see [`MediaDirs::answer_within`].
-    fn times(
-        &self,
-        paths: &[PathBuf],
-        wait: std::time::Duration,
-    ) -> Option<Vec<Option<SystemTime>>> {
+    fn times(&self, paths: &[PathBuf], patience: Patience) -> Option<Vec<Option<SystemTime>>> {
         if paths.is_empty() {
             return Some(Vec::new());
         }
-        match self.answer_within(&Ask::Times(paths.to_vec()), wait)? {
+        match self.answer_within(&Ask::Times(paths.to_vec()), patience)? {
             Answer::Times(times) => Some(times),
             _ => None,
         }
@@ -1825,6 +1843,15 @@ impl MediaDirs {
     fn age(&self) {
         let then = std::time::Instant::now() - 2 * MEDIA_RECHECK;
         for (_, at) in self.state().known.values_mut() {
+            *at = then;
+        }
+    }
+
+    /// Makes the pages' answers old, as though they were found a while ago.
+    #[cfg(test)]
+    fn age_answers(&self) {
+        let then = std::time::Instant::now() - 2 * LOOK_AGAIN;
+        for (_, at) in self.state().answers.values_mut() {
             *at = then;
         }
     }
@@ -2144,6 +2171,24 @@ mod tests {
         let page = lib.entries(&Place::Videos);
         assert_eq!(page[0], action("Add", Action::AddFolder(Section::Videos)));
         assert_eq!(page[1], folder("Shows", place));
+    }
+
+    /// A play queue is made from the folder as it is now: a file that came since a page last
+    /// listed it joins, rather than the queue being that old listing, which nothing redoes.
+    #[test]
+    fn a_queue_lists_the_folder_as_it_is_now() {
+        let tmp = TempDir::new();
+        let show = tmp.0.join("Show");
+        tmp.touch("Show/E01.mkv");
+        let lib = Library::open(&tmp.0.join("state"), false);
+        let place = Place::Folder(Section::Videos, show.clone());
+        assert_eq!(lib.media_in(&place), [show.join("E01.mkv")]);
+        tmp.touch("Show/E02.mkv");
+        lib.media_dirs.age_answers();
+        assert_eq!(
+            lib.media_in(&place),
+            [show.join("E01.mkv"), show.join("E02.mkv")]
+        );
     }
 
     /// A folder listing and Home's checks for what is still there wait for the file system off
