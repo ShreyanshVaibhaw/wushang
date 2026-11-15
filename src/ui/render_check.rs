@@ -8,6 +8,9 @@ use super::*;
 use crate::captions::CaptionStyle;
 use crate::library::{Crumb, Entry, MediaKind, Place};
 
+/// The popups' data for screens without one open.
+static NO_PANEL: std::sync::LazyLock<PanelData> = std::sync::LazyLock::new(PanelData::default);
+
 /// Device pixels per DIP: a Retina screen.
 const SCALE: f32 = 2.0;
 
@@ -40,7 +43,7 @@ pub(super) fn scene<'a>(
         fullscreen: false,
         has_frame: true,
         browse,
-        panel: None,
+        panel: &NO_PANEL,
         queue: None,
         dialog: None,
         preferences: None,
@@ -288,7 +291,7 @@ fn render_check_popup() {
     let mut layout = Layout::new(1280.0, 720.0, true, false);
     layout.add_panel(&ui.panels, &data);
     let mut s = scene(&layout, &browse, &style);
-    s.panel = Some(&data);
+    s.panel = &data;
     shoot(&ctx, &mut painter, &s, "popup");
 }
 

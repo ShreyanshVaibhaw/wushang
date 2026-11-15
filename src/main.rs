@@ -2562,7 +2562,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                     fullscreen,
                     has_frame: tab.current.is_some(),
                     browse: &ui.browse,
-                    panel: Some(&panel_data),
+                    panel: &panel_data,
                     queue: queue_data.as_ref(),
                     dialog: ui.dialog.as_ref(),
                     preferences: ui.preferences.as_ref(),

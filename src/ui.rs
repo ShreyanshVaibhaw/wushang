@@ -1053,7 +1053,7 @@ pub struct Scene<'a> {
     pub has_frame: bool,
     pub browse: &'a Browse,
     /// What the tracks and settings popups show.
-    pub panel: Option<&'a PanelData>,
+    pub panel: &'a PanelData,
     /// What the queue panel shows, while it is open.
     pub queue: Option<&'a QueueData>,
     /// The open dialog's text, files and caret.
@@ -1724,9 +1724,7 @@ impl Painter {
             if let Some(panel) = l.browse.overlay {
                 self.overlay(rt, ctx, s, panel)?;
             }
-            if let Some(data) = s.panel {
-                self.panel(rt, ctx, s, data);
-            }
+            self.panel(rt, ctx, s, s.panel);
             if let Some(data) = s.queue {
                 self.queue_panel(rt, ctx, s, data);
             }
@@ -2119,7 +2117,7 @@ impl Painter {
                         ToolItem::Shuffle => s.shuffle,
                         ToolItem::Favorite => s.favorite,
                         ToolItem::Record => s.recording,
-                        ToolItem::Hdr => s.panel.is_some_and(|p| p.hdr),
+                        ToolItem::Hdr => s.panel.hdr,
                         ToolItem::RightSidebar => l.queue.open,
                         _ => false,
                     };
