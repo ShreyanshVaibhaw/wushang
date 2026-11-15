@@ -444,15 +444,18 @@ fn resolve(base: &str, href: &str) -> String {
     let Some((scheme, rest)) = base.split_once("://") else {
         return href.to_owned();
     };
-    let authority = rest.split('/').next().unwrap_or("");
+    let (authority, path) = rest.split_at(rest.find(['/', '?', '#']).unwrap_or(rest.len()));
     if let Some(path) = href.strip_prefix("//") {
         return format!("{scheme}://{path}");
     }
     if href.starts_with('/') {
         return format!("{scheme}://{authority}{href}");
     }
-    let dir = base.rsplit_once('/').map_or(base, |(d, _)| d);
-    format!("{dir}/{href}")
+    // The feed's folder comes from its path alone: "https://example.com" has none, and a
+    // slash in the query is no folder.
+    let path = path.split(['?', '#']).next().unwrap_or("");
+    let dir = path.rsplit_once('/').map_or("", |(d, _)| d);
+    format!("{scheme}://{authority}{dir}/{href}")
 }
 
 /// Fetches `url` (http or https) and returns the body as text. Follows redirects,
@@ -471,6 +474,16 @@ pub fn fetch(
     deadline: Duration,
     max: usize,
 ) -> Result<Vec<u8>, String> {
+    get(url, timeout, deadline, max).map(|(body, _)| body)
+}
+
+/// [`fetch`], with the address the body came from once redirects were followed.
+fn get(
+    url: &str,
+    timeout: Duration,
+    deadline: Duration,
+    max: usize,
+) -> Result<(Vec<u8>, String), String> {
     let (scheme, rest) = url
         .split_once("://")
         .ok_or_else(|| format!("{} is not a web address", redact(url)))?;
@@ -537,7 +550,19 @@ pub fn fetch(
     if body.len() > max {
         return Err("that download is too large".into());
     }
-    Ok(body)
+    use ureq::ResponseExt;
+    Ok((body, response.get_uri().to_string()))
+}
+
+/// Fetches and parses the podcast feed at `url`; one without a playable episode is an error.
+/// Relative links are resolved against where the feed is now, after any redirect.
+fn load_feed(url: &str, timeout: Duration) -> Result<Feed, String> {
+    let (body, at) = get(url, timeout, FETCH_DEADLINE, MAX_FETCH)?;
+    let feed = parse_feed(&String::from_utf8_lossy(&body), &at);
+    if feed.episodes.is_empty() {
+        return Err("that feed has no playable episodes".into());
+    }
+    Ok(feed)
 }
 
 /// What a finished fetch means for the caller.
@@ -569,14 +594,7 @@ impl Fetcher {
             while let Ok(request) = ask.recv() {
                 let fetched = match request {
                     Request::Feed(url, timeout) => Fetched::Feed {
-                        result: fetch_text(&url, timeout).and_then(|text| {
-                            let feed = parse_feed(&text, &url);
-                            if feed.episodes.is_empty() {
-                                Err("that feed has no playable episodes".into())
-                            } else {
-                                Ok(feed)
-                            }
-                        }),
+                        result: load_feed(&url, timeout),
                         feed: url,
                     },
                     Request::Stations(timeout) => Fetched::Stations(
@@ -897,6 +915,77 @@ mod tests {
         assert!(stalled.starts_with("cannot reach 127.0.0.1"), "{stalled}");
         assert!(fetch_text("ftp://example.com/x", second).is_err());
         assert!(fetch_text("not an address", second).is_err());
+    }
+
+    #[test]
+    fn resolves_links_against_the_feeds_path() {
+        let cases = [
+            (
+                "https://example.com",
+                "ep1.mp3",
+                "https://example.com/ep1.mp3",
+            ),
+            (
+                "https://example.com?x=1",
+                "/a.mp3",
+                "https://example.com/a.mp3",
+            ),
+            (
+                "https://example.com?x=1",
+                "a.mp3",
+                "https://example.com/a.mp3",
+            ),
+            (
+                "https://example.com/feeds/show.xml?from=a/b#c/d",
+                "ep1.mp3",
+                "https://example.com/feeds/ep1.mp3",
+            ),
+            (
+                "https://example.com/feeds/",
+                "ep1.mp3",
+                "https://example.com/feeds/ep1.mp3",
+            ),
+            (
+                "https://example.com/feeds/show.xml",
+                "/a.mp3",
+                "https://example.com/a.mp3",
+            ),
+            (
+                "https://example.com/f.xml",
+                "//cdn.example/a.mp3",
+                "https://cdn.example/a.mp3",
+            ),
+            (
+                "https://example.com/f.xml",
+                "http://other.example/a.mp3",
+                "http://other.example/a.mp3",
+            ),
+        ];
+        for (base, href, want) in cases {
+            assert_eq!(resolve(base, href), want, "{href} in {base}");
+        }
+    }
+
+    /// A feed that moved: its relative links are under where it is now, not where it was.
+    #[test]
+    fn relative_links_follow_the_feeds_redirect() {
+        let base = serve(|path| match path {
+            "/old/feed.xml" => {
+                b"HTTP/1.1 301 Moved\r\nLocation: /new/feed.xml\r\nContent-Length: 0\r\n\r\n"
+                    .to_vec()
+            }
+            "/new/feed.xml" => {
+                let body = "<rss><channel><title>Moved</title><item><enclosure url=\"ep1.mp3\"/></item></channel></rss>";
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .into_bytes()
+            }
+            _ => b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n".to_vec(),
+        });
+        let feed = load_feed(&format!("{base}/old/feed.xml"), Duration::from_secs(5)).unwrap();
+        assert_eq!(feed.episodes[0].url, format!("{base}/new/ep1.mp3"));
     }
 
     /// A directory as big as a fetch may be parses in linear time, duplicates still dropped.
