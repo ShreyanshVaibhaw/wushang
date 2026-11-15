@@ -353,12 +353,9 @@ macro_rules! w {
 }
 pub(crate) use w;
 
-/// A string constant from `w!`, and the cursor ids `LoadCursorW` takes.
+/// A string constant from `w!`.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct PCWSTR(pub &'static str);
-
-pub const IDC_IBEAM: PCWSTR = PCWSTR("IDC_IBEAM");
-pub const IDC_HAND: PCWSTR = PCWSTR("IDC_HAND");
 
 /// `windows::core::HSTRING`: an owned string handed to a call.
 #[derive(Clone, Default, PartialEq, Eq, Hash, Debug)]
