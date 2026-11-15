@@ -252,16 +252,17 @@ define_class!(
             }
         }
 
-        /// Greys out the menu bar's commands while a dialog, Settings, the welcome, Customize
-        /// or a menu of the window's own is open; Hide and Quit's neighbours stay AppKit's.
-        /// Closing and switching tabs also wait for the window to be on screen: minimized, it
-        /// isn't the key window, so their keys come here and would act on tabs out of sight.
+        /// Greys out the menu bar's commands as `command_enabled` says; Hide and Quit's
+        /// neighbours stay AppKit's.
         #[unsafe(method(validateMenuItem:))]
         fn validate_menu_item(&self, item: &NSMenuItem) -> bool {
-            let tabs = [Command::CloseTab, Command::NextTab, Command::PreviousTab];
-            let on_tabs = tabs.into_iter().any(|c| c as isize == item.tag());
-            item.action() != Some(sel!(wushangMenu:))
-                || (MENU_ENABLED.get() && (!on_tabs || self.window_on_screen()))
+            let command = Command::ALL.into_iter().find(|c| *c as isize == item.tag());
+            match command {
+                Some(command) if item.action() == Some(sel!(wushangMenu:)) => {
+                    command_enabled(command, MENU_ENABLED.get(), || self.window_on_screen())
+                }
+                _ => true,
+            }
         }
 
         /// Quit from the Dock, Activity Monitor or a script, and the system's as it logs out,
@@ -278,6 +279,20 @@ define_class!(
         }
     }
 );
+
+/// Whether the menu bar's `command` is on. `menu_enabled` is off while a dialog, Settings, the
+/// welcome, Customize or a menu of the window's own has the keys, and the commands wait for it,
+/// About and Settings too, since they open in the window in place of what is there. Quit never
+/// waits: it ends and saves as the Dock's Quit does, whatever is open. Closing and switching
+/// tabs also wait for the window to be on screen (`on_screen`): minimized, it isn't the key
+/// window, so their keys come here and would act on tabs out of sight.
+fn command_enabled(command: Command, menu_enabled: bool, on_screen: impl FnOnce() -> bool) -> bool {
+    match command {
+        Command::Quit => true,
+        Command::CloseTab | Command::NextTab | Command::PreviousTab => menu_enabled && on_screen(),
+        _ => menu_enabled,
+    }
+}
 
 /// Asks the render loop to end and save, closing a file picker that would hold it up.
 fn quit() {
@@ -572,5 +587,23 @@ fn item(
             action,
             &NSString::from_str(key),
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn quit_stays_on_while_the_window_has_the_keys() {
+        let off_screen = || false;
+        assert!(command_enabled(Command::Quit, false, off_screen));
+        for c in [Command::About, Command::Settings, Command::Open] {
+            assert!(!command_enabled(c, false, || true), "{c:?}");
+            assert!(command_enabled(c, true, off_screen), "{c:?}");
+        }
+        assert!(!command_enabled(Command::CloseTab, true, off_screen));
+        assert!(command_enabled(Command::NextTab, true, || true));
+        assert!(!command_enabled(Command::PreviousTab, false, || true));
     }
 }
