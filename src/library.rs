@@ -1501,11 +1501,26 @@ fn stem_of(path: &Path) -> String {
 
 /// Absolute form of `path`, so lookups match however the file was opened. A stream address
 /// stays as it is; it would read as a path relative to the current folder.
+///
+/// `.` and `..` are taken out by name alone (`a/sub/../b` is `a/b`), and links aren't followed:
+/// the library is keyed by paths as they were opened, and following links would change the key
+/// of files already in it, losing where they stopped.
 pub fn abs(path: &Path) -> PathBuf {
+    use std::path::Component;
     if crate::net::is_address(path) {
         return path.to_path_buf();
     }
-    std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf())
+    let path = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
+    let mut out = PathBuf::new();
+    for part in path.components() {
+        match part {
+            Component::CurDir => {}
+            // `pop` leaves the root, as `/..` is `/`.
+            Component::ParentDir => _ = out.pop(),
+            part => out.push(part),
+        }
+    }
+    out
 }
 
 /// Keys with a nonzero count, highest count first, ties in key order.
@@ -2724,6 +2739,33 @@ mod tests {
         let url = Path::new("https://example.com/live/index.m3u8");
         assert_eq!(abs(url), url);
         assert!(abs(Path::new("clip.mp4")).is_absolute());
+    }
+
+    /// A file opened as `../film.mkv` from a subfolder is the same file as `film.mkv` opened
+    /// from its own folder, so it resumes and lists once.
+    #[test]
+    fn dots_in_a_path_name_the_same_file() {
+        assert_eq!(
+            abs(Path::new("/x/sub/../film.mkv")),
+            Path::new("/x/film.mkv")
+        );
+        assert_eq!(abs(Path::new("/x/./a/b/../../c")), Path::new("/x/c"));
+        assert_eq!(abs(Path::new("/../film.mkv")), Path::new("/film.mkv"));
+        let cwd = env::current_dir().unwrap();
+        assert_eq!(
+            abs(Path::new("../film.mkv")),
+            cwd.parent().unwrap().join("film.mkv")
+        );
+
+        let tmp = TempDir::new();
+        let mut lib = Library::open(&tmp.0, false);
+        lib.record_position(Path::new("/x/sub/../film.mkv"), 50.0, 100.0);
+        lib.record_position(Path::new("/x/film.mkv"), 60.0, 100.0);
+        assert_eq!(lib.media_in(&Place::Recent), [PathBuf::from("/x/film.mkv")]);
+        assert_eq!(
+            lib.resume_position(Path::new("/x/sub/../film.mkv")),
+            Some(60.0)
+        );
     }
 
     #[test]
