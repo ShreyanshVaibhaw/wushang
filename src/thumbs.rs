@@ -7,7 +7,7 @@ use std::ffi::CStr;
 use std::panic::{self, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex};
-use std::thread::{self, JoinHandle};
+use std::thread;
 
 use ff::ffi;
 use ff::format::stream::Disposition;
@@ -307,7 +307,6 @@ struct State<T> {
 
 struct Workers<T> {
     queue: Arc<Queue<T>>,
-    threads: Vec<JoinHandle<()>>,
 }
 
 impl<T: Send + 'static> Workers<T> {
@@ -322,35 +321,33 @@ impl<T: Send + 'static> Workers<T> {
             wake: Condvar::new(),
         });
         let job = Arc::new(job);
-        let threads = (0..count.max(1))
-            .map(|_| {
-                let (queue, job) = (queue.clone(), job.clone());
-                thread::spawn(move || {
-                    loop {
-                        let path = {
-                            let s = queue.state.lock().unwrap();
-                            let mut s = queue
-                                .wake
-                                .wait_while(s, |s| s.stack.is_empty() && !s.quit)
-                                .unwrap();
-                            if s.quit {
-                                return;
-                            }
-                            s.stack.pop().unwrap()
-                        };
-                        // A panic inside ffmpeg-next on some odd file must not kill the worker.
-                        let result =
-                            panic::catch_unwind(AssertUnwindSafe(|| job(&path))).unwrap_or(None);
-                        let mut s = queue.state.lock().unwrap();
-                        if result.is_none() {
-                            s.seen.remove(&path);
+        for _ in 0..count.max(1) {
+            let (queue, job) = (queue.clone(), job.clone());
+            thread::spawn(move || {
+                loop {
+                    let path = {
+                        let s = queue.state.lock().unwrap();
+                        let mut s = queue
+                            .wake
+                            .wait_while(s, |s| s.stack.is_empty() && !s.quit)
+                            .unwrap();
+                        if s.quit {
+                            return;
                         }
-                        s.ready.push((path, result));
+                        s.stack.pop().unwrap()
+                    };
+                    // A panic inside ffmpeg-next on some odd file must not kill the worker.
+                    let result =
+                        panic::catch_unwind(AssertUnwindSafe(|| job(&path))).unwrap_or(None);
+                    let mut s = queue.state.lock().unwrap();
+                    if result.is_none() {
+                        s.seen.remove(&path);
                     }
-                })
-            })
-            .collect();
-        Workers { queue, threads }
+                    s.ready.push((path, result));
+                }
+            });
+        }
+        Workers { queue }
     }
 
     /// Queues the paths not seen before; the last one is served first.
@@ -375,13 +372,14 @@ impl<T: Send + 'static> Workers<T> {
 }
 
 impl<T> Drop for Workers<T> {
-    /// Waits only for the items in flight; queued ones are dropped.
+    /// Drops the queued items and lets the threads go without waiting for them: an item in
+    /// flight can be stuck for a network timeout on a share that doesn't answer, and quitting
+    /// (or logging out) must not wait for it. Each thread ends once its item is done.
     fn drop(&mut self) {
-        self.queue.state.lock().unwrap().quit = true;
+        let mut s = self.queue.state.lock().unwrap();
+        s.quit = true;
+        s.stack.clear();
         self.queue.wake.notify_all();
-        for t in self.threads.drain(..) {
-            _ = t.join();
-        }
     }
 }
 
@@ -789,6 +787,37 @@ mod tests {
         let got = wait_for(|| thumbs.take_ready(), 1);
         assert!(got.first().is_some_and(|(_, t)| t.is_some()));
         _ = std::fs::remove_file(&path);
+    }
+
+    /// Dropping the workers doesn't wait for a job stuck on a share that doesn't answer, and
+    /// the thread takes no new job once that one ends.
+    #[test]
+    fn dropping_workers_leaves_a_stuck_job_behind() {
+        let (release, stuck) = std::sync::mpsc::channel::<()>();
+        let stuck = Mutex::new(stuck);
+        let ran = Arc::new(Mutex::new(Vec::new()));
+        let log = ran.clone();
+        let workers = Workers::new(1, move |p: &Path| {
+            log.lock().unwrap().push(p.to_owned());
+            if p == Path::new("/stuck") {
+                _ = stuck.lock().unwrap().recv();
+            }
+            Some(())
+        });
+        // The last path pushed is served first.
+        workers.push([PathBuf::from("/next"), PathBuf::from("/stuck")]);
+        _ = wait_for(|| ran.lock().unwrap().drain(..).collect(), 1);
+        // Lets the job go in 2 s, in case dropping waits for it.
+        thread::spawn(move || {
+            thread::sleep(Duration::from_secs(2));
+            _ = release.send(());
+        });
+        let started = Instant::now();
+        drop(workers);
+        let took = started.elapsed();
+        assert!(took < Duration::from_secs(1), "{took:?}");
+        thread::sleep(Duration::from_millis(2300));
+        assert!(ran.lock().unwrap().is_empty(), "a job ran after the drop");
     }
 
     #[test]
