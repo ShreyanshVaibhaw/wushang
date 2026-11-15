@@ -372,6 +372,11 @@ impl Browse {
 }
 
 impl Ui {
+    /// Whether typing goes to the library's search box: it has focus, and the library shows.
+    pub fn search_focused(&self) -> bool {
+        self.browse.searching && self.page == Page::Library
+    }
+
     /// After a new layout: a scroll left past the library's end (a list that shrank, a window
     /// that grew), which the layout drew at the end, comes back to the end, so the wheel goes
     /// on from where the page shows.
@@ -1653,5 +1658,17 @@ mod tests {
         assert!(b.search_key(VK_ESCAPE, false, false, false));
         assert_eq!((b.search.text.as_str(), b.searching), ("", false));
         assert_eq!(b.entries.len(), 3);
+    }
+
+    /// The search box has the keys only while the library shows it: playing a result leaves
+    /// it behind, and Space then pauses.
+    #[test]
+    fn the_search_box_has_focus_only_on_the_library() {
+        let mut ui = Ui::new();
+        ui.show(Page::Library);
+        ui.browse.searching = true;
+        assert!(ui.search_focused());
+        ui.show(Page::Player);
+        assert!(!ui.search_focused());
     }
 }

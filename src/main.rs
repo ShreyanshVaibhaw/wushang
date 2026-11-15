@@ -3906,7 +3906,7 @@ fn on_event(event: Event) {
             }
             // Typing goes to the library's search box while it has focus.
             UI.with_borrow_mut(|ui| {
-                if ui.browse.searching && ui.browse.search_char(c) {
+                if ui.search_focused() && ui.browse.search_char(c) {
                     ui.relayout = true;
                 }
             });
@@ -3918,7 +3918,7 @@ fn on_event(event: Event) {
             alt,
         } => {
             let typing = UI.with_borrow(|ui| {
-                ui.dialog.is_some() || ui.preferences.is_some() || ui.browse.searching
+                ui.dialog.is_some() || ui.preferences.is_some() || ui.search_focused()
             });
             if alt && !typing {
                 // Option + Left/Right is Alt's very short skip. Other Option keys type
@@ -4321,7 +4321,7 @@ fn on_key(win: Window, shared: &Shared, key: VIRTUAL_KEY, shift: bool, ctrl: boo
         return;
     }
     // While searching, keys type; Esc clears the search and Enter keeps it.
-    if UI.with_borrow(|ui| ui.browse.searching) {
+    if UI.with_borrow(Ui::search_focused) {
         UI.with_borrow_mut(|ui| {
             if ui.browse.search_key(key, shift, ctrl, alt) {
                 ui.relayout = true;
