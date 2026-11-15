@@ -673,7 +673,7 @@ fn local_time(time: std::time::SystemTime) -> Option<String> {
     ))
 }
 
-use crate::platform::{clipboard_text, set_clipboard_text};
+use crate::platform::{Cursor, clipboard_text, set_clipboard_text};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Style {
@@ -1259,12 +1259,12 @@ impl Ui {
             .is_some_and(|d| matches!(d.dialog, Dialog::NewPlaylist { .. }))
     }
 
-    /// The cursor over the open dialog: an I-beam on the name field, a hand on links.
-    pub fn dialog_cursor(&self) -> Option<PCWSTR> {
-        match self.hover? {
-            Hit::Dialog(Target::Field) => Some(IDC_IBEAM),
-            Hit::Dialog(Target::Link(_)) => Some(IDC_HAND),
-            _ => None,
+    /// The pointer over the open dialog: an I-beam on the name field, a hand on links.
+    pub fn dialog_cursor(&self) -> Cursor {
+        match self.hover {
+            Some(Hit::Dialog(Target::Field)) => Cursor::IBeam,
+            Some(Hit::Dialog(Target::Link(_))) => Cursor::Hand,
+            _ => Cursor::Arrow,
         }
     }
 

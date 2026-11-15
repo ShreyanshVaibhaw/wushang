@@ -48,9 +48,9 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use d2d::{
-    IDC_HAND, IDC_IBEAM, VIRTUAL_KEY, VK_1, VK_8, VK_9, VK_BACK, VK_D, VK_DOWN, VK_ESCAPE, VK_F,
-    VK_F1, VK_I, VK_LEFT, VK_M, VK_N, VK_O, VK_OEM_4, VK_OEM_5, VK_OEM_6, VK_OEM_COMMA, VK_P, VK_Q,
-    VK_R, VK_RETURN, VK_RIGHT, VK_S, VK_SPACE, VK_T, VK_TAB, VK_UP, VK_W,
+    VIRTUAL_KEY, VK_1, VK_8, VK_9, VK_BACK, VK_D, VK_DOWN, VK_ESCAPE, VK_F, VK_F1, VK_I, VK_LEFT,
+    VK_M, VK_N, VK_O, VK_OEM_4, VK_OEM_5, VK_OEM_6, VK_OEM_COMMA, VK_P, VK_Q, VK_R, VK_RETURN,
+    VK_RIGHT, VK_S, VK_SPACE, VK_T, VK_TAB, VK_UP, VK_W,
 };
 use ffmpeg_next as ff;
 use platform::{Event, Rect, Window};
@@ -3768,12 +3768,7 @@ fn destroy(win: Window) {
 
 /// The pointer's shape over the open dialog: an I-beam on its field, a hand on links.
 fn set_pointer() {
-    let cursor = match UI.with_borrow(Ui::dialog_cursor) {
-        Some(c) if c == IDC_IBEAM => platform::Cursor::IBeam,
-        Some(c) if c == IDC_HAND => platform::Cursor::Hand,
-        _ => platform::Cursor::Arrow,
-    };
-    platform::set_cursor(cursor);
+    platform::set_cursor(UI.with_borrow(Ui::dialog_cursor));
 }
 
 /// What the window tells wushang: the window procedure, as it was on Windows.
