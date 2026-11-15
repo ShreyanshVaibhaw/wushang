@@ -716,6 +716,11 @@ impl IDWriteTextLayout {
         })))
     }
 
+    /// Whether the layout is of `text`.
+    pub(crate) fn has_text(&self, text: &[u16]) -> bool {
+        self.0.borrow().text == text
+    }
+
     fn change(&self, f: impl FnOnce(&mut Layout)) -> Result<()> {
         let mut l = self.0.borrow_mut();
         f(&mut l);

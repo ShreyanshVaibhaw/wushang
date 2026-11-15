@@ -3,10 +3,13 @@
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::ffi::c_void;
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::ops::Deref;
 use std::rc::Rc;
 
-use objc2_core_foundation::{CFData, CFRetained, CGFloat, CGPoint, CGRect, CGSize};
+use objc2_core_foundation::{
+    CFData, CFIndex, CFMutableData, CFRetained, CGFloat, CGPoint, CGRect, CGSize,
+};
 use objc2_core_graphics::{
     CGBitmapContextGetColorSpace, CGBitmapInfo, CGColorRenderingIntent, CGColorSpace, CGContext,
     CGDataProvider, CGImage, CGImageAlphaInfo, CGImageByteOrderInfo, CGInterpolationQuality,
@@ -37,11 +40,13 @@ pub(crate) struct DcState {
     frame: u64,
 }
 
-#[derive(Clone, PartialEq, Eq, Hash)]
+/// What a DrawText layout was made for. The text goes in as its hash, so a lookup needn't copy
+/// the string.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 struct TextKey {
     format: u64,
     generation: u64,
-    text: Vec<u16>,
+    text: u64,
     width: u32,
     height: u32,
 }
@@ -747,17 +752,22 @@ impl ID2D1RenderTarget {
             return Err(Error::new(E_INVALIDARG, "unsupported bitmap"));
         }
         let row = size.width as usize * 4;
-        let mut bytes = vec![0u8; row * size.height as usize];
+        let len = (row * size.height as usize) as CFIndex;
+        // The rows go straight into the CFData the image reads; growing it zeroes the bytes.
+        let data = CFMutableData::new(None, len).ok_or_else(|| Error::fail("bitmap memory"))?;
+        CFMutableData::set_length(Some(&data), len);
+        let bytes = CFMutableData::mutable_byte_ptr(Some(&data));
         if let Some(src) = srcdata.filter(|s| !s.is_null()) {
             for y in 0..size.height as usize {
-                let from = unsafe { (src as *const u8).add(y * pitch as usize) };
-                let to = &mut bytes[y * row..(y + 1) * row];
-                unsafe { std::ptr::copy_nonoverlapping(from, to.as_mut_ptr(), row) };
+                unsafe {
+                    let from = (src as *const u8).add(y * pitch as usize);
+                    std::ptr::copy_nonoverlapping(from, bytes.add(y * row), row)
+                };
             }
         }
         let dpi = |d: f32| if d > 0.0 { d } else { 96.0 };
         Ok(ID2D1Bitmap(Rc::new(Bitmap {
-            data: CFData::from_bytes(&bytes),
+            data: CFRetained::from(&**data),
             width: size.width,
             height: size.height,
             premultiplied: p.pixelFormat.alphaMode != D2D1_ALPHA_MODE_IGNORE,
@@ -1002,20 +1012,29 @@ impl ID2D1RenderTarget {
         let key = TextKey {
             format: textformat.id(),
             generation: textformat.generation(),
-            text: string.to_vec(),
+            text: {
+                let mut hasher = DefaultHasher::new();
+                string.hash(&mut hasher);
+                hasher.finish()
+            },
             width: w.to_bits(),
             height: h.to_bits(),
         };
         let layout = {
             let mut t = self.0.borrow_mut();
             let frame = t.frame;
-            if let Some((layout, used)) = t.texts.get_mut(&key) {
-                *used = frame;
-                layout.clone()
-            } else {
-                let layout = IDWriteTextLayout::new(string, textformat, w, h);
-                t.texts.insert(key, (layout.clone(), frame));
-                layout
+            match t.texts.get_mut(&key) {
+                // The key holds the text's hash, so a hit checks the text itself; two labels
+                // that collide take turns in the slot.
+                Some((layout, used)) if layout.has_text(string) => {
+                    *used = frame;
+                    layout.clone()
+                }
+                _ => {
+                    let layout = IDWriteTextLayout::new(string, textformat, w, h);
+                    t.texts.insert(key, (layout.clone(), frame));
+                    layout
+                }
             }
         };
         let origin = Vector2 {

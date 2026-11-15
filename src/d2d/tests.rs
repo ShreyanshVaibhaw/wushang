@@ -327,6 +327,80 @@ fn text_draws_upright_on_a_snapped_baseline() {
     assert!(ink(16) > 0);
 }
 
+/// DrawText keeps each label's layout between frames; a different label in the same box and
+/// format, frame after frame, still draws as itself.
+#[test]
+fn cached_text_draws_the_label_asked_for() {
+    let (_dwrite, f) = format(20.0, false);
+    let canvas = Canvas::new(100, 100).unwrap();
+    let ctx = ID2D1DeviceContext5::new();
+    let ink = |label: &str| {
+        let text: Vec<u16> = label.encode_utf16().collect();
+        ctx.begin(&canvas.cg, (100, 100), 1.0);
+        unsafe {
+            ctx.Clear(None);
+            ctx.DrawText(
+                &text,
+                &f,
+                &rect(10.0, 10.0, 90.0, 90.0),
+                &red(&ctx),
+                D2D1_DRAW_TEXT_OPTIONS_NONE,
+                DWRITE_MEASURING_MODE_NATURAL,
+            )
+        };
+        ctx.end();
+        canvas
+            .pixels()
+            .chunks(4)
+            .map(|p| u32::from(p[3]))
+            .sum::<u32>()
+    };
+    let (l, w) = (ink("l"), ink("WWW"));
+    assert!(w > 4 * l, "{w} {l}");
+    for _ in 0..3 {
+        assert_eq!(ink("l"), l);
+        assert_eq!(ink("WWW"), w);
+    }
+}
+
+/// Bitmap rows are read at the caller's pitch, which may be wider than the row.
+#[test]
+fn bitmaps_read_rows_at_their_pitch() {
+    // 2x2 BGRA in rows of 3 pixels: red, blue, then a padding pixel the bitmap leaves out.
+    let pad = [9, 9, 9, 9];
+    let (r, b) = ([0, 0, 255, 255], [255, 0, 0, 255]);
+    let rows: Vec<u8> = [r, b, pad, b, r, pad].concat();
+    let c = draw(1.0, |ctx| unsafe {
+        let props = D2D1_BITMAP_PROPERTIES {
+            pixelFormat: D2D1_PIXEL_FORMAT {
+                format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED,
+            },
+            dpiX: 96.0,
+            dpiY: 96.0,
+        };
+        let size = D2D_SIZE_U {
+            width: 2,
+            height: 2,
+        };
+        let bitmap = ctx
+            .CreateBitmap(size, Some(rows.as_ptr().cast()), 12, &props)
+            .unwrap();
+        ctx.DrawBitmap(
+            &bitmap,
+            Some(&rect(0.0, 0.0, 100.0, 100.0)),
+            1.0,
+            D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR,
+            None,
+            None,
+        );
+    });
+    assert_eq!(at(&c, 25, 25), RED);
+    assert_eq!(at(&c, 75, 25), [255, 0, 0, 255]);
+    assert_eq!(at(&c, 25, 75), [255, 0, 0, 255]);
+    assert_eq!(at(&c, 75, 75), RED);
+}
+
 #[test]
 fn svg_icons_raster_at_the_device_scale() {
     let svg = br##"<svg width="24" height="24" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><rect x="4" y="4" width="16" height="8" fill="#FF0000"/></svg>"##;
