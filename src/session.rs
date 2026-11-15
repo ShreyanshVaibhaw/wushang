@@ -445,18 +445,30 @@ impl Session {
             record: record::Control::default(),
             stream: record::Control::default(),
         };
+        // Either one failing leaves the other to play; with neither, the first failure says why.
+        let mut failure = None;
         if let Some(stream) = video {
-            let decoder = session.open_video(stream)?;
-            session.start_video(stream, decoder);
+            match session.open_video(stream) {
+                Ok(decoder) => session.start_video(stream, decoder),
+                Err(e) => {
+                    eprintln!("video: {e}, playing without a picture");
+                    failure = Some(e);
+                }
+            }
         }
         if let Some(stream) = audio_stream {
             match session.open_audio(stream) {
                 Ok(decoder) => session.start_audio(stream, decoder),
-                Err(e) => eprintln!("audio: cannot decode ({e}), playing without sound"),
+                Err(e) => {
+                    eprintln!("audio: cannot decode ({e}), playing without sound");
+                    failure = failure.or(Some(e));
+                }
             }
         }
         if session.video_track.is_none() && session.audio_track.is_none() {
-            return Err("no playable video or audio stream".into()); // drop stops the decoder
+            // Dropping the session stops the decoders.
+            let why = failure.unwrap_or_else(|| "no playable video or audio stream".into());
+            return Err(why.into());
         }
         session.initial_subtitles = session.route_subtitles(subtitles);
         if let Some(t) = start.filter(|t| *t > 0.0) {
@@ -688,7 +700,7 @@ impl Session {
                 language: tag(c"language").filter(|l| !l.eq_ignore_ascii_case("und")),
                 codec: parameters.id().name().to_owned(),
                 default: false,
-                size: picture_size(&parameters),
+                size: None,
             });
             self.codecs.insert(
                 base + stream.index(),
@@ -1330,6 +1342,93 @@ mod tests {
         s.select(TrackKind::Video, None).unwrap();
         assert!(s.select(TrackKind::Audio, None).is_err(), "both off");
         assert_eq!(s.selected(TrackKind::Audio), Some(ENGLISH));
+    }
+
+    /// A file whose video decoder won't open (Microsoft RLE has no 7-bit form) but whose sound
+    /// decodes plays the sound, as a file with undecodable sound plays its picture.
+    #[test]
+    fn undecodable_video_plays_the_sound() {
+        ff::init().unwrap();
+        let dir = std::env::temp_dir().join(format!("wushang-novideo-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("rle7.mkv");
+        let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/test_60s.mp4");
+        let mut input = ff::format::input(&source).unwrap();
+        let sound = input.streams().best(ff::media::Type::Audio).unwrap();
+        let (sound_index, sound_base) = (sound.index(), sound.time_base());
+        let picture = || {
+            let mut picture = ff::codec::Parameters::new();
+            picture.set_medium(ff::media::Type::Video);
+            picture.set_id(ff::codec::Id::MSRLE);
+            unsafe {
+                (*picture.as_mut_ptr()).width = 64;
+                (*picture.as_mut_ptr()).height = 64;
+                (*picture.as_mut_ptr()).bits_per_coded_sample = 7;
+            }
+            picture
+        };
+        let none = ff::encoder::find(ff::codec::Id::None);
+        // The picture alone, with nothing else to play: the decoder's error says why.
+        let silent = dir.join("silent.mkv");
+        let mut out = ff::format::output(&silent).unwrap();
+        out.add_stream(none).unwrap().set_parameters(picture());
+        out.write_header().unwrap();
+        let mut packet = ff::Packet::copy(&[0; 16]);
+        packet.set_pts(Some(0));
+        packet.set_dts(Some(0));
+        packet.write_interleaved(&mut out).unwrap();
+        out.write_trailer().unwrap();
+        drop(out);
+
+        let mut out = ff::format::output(&path).unwrap();
+        out.add_stream(none).unwrap().set_parameters(picture());
+        let mut sound = sound.parameters();
+        // MP4's codec tag means nothing to Matroska.
+        unsafe { (*sound.as_mut_ptr()).codec_tag = 0 };
+        out.add_stream(none).unwrap().set_parameters(sound);
+        out.write_header().unwrap();
+        let out_base = out.stream(1).unwrap().time_base();
+        for (stream, mut packet) in input.packets() {
+            if stream.index() != sound_index {
+                continue;
+            }
+            if packet
+                .pts()
+                .is_some_and(|t| f64::from(sound_base) * t as f64 > 1.0)
+            {
+                break;
+            }
+            packet.rescale_ts(sound_base, out_base);
+            packet.set_stream(1);
+            packet.write_interleaved(&mut out).unwrap();
+        }
+        out.write_trailer().unwrap();
+        drop(out);
+
+        let shared = Arc::new(Shared::new());
+        shared.toggle_mute();
+        let audio = audio::Device::open(shared.clone(), None);
+        let s = Session::open(&path, None, &TrackChoice::default(), &shared, None, &audio)
+            .expect("the sound plays");
+        assert_eq!(s.selected(TrackKind::Video), None);
+        assert_eq!(s.selected(TrackKind::Audio), Some(1));
+        assert_eq!(s.video_size, None);
+        drop(s);
+        let err = Session::open(
+            &silent,
+            None,
+            &TrackChoice::default(),
+            &shared,
+            None,
+            &audio,
+        )
+        .err()
+        .unwrap();
+        assert!(
+            err.to_string().starts_with("cannot decode video stream 0"),
+            "{err}"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
