@@ -363,6 +363,15 @@ fn spawn_styled(
     (handle, cues)
 }
 
+/// Whether the file at `path` begins as a picture subtitle track does: a Blu-ray .sup's "PG"
+/// segment, or the MPEG program stream pack header of a VobSub .sub.
+fn starts_like_pictures(path: &Path) -> bool {
+    use std::io::Read;
+    let mut head = [0; 4];
+    std::fs::File::open(path).is_ok_and(|mut f| f.read_exact(&mut head).is_ok())
+        && (head.starts_with(b"PG") || head == [0, 0, 1, 0xBA])
+}
+
 /// Reads external text subtitles up front, with a decoded-size budget. Bitmap formats decode
 /// on a worker around the current playback position. ASS/SSA goes to libass on `canvas`, with
 /// the `fonts` of the file it is shown on.
@@ -372,13 +381,18 @@ pub fn load_external(
     fonts: &crate::ass::Fonts,
 ) -> Result<Arc<Cues>, String> {
     let canvas = canvas.into();
-    // Subtitle files run to kilobytes; one this big is not a subtitle file, and reading it
-    // whole would stall the window and eat memory.
-    if std::fs::metadata(path).is_ok_and(|m| m.len() > 64 << 20) {
-        return Err(format!("{} is too big for a subtitle file", path.display()));
+    // Text subtitle files run to kilobytes; one this big is not a subtitle file, and reading it
+    // whole would stall the window and eat memory. FFmpeg reads a text format whole as it
+    // opens it, so this runs first. Picture tracks are read a little at a time and may be
+    // bigger.
+    let big = std::fs::metadata(path).is_ok_and(|m| m.len() > 64 << 20);
+    let too_big = || format!("{} is too big for a subtitle file", path.display());
+    if big && !starts_like_pictures(path) {
+        return Err(too_big());
     }
     let ext = path.extension().map(|e| e.to_string_lossy().to_lowercase());
-    if matches!(ext.as_deref(), Some("ass" | "ssa"))
+    if !big
+        && matches!(ext.as_deref(), Some("ass" | "ssa"))
         && crate::ass::styling()
         && let Ok(bytes) = std::fs::read(path)
     {
@@ -415,6 +429,10 @@ pub fn load_external(
             | ff::codec::Id::DVB_SUBTITLE
     ) {
         return Ok(load_bitmap(path.to_owned(), input, decoder, index));
+    }
+    // A big file that began like pictures but holds text.
+    if big {
+        return Err(too_big());
     }
     // The whole file says far more about its code page than one cue does.
     if decoder.plain_text
@@ -1034,6 +1052,31 @@ mod tests {
             assert!(cues.retained_bytes.load(Relaxed) <= MAX_TRACK_BYTES);
             assert!(cues.len() < 16, "the whole movie must not be retained");
         }
+    }
+
+    /// Picture tracks are read around the playback position, never whole, so a long Blu-ray
+    /// track past the text formats' size limit still loads.
+    #[test]
+    fn big_bitmap_files_load() {
+        let dir = temp_dir("big-pgs");
+        let path = dir.join("movie.sup");
+        std::fs::write(&path, pgs_file(2)).unwrap();
+        // Sparse, so the test writes kilobytes. The zeros after the pictures are no packets.
+        let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        file.set_len(65 << 20).unwrap();
+        let cues = load_external(&path, (1920, 1080), &crate::ass::Fonts::default()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while cues.active(0.5).is_empty() {
+            assert!(Instant::now() < deadline, "no picture from the big file");
+            thread::sleep(Duration::from_millis(5));
+        }
+        // A text file that big is still refused before anything reads it.
+        let srt = dir.join("movie.srt");
+        std::fs::write(&srt, "1\n00:00:01,000 --> 00:00:02,000\nHi\n\n").unwrap();
+        let file = std::fs::OpenOptions::new().write(true).open(&srt).unwrap();
+        file.set_len(65 << 20).unwrap();
+        let err = load_external(&srt, (1920, 1080), &crate::ass::Fonts::default()).err();
+        assert!(err.is_some_and(|e| e.contains("too big")));
     }
 
     /// DVD pictures are one packet each, so the packet that crosses the lookahead is a picture
