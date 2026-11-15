@@ -1352,36 +1352,68 @@ fn text_format(
 
 /// How many thumbnails the painter keeps: a few screens of the library, at 360 KB a video.
 const THUMB_CACHE: usize = 256;
+/// How long a file that couldn't be read waits before it is asked for again: a drive asleep
+/// wakes, and a share comes back.
+const THUMB_RETRY: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Thumbnails by file (None for a file with no picture), the ones drawn most lately and at most
-/// `THUMB_CACHE` of them. A file that dropped out is asked for again when it next shows.
+/// `THUMB_CACHE` of them. A file that dropped out is asked for again when it next shows. What
+/// the latest paint drew is never dropped: with more on screen than that, the cache grows
+/// rather than drop a picture it would ask for again at once.
 #[derive(Default)]
 struct Thumbs {
-    /// Each with the lookup that last drew it.
-    map: HashMap<PathBuf, (Option<ID2D1Bitmap>, Cell<u64>)>,
+    map: HashMap<PathBuf, Thumb>,
     /// Counts lookups and insertions, the cache's clock.
     clock: Cell<u64>,
+    /// The clock when the latest paint began.
+    painted: Cell<u64>,
+}
+
+struct Thumb {
+    bitmap: Option<ID2D1Bitmap>,
+    /// The lookup that last drew it.
+    used: Cell<u64>,
+    /// For a file that couldn't be read, when that was.
+    unreadable: Option<Instant>,
 }
 
 impl Thumbs {
-    /// `path`'s entry, None when the cache has none; looking it up to draw it keeps it.
+    /// `path`'s entry, None when the cache has none, or has only a failure old enough to ask
+    /// again; looking it up to draw it keeps it.
     fn get(&self, path: &Path) -> Option<&Option<ID2D1Bitmap>> {
-        let (bitmap, used) = self.map.get(path)?;
-        used.set(self.tick());
-        Some(bitmap)
+        let t = self.map.get(path)?;
+        if t.unreadable.is_some_and(|at| at.elapsed() > THUMB_RETRY) {
+            return None;
+        }
+        t.used.set(self.tick());
+        Some(&t.bitmap)
     }
 
-    fn insert(&mut self, path: PathBuf, bitmap: Option<ID2D1Bitmap>) {
-        let used = Cell::new(self.tick());
-        self.map.insert(path, (bitmap, used));
+    /// `path`'s picture, or None for no picture; `readable` false when the file couldn't be
+    /// read, which is asked for again later.
+    fn insert(&mut self, path: PathBuf, bitmap: Option<ID2D1Bitmap>, readable: bool) {
+        let thumb = Thumb {
+            bitmap,
+            used: Cell::new(self.tick()),
+            unreadable: (!readable).then(Instant::now),
+        };
+        self.map.insert(path, thumb);
+        let painted = self.painted.get();
         while self.map.len() > THUMB_CACHE {
             let oldest = (self.map.iter())
-                .min_by_key(|(_, (_, used))| used.get())
+                .filter(|(_, t)| t.used.get() <= painted)
+                .min_by_key(|(_, t)| t.used.get())
                 .map(|(path, _)| path.clone());
-            if let Some(path) = oldest {
-                self.map.remove(&path);
-            }
+            let Some(path) = oldest else {
+                break;
+            };
+            self.map.remove(&path);
         }
+    }
+
+    /// A paint begins: what it looks up is on screen.
+    fn new_paint(&self) {
+        self.painted.set(self.clock.get());
     }
 
     #[cfg(test)]
@@ -1564,14 +1596,17 @@ impl Painter {
     }
 
     /// Takes a finished thumbnail. BGRA rows, `width * 4` bytes each.
+    /// `path`'s thumbnail: its picture, or None for no picture; `readable` false when the file
+    /// couldn't be read, to ask again later.
     pub fn add_thumbnail(
         &mut self,
         ctx: &ID2D1DeviceContext5,
         path: PathBuf,
         picture: Option<(u32, u32, &[u8])>,
+        readable: bool,
     ) {
-        self.thumbs
-            .insert(path, picture.and_then(|p| bgra_bitmap(ctx, p)));
+        let bitmap = picture.and_then(|p| bgra_bitmap(ctx, p));
+        self.thumbs.insert(path, bitmap, readable);
     }
 
     /// The still the seek bar's preview shows, or None for just the time.
@@ -1605,6 +1640,7 @@ impl Painter {
     /// Paints the interface over the video, which the renderer has already drawn into the
     /// video area, and the open dialog over both. Runs between BeginDraw and EndDraw.
     pub fn paint(&mut self, ctx: &ID2D1DeviceContext5, s: &Scene) -> Result<()> {
+        self.thumbs.new_paint();
         self.paint_page(ctx, s)?;
         if let Some(g) = &s.layout.customize {
             self.paint_customize(ctx, s, g);
@@ -2431,12 +2467,51 @@ mod tests {
         let pixels = [0u8; 4 * 4 * 4];
         // Scrolling past 5000 videos, with the first one on screen all along.
         for i in 0..5000 {
-            p.add_thumbnail(&ctx, path(i), Some((4, 4, &pixels)));
+            p.add_thumbnail(&ctx, path(i), Some((4, 4, &pixels)), true);
+            p.thumbs.new_paint();
             assert!(p.thumbs.get(&path(0)).is_some(), "the one on screen stays");
         }
         assert!(p.thumbs.len() <= THUMB_CACHE, "{} kept", p.thumbs.len());
         assert!(p.thumbs.get(&path(1)).is_none(), "scrolled past long ago");
         assert!(p.thumbs.get(&path(4999)).is_some());
+    }
+
+    /// With more thumbnails on screen than the cache holds (a big window in list view), none
+    /// that the latest paint drew goes, or each would be rendered again and drop another.
+    #[test]
+    fn the_thumbnail_cache_keeps_a_screen_bigger_than_it() {
+        let (ctx, mut p) = render_check::painter();
+        let path = |i: usize| PathBuf::from(format!("/videos/{i}.mp4"));
+        let pixels = [0u8; 4 * 4 * 4];
+        let shown = THUMB_CACHE + 44;
+        for i in 0..shown {
+            p.add_thumbnail(&ctx, path(i), Some((4, 4, &pixels)), true);
+        }
+        p.thumbs.new_paint();
+        for i in 0..shown {
+            assert!(p.thumbs.get(&path(i)).is_some(), "{i} is on screen");
+        }
+        p.add_thumbnail(&ctx, path(shown), Some((4, 4, &pixels)), true);
+        assert!((0..shown).all(|i| p.thumbs.get(&path(i)).is_some()));
+    }
+
+    /// A file that couldn't be read (a drive asleep) is asked for again a while later, while
+    /// one with no picture stays as it is.
+    #[test]
+    fn an_unreadable_thumbnail_is_asked_for_again() {
+        let (ctx, mut p) = render_check::painter();
+        let (asleep, silent) = (PathBuf::from("/Volumes/E/a.mp4"), PathBuf::from("/m/b.mp3"));
+        p.add_thumbnail(&ctx, asleep.clone(), None, false);
+        p.add_thumbnail(&ctx, silent.clone(), None, true);
+        assert!(p.thumbs.get(&asleep).is_some(), "not at once");
+        let then = Instant::now() - 2 * THUMB_RETRY;
+        for path in [&asleep, &silent] {
+            if let Some(t) = p.thumbs.map.get_mut(path) {
+                t.unreadable = t.unreadable.map(|_| then);
+            }
+        }
+        assert!(p.thumbs.get(&asleep).is_none());
+        assert!(p.thumbs.get(&silent).is_some());
     }
 
     #[test]

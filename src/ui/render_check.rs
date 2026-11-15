@@ -221,6 +221,7 @@ fn render_check_library() {
         &ctx,
         PathBuf::from("/Movies/Big Buck Bunny (2008).mkv"),
         Some((320, 180, &thumb)),
+        true,
     );
     let layout = painter.library_layout(1280.0, 720.0, &browse, None);
     let style = CaptionStyle::default();

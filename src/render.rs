@@ -268,8 +268,14 @@ impl Renderer {
         self.painter.add_dialog(layout, dialog);
     }
 
-    pub fn add_thumbnail(&mut self, path: PathBuf, picture: Option<(u32, u32, &[u8])>) {
-        self.painter.add_thumbnail(&self.d2d, path, picture);
+    pub fn add_thumbnail(
+        &mut self,
+        path: PathBuf,
+        picture: Option<(u32, u32, &[u8])>,
+        readable: bool,
+    ) {
+        self.painter
+            .add_thumbnail(&self.d2d, path, picture, readable);
     }
 
     pub fn set_seek_still(&mut self, still: Option<(u32, u32, &[u8])>) {

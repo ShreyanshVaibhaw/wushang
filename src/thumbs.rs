@@ -95,14 +95,22 @@ pub fn probe(path: &Path) -> Option<MediaInfo> {
 /// Video: a frame at 10% of the duration, but no later than 30 s (seek to the keyframe before, then decode until the first frame at/after the target or give up after ~60 frames and use the last one); fall back to the first frame if seeking fails.
 /// Audio: the embedded cover picture (attached_pic stream, decoded with the mjpeg or png decoder) if any, else None.
 /// Software decoding only (never touch the GPU), thread_count 2. Must not panic on corrupt input; return None.
+#[cfg(test)]
 pub fn render(path: &Path, width: u32, height: u32) -> Option<Thumbnail> {
-    if width == 0 || height == 0 {
-        return None;
-    }
+    thumbnail(path, width, height).flatten()
+}
+
+/// `path`'s picture for the library, as `render` makes it: None when the file can't be opened
+/// at all (a drive asleep, a share away), to be asked for again later; Some(None) when it opens
+/// but has no picture to show, which is how it stays.
+fn thumbnail(path: &Path, width: u32, height: u32) -> Option<Option<Thumbnail>> {
     let mut input = open(path)?;
+    if width == 0 || height == 0 {
+        return Some(None);
+    }
     // A video whose stream cannot be decoded still gets its cover art, if it carries one.
-    let frame = video_frame(&mut input, path).or_else(|| cover_frame(&input))?;
-    scale_cover(frame, width, height)
+    let frame = video_frame(&mut input, path).or_else(|| cover_frame(&input));
+    Some(frame.and_then(|f| scale_cover(f, width, height)))
 }
 
 /// `skim` trades quality nobody sees at thumbnail size for speed: no deblocking, and no decoding
@@ -478,20 +486,21 @@ impl Drop for SeekPreviewer {
     }
 }
 
-pub struct Thumbnailer(Workers<Thumbnail>);
+pub struct Thumbnailer(Workers<Option<Thumbnail>>);
 
 impl Thumbnailer {
     pub fn new(workers: usize, width: u32, height: u32) -> Self {
-        Thumbnailer(Workers::new(workers, move |p| render(p, width, height)))
+        Thumbnailer(Workers::new(workers, move |p| thumbnail(p, width, height)))
     }
 
     pub fn request(&self, path: &Path) {
         self.0.push([path.to_path_buf()]);
     }
 
-    /// Finished results since the last call (None = no picture for that path, so the UI stops
-    /// asking). A path that got None is rendered again if requested again.
-    pub fn take_ready(&self) -> Vec<(PathBuf, Option<Thumbnail>)> {
+    /// Finished results since the last call: Some(picture), Some(None) for a file with no
+    /// picture (the UI stops asking), or None for one that couldn't be read, which is rendered
+    /// again if requested again.
+    pub fn take_ready(&self) -> Vec<(PathBuf, Option<Option<Thumbnail>>)> {
         self.0.take_ready()
     }
 
@@ -680,6 +689,12 @@ mod tests {
             &t.bgra[..4]
         );
         assert!(render(&wav("plain.wav", &[], None), 64, 64).is_none());
+        // That is no picture, which stays; a file that can't be read is asked for again.
+        assert!(matches!(
+            thumbnail(&wav("plain.wav", &[], None), 64, 64),
+            Some(None)
+        ));
+        assert!(thumbnail(Path::new("/Volumes/asleep/film.mkv"), 64, 64).is_none());
     }
 
     fn wait_for<T>(take: impl Fn() -> Vec<T>, n: usize) -> Vec<T> {
@@ -700,10 +715,10 @@ mod tests {
         thumbs.request(&testdata(CLIPS[0]));
         let got = wait_for(|| thumbs.take_ready(), 3);
         assert_eq!(got.len(), 3);
-        assert!(
-            got.iter()
-                .all(|(_, t)| t.as_ref().is_some_and(|t| t.width == 160))
-        );
+        assert!(got.iter().all(|(_, t)| {
+            t.as_ref()
+                .is_some_and(|t| t.as_ref().is_some_and(|t| t.width == 160))
+        }));
         // Paths already done are ignored too.
         thumbs.request(&testdata(CLIPS[1]));
         std::thread::sleep(Duration::from_millis(300));
