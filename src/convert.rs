@@ -9,7 +9,7 @@ use std::ffi::c_void;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::Ordering::Relaxed;
-use std::sync::atomic::{AtomicBool, AtomicU32};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32};
 use std::sync::mpsc::{Receiver, channel};
 use std::thread::{self, JoinHandle};
 
@@ -63,12 +63,15 @@ impl Target {
 /// A conversion running in the background. Dropping it (quitting mid-conversion) cancels it
 /// and waits a moment for the thread, which removes the unfinished file. A thread stuck on an
 /// input that doesn't answer (a share gone quiet) isn't waited for: the file goes from here,
-/// and the thread is let go, so quitting isn't held up.
+/// and the thread is let go, so quitting isn't held up. A conversion already writing out its
+/// finished file is waited for, however long that takes, rather than have the file deleted.
 pub struct Job {
     pub output: PathBuf,
     /// Thousandths done, by the input's timestamps.
     progress: Arc<AtomicU32>,
     cancel: Arc<AtomicBool>,
+    /// `READING`, `FINISHING` or `ABANDONED`: which of the thread and `drop` decides the file.
+    phase: Arc<AtomicU8>,
     done: Receiver<Result<PathBuf, String>>,
     thread: Option<JoinHandle<()>>,
 }
@@ -79,9 +82,10 @@ impl Job {
         let cancel = Arc::new(AtomicBool::new(false));
         let (send, done) = channel();
         let (input, out) = (input.to_owned(), output.clone());
-        let (p, c) = (progress.clone(), cancel.clone());
+        let phase = Arc::new(AtomicU8::new(READING));
+        let (p, c, ph) = (progress.clone(), cancel.clone(), phase.clone());
         let thread = thread::spawn(move || {
-            let result = run(&input, target, &out, &p, &c);
+            let result = run(&input, target, &out, &p, &c, &ph);
             if result.is_err() {
                 _ = std::fs::remove_file(&out);
             }
@@ -91,6 +95,7 @@ impl Job {
             output,
             progress,
             cancel,
+            phase,
             done,
             thread: Some(thread),
         }
@@ -114,6 +119,13 @@ impl Job {
 /// How long dropping a job waits for its thread to stop.
 const STOP_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
 
+/// A job's phases: reading the input, writing out the finished file, or let go by `drop`
+/// while still reading. The thread and `drop` each claim the step from `READING`, so a file
+/// can't be both finished and deleted.
+const READING: u8 = 0;
+const FINISHING: u8 = 1;
+const ABANDONED: u8 = 2;
+
 impl Drop for Job {
     fn drop(&mut self) {
         self.cancel();
@@ -124,10 +136,11 @@ impl Drop for Job {
         while !t.is_finished() && std::time::Instant::now() < deadline {
             thread::sleep(std::time::Duration::from_millis(10));
         }
-        if t.is_finished() {
-            _ = t.join();
-        } else {
+        let claim = |to| (self.phase).compare_exchange(READING, to, Relaxed, Relaxed);
+        if !t.is_finished() && claim(ABANDONED).is_ok() {
             _ = std::fs::remove_file(&self.output);
+        } else {
+            _ = t.join();
         }
     }
 }
@@ -142,6 +155,7 @@ fn run(
     output: &Path,
     progress: &AtomicU32,
     cancel: &AtomicBool,
+    phase: &AtomicU8,
 ) -> Result<(), String> {
     // ffmpeg-next panics on a path that isn't valid Unicode, so those stop here.
     let Some(output) = output.to_str() else {
@@ -240,6 +254,13 @@ fn run(
         } else if let Some(a) = audio.as_mut().filter(|a| a.index == index) {
             a.decode(&packet, &mut octx)?;
         }
+    }
+    // From here the file is written out whole, which a quit waits for, unless it let go first.
+    if phase
+        .compare_exchange(READING, FINISHING, Relaxed, Relaxed)
+        .is_err()
+    {
+        return Err("cancelled".into());
     }
     if let Some(v) = video.as_mut() {
         v.finish(&mut octx)?;
@@ -918,32 +939,120 @@ mod tests {
         assert!(!out.exists(), "{} was left behind", out.display());
     }
 
-    /// Dropping a job whose input never answers (a share gone quiet) doesn't wait for it, so
-    /// quitting isn't held up. The input here is a pipe nothing writes to.
+    /// Dropping a job whose input stops answering (a share gone quiet) mid-copy doesn't wait for
+    /// it, so quitting isn't held up, and the unfinished file goes. The input is a stream fed
+    /// through a pipe that stops partway and stays open.
     #[test]
-    fn dropping_a_stuck_job_returns() {
+    fn dropping_a_stuck_job_returns_and_removes_its_file() {
         let dir = std::env::temp_dir().join(format!("wushang-stuck-{}", std::process::id()));
         _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let pipe = dir.join("never.mp4");
+        // A minute of TS, of which the pipe gets the first 6 MB before it goes quiet.
+        let ts = dir.join("film.ts");
+        let clip = Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/test_60s_noaudio.mp4");
+        let mut input = ff::format::input(&clip).unwrap();
+        let mut output = ff::format::output_as(&ts, "mpegts").unwrap();
+        let mut bases = Vec::new();
+        for stream in input.streams() {
+            let mut out = output.add_stream(encoder::find(codec::Id::None)).unwrap();
+            out.set_parameters(stream.parameters());
+            unsafe { (*out.parameters().as_mut_ptr()).codec_tag = 0 };
+            bases.push(stream.time_base());
+        }
+        output.write_header().unwrap();
+        for (stream, mut packet) in input.packets() {
+            let i = stream.index();
+            packet.rescale_ts(bases[i], output.stream(i).unwrap().time_base());
+            packet.set_position(-1);
+            packet.write_interleaved(&mut output).unwrap();
+        }
+        output.write_trailer().unwrap();
+        let bytes = std::fs::read(&ts).unwrap();
+        let pipe = dir.join("never.ts");
         let made = std::process::Command::new("/usr/bin/mkfifo")
             .arg(&pipe)
             .status()
             .unwrap();
         assert!(made.success());
-        let job = Job::start(&pipe, Target::Mp4, dir.join("out.mp4"));
-        thread::sleep(std::time::Duration::from_millis(200));
+        let (quiet, stop) = channel::<()>();
+        let feed = pipe.clone();
+        let feeder = thread::spawn(move || {
+            use std::io::Write;
+            let mut w = std::fs::OpenOptions::new().write(true).open(feed).unwrap();
+            _ = w.write_all(&bytes[..bytes.len().min(6 << 20)]);
+            // Holds the pipe open, sending nothing more, until told.
+            _ = stop.recv();
+        });
+
+        let out = dir.join("out.mp4");
+        let job = Job::start(&pipe, Target::Mp4, out.clone());
+        let start = std::time::Instant::now();
+        // Through a pipe the length is unknown, so there is no progress to watch: the file
+        // shows the copy has begun.
+        while !out.exists() {
+            if let Some(r) = job.finished() {
+                panic!("the job ended: {r:?}");
+            }
+            assert!(start.elapsed().as_secs() < 20, "the copy never began");
+            thread::sleep(std::time::Duration::from_millis(10));
+        }
+        // Until it has copied what the pipe had and waits on it: the file stops growing.
+        let size = || std::fs::metadata(&out).map_or(0, |m| m.len());
+        let mut last = (size(), std::time::Instant::now());
+        while last.1.elapsed().as_millis() < 1500 {
+            assert!(start.elapsed().as_secs() < 60, "the copy never settled");
+            thread::sleep(std::time::Duration::from_millis(50));
+            if size() != last.0 {
+                last = (size(), std::time::Instant::now());
+            }
+        }
+        if let Some(r) = job.finished() {
+            panic!("the job ended: {r:?}");
+        }
         let (tx, rx) = channel();
         thread::spawn(move || {
             drop(job);
             _ = tx.send(());
         });
+        let dropping = std::time::Instant::now();
         let returned = rx.recv_timeout(std::time::Duration::from_secs(10)).is_ok();
-        // Let the job's thread go: a writer opening the pipe ends its wait.
-        drop(std::fs::OpenOptions::new().write(true).open(&pipe));
+        let took = dropping.elapsed();
+        let left = out.exists();
+        _ = quiet.send(());
+        feeder.join().unwrap();
         assert!(returned, "dropping the job waited for its input");
-        assert!(!dir.join("out.mp4").exists());
+        // It waited its while for the thread, which never stopped, rather than return at once.
+        assert!(
+            took >= STOP_WAIT,
+            "dropped in {took:?}: the job wasn't stuck"
+        );
+        assert!(!left, "the unfinished file stayed");
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A job already writing out its finished file (a faststart MP4 rewrites it whole, which
+    /// can outlast the drop's wait) is waited for, and its file kept.
+    #[test]
+    fn dropping_a_finishing_job_keeps_its_file() {
+        let out =
+            std::env::temp_dir().join(format!("wushang-finishing-{}.mp4", std::process::id()));
+        std::fs::write(&out, b"finished").unwrap();
+        let (send, done) = channel();
+        let phase = Arc::new(AtomicU8::new(FINISHING));
+        let thread = thread::spawn(move || {
+            thread::sleep(STOP_WAIT + std::time::Duration::from_secs(1));
+            _ = send.send(Err(String::new()));
+        });
+        drop(Job {
+            output: out.clone(),
+            progress: Arc::new(AtomicU32::new(999)),
+            cancel: Arc::new(AtomicBool::new(false)),
+            phase,
+            done,
+            thread: Some(thread),
+        });
+        assert!(out.exists(), "a finished file was deleted");
+        std::fs::remove_file(out).unwrap();
     }
 
     /// The picture and the sound keep their places against each other, and the copy starts at 0.
