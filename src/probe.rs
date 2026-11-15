@@ -1,6 +1,5 @@
 //! Container and stream facts for the Properties dialog. Reads headers only, without decoding.
 
-use std::ffi::CStr;
 use std::path::Path;
 
 use ff::ffi;
@@ -63,7 +62,7 @@ fn describe(s: &ff::Stream) -> Option<(&'static str, String)> {
         _ => return None,
     };
     // SAFETY: as above; the dictionary belongs to the stream.
-    let language = unsafe { tag((*s.as_ptr()).metadata, c"language") };
+    let language = crate::thumbs::tag(unsafe { (*s.as_ptr()).metadata }, c"language");
     if let Some(l) = language.filter(|l| !l.eq_ignore_ascii_case("und")) {
         parts.push(l);
     }
@@ -88,17 +87,6 @@ fn trim_number(v: f64, decimals: usize) -> String {
     } else {
         s
     }
-}
-
-/// A tag from a raw dictionary, read lossily, None when missing or blank.
-unsafe fn tag(dict: *const ffi::AVDictionary, key: &CStr) -> Option<String> {
-    let entry = unsafe { ffi::av_dict_get(dict, key.as_ptr(), std::ptr::null(), 0) };
-    if entry.is_null() {
-        return None;
-    }
-    let value = unsafe { CStr::from_ptr((*entry).value) }.to_string_lossy();
-    let value = value.trim();
-    (!value.is_empty()).then(|| value.to_owned())
 }
 
 #[cfg(test)]
