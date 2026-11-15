@@ -1171,9 +1171,16 @@ impl Library {
         if old == new {
             return Ok(());
         }
-        // macOS file names usually ignore case (APFS's default), so "mix" -> "Mix" finds itself
-        // at the target.
-        if to.exists() && old.to_lowercase() != new.to_lowercase() {
+        // On a volume that ignores case (APFS's default) "mix" -> "Mix" finds the playlist itself
+        // at the target; on one that doesn't, that can be another playlist.
+        let same_file = |a: &Path, b: &Path| {
+            use std::os::unix::fs::MetadataExt;
+            match (fs::metadata(a), fs::metadata(b)) {
+                (Ok(a), Ok(b)) => (a.dev(), a.ino()) == (b.dev(), b.ino()),
+                _ => false,
+            }
+        };
+        if to.exists() && !same_file(&from, &to) {
             return Err(io::Error::new(
                 ErrorKind::AlreadyExists,
                 format!("a playlist called {new:?} already exists"),
@@ -2414,6 +2421,67 @@ mod tests {
             lib.track_prefs(&playlist_scope("Shows")),
             TrackPrefs::default()
         );
+    }
+
+    /// A library on a case-sensitive volume can hold "Mix" and "mix" both; renaming one to the
+    /// other's name is refused like any taken name, not taken for a change of case.
+    #[test]
+    fn a_rename_never_replaces_a_playlist_differing_only_in_case() {
+        /// A small case-sensitive APFS volume, mounted out of Finder's sight, and detached when
+        /// dropped.
+        struct Volume(PathBuf);
+        impl Drop for Volume {
+            fn drop(&mut self) {
+                _ = std::process::Command::new("/usr/bin/hdiutil")
+                    .args(["detach", "-quiet", "-force"])
+                    .arg(&self.0)
+                    .status();
+            }
+        }
+        let tmp = TempDir::new();
+        let image = tmp.0.join("cs.dmg");
+        let hdiutil = |args: &[&std::ffi::OsStr]| {
+            let status = std::process::Command::new("/usr/bin/hdiutil")
+                .args(args)
+                .status()
+                .unwrap();
+            assert!(status.success(), "hdiutil {args:?} failed");
+        };
+        let os = std::ffi::OsStr::new;
+        let size = [os("-size"), os("2m"), os("-fs"), os("Case-sensitive APFS")];
+        hdiutil(
+            &[
+                &[os("create"), os("-quiet")],
+                &size[..],
+                &[image.as_os_str()],
+            ]
+            .concat(),
+        );
+        let at = tmp.0.join("mnt");
+        fs::create_dir_all(&at).unwrap();
+        let quietly = [
+            os("-quiet"),
+            os("-nobrowse"),
+            os("-noautoopen"),
+            os("-noverify"),
+        ];
+        let mount = [os("-mountpoint"), at.as_os_str(), image.as_os_str()];
+        hdiutil(&[&[os("attach")], &quietly[..], &mount[..]].concat());
+        let volume = Volume(at);
+
+        let mut lib = Library::open(&volume.0, false);
+        lib.add_to_playlist("Mix", Path::new("/a.mp3")).unwrap();
+        lib.add_to_playlist("mix", Path::new("/b.mp3")).unwrap();
+        assert_eq!(lib.playlists(), ["Mix", "mix"]);
+        let taken = lib.rename_playlist("mix", "Mix").unwrap_err();
+        assert_eq!(taken.kind(), ErrorKind::AlreadyExists);
+        assert_eq!(lib.playlist_items("Mix"), [PathBuf::from("/a.mp3")]);
+        assert_eq!(lib.playlist_items("mix"), [PathBuf::from("/b.mp3")]);
+        // A change of case alone still goes through.
+        lib.delete_playlist("Mix").unwrap();
+        lib.rename_playlist("mix", "MIX").unwrap();
+        assert_eq!(lib.playlists(), ["MIX"]);
+        drop(lib);
     }
 
     #[test]
