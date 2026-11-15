@@ -640,6 +640,20 @@ mod tests {
         assert!(b.track.l >= b.current.r && b.track.r <= b.duration.l);
     }
 
+    /// Only a bar given more than fits loses items: the default bar keeps all of them in the
+    /// smallest window.
+    #[test]
+    fn the_default_bar_fits_the_smallest_window() {
+        let t = Toolbar::default();
+        let b = layout(&t, 800.0, 450.0);
+        let all = [&t.title, &t.left, &t.center, &t.right]
+            .iter()
+            .map(|g| g.len())
+            .sum::<usize>();
+        assert_eq!(b.placed.len(), all);
+        assert_clear(&b);
+    }
+
     #[test]
     fn items_that_dont_fit_are_left_out() {
         let extra = &PALETTE[2..10];
