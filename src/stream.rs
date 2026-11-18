@@ -25,6 +25,9 @@ const MAX_PLAYERS: usize = 16;
 pub struct Broadcast {
     players: Mutex<Vec<SyncSender<Arc<[u8]>>>>,
     count: AtomicUsize,
+    /// Set once the stream has stopped, so a player that finishes its request later isn't
+    /// left waiting on it. Read and written with `players` locked.
+    closed: AtomicBool,
 }
 
 impl Broadcast {
@@ -38,17 +41,22 @@ impl Broadcast {
         self.count.store(players.len(), Relaxed);
     }
 
+    /// The chunks from now on; none, once the stream has stopped.
     fn join(&self) -> Receiver<Arc<[u8]>> {
         let (send, receive) = sync_channel(BACKLOG);
         let mut players = self.players.lock().unwrap();
-        players.push(send);
-        self.count.store(players.len(), Relaxed);
+        if !self.closed.load(Relaxed) {
+            players.push(send);
+            self.count.store(players.len(), Relaxed);
+        }
         receive
     }
 
-    /// Ends every player's stream.
+    /// Ends every player's stream, and those of players still on their way in.
     fn close_all(&self) {
-        self.players.lock().unwrap().clear();
+        let mut players = self.players.lock().unwrap();
+        self.closed.store(true, Relaxed);
+        players.clear();
         self.count.store(0, Relaxed);
     }
 
@@ -225,5 +233,28 @@ mod tests {
         // Stopping ends every player's stream.
         drop(server);
         assert_eq!(a.read(&mut [0u8; 1]).unwrap(), 0);
+    }
+
+    /// A player still sending its request when the stream stops gets an ended stream, rather
+    /// than waiting for good on one that will never send again.
+    #[test]
+    fn a_player_mid_request_when_the_stream_stops_is_let_go() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let mut player = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        player
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        let (socket, _) = listener.accept().unwrap();
+        let broadcast = Arc::new(Broadcast::default());
+        let b = broadcast.clone();
+        let served = thread::spawn(move || serve(socket, &b));
+        player.write_all(b"GET / HTTP/1.1\r\n").unwrap();
+        // What dropping the server does.
+        broadcast.close_all();
+        player.write_all(b"\r\n").unwrap();
+        let mut received = Vec::new();
+        player.read_to_end(&mut received).unwrap();
+        assert!(String::from_utf8_lossy(&received).starts_with("HTTP/1.1 200 OK"));
+        served.join().unwrap();
     }
 }

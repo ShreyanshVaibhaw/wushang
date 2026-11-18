@@ -2,7 +2,8 @@
 //! takes UTF-8, and old .srt files come in whatever the author's Windows used: 1252 in Western
 //! Europe, 1251 for Cyrillic, Shift-JIS in Japan and so on.
 //!
-//! A language tag (from "movie.ru.srt") settles it when it names one. Otherwise every candidate
+//! A UTF-16 byte order mark settles it first. A matching language tag can settle it too.
+//! Otherwise every candidate
 //! decodes the text and the most plausible result wins: words in one script, Latin words with
 //! some plain ASCII in them, and for the CJK code pages strict decoding into CJK characters.
 
@@ -20,6 +21,14 @@ unsafe extern "system" {
         dst_len: i32,
     ) -> i32;
     fn GetACP() -> u32;
+}
+
+const UTF16LE: u32 = 1200;
+const UTF16BE: u32 = 1201;
+
+/// Windows' active code page breaks ties between equally plausible encodings.
+fn system_code_page() -> u32 {
+    unsafe { GetACP() }
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -57,15 +66,14 @@ pub fn detect(text: &[u8], language: Option<&str>) -> u32 {
     if std::str::from_utf8(text).is_ok() {
         return UTF8;
     }
-    if let Some(cp) = language.and_then(for_language)
-        && decode(text, cp, true).is_some()
-    {
-        return cp;
+    // Notepad's "Unicode" is UTF-16 with a byte order mark. Read as a code page, every other
+    // byte would be a NUL, and libass stops at the first one.
+    if text.starts_with(&[0xff, 0xfe]) {
+        return UTF16LE;
     }
-    // The system's own code page goes first, so it wins ties.
-    let system = unsafe { GetACP() };
-    let mut order: Vec<(u32, Script)> = CANDIDATES.to_vec();
-    order.sort_by_key(|&(cp, _)| cp != system);
+    if text.starts_with(&[0xfe, 0xff]) {
+        return UTF16BE;
+    }
     let score = |cp: u32, script: Script| {
         let text = decode(text, cp, true)?;
         Some(match script {
@@ -73,6 +81,23 @@ pub fn detect(text: &[u8], language: Option<&str>) -> u32 {
             _ => plausibility(&text, script),
         })
     };
+    // A tag settles it unless the text reads wrong in its code page: file names end in words
+    // that are also language codes ("Let_It_Be.srt" isn't Belarusian). Thai and Vietnamese
+    // have no script check, so their tags only need the text to be valid.
+    if let Some(cp) = language.and_then(for_language) {
+        let script = CANDIDATES.iter().find(|&&(c, _)| c == cp).map(|&(_, s)| s);
+        let fits = match script {
+            Some(script) => score(cp, script).is_some_and(|s| s >= 0),
+            None => decode(text, cp, true).is_some(),
+        };
+        if fits {
+            return cp;
+        }
+    }
+    // The system's own code page goes first, so it wins ties.
+    let system = system_code_page();
+    let mut order: Vec<(u32, Script)> = CANDIDATES.to_vec();
+    order.sort_by_key(|&(cp, _)| cp != system);
     let best = (order.into_iter())
         .filter_map(|(cp, script)| Some((cp, score(cp, script)?)))
         .fold(None, |best: Option<(u32, i32)>, (cp, score)| match best {
@@ -87,8 +112,38 @@ pub fn detect(text: &[u8], language: Option<&str>) -> u32 {
     }
 }
 
-/// `text` in code page `cp` as a string; with `strict`, None when it isn't valid in it.
+/// `text` in code page `cp` as a string, without the code page's byte order mark if it starts
+/// with one; with `strict`, None when it isn't valid in it.
 pub fn decode(text: &[u8], cp: u32, strict: bool) -> Option<String> {
+    if cp == UTF16LE || cp == UTF16BE {
+        let text = if text.starts_with(&[0xff, 0xfe]) || text.starts_with(&[0xfe, 0xff]) {
+            &text[2..]
+        } else {
+            text
+        };
+        if strict && text.len() % 2 != 0 {
+            return None;
+        }
+        let words: Vec<u16> = text
+            .chunks_exact(2)
+            .map(|b| {
+                if cp == UTF16LE {
+                    u16::from_le_bytes([b[0], b[1]])
+                } else {
+                    u16::from_be_bytes([b[0], b[1]])
+                }
+            })
+            .collect();
+        return if strict {
+            String::from_utf16(&words).ok()
+        } else {
+            let mut decoded = String::from_utf16_lossy(&words);
+            if text.len() % 2 != 0 {
+                decoded.push('\u{fffd}');
+            }
+            Some(decoded)
+        };
+    }
     if text.is_empty() {
         return Some(String::new());
     }
@@ -308,6 +363,18 @@ mod tests {
     }
 
     #[test]
+    fn a_byte_order_mark_means_utf16() {
+        let units: Vec<u16> = "\u{feff}Café, Привет".encode_utf16().collect();
+        let le: Vec<u8> = units.iter().flat_map(|u| u.to_le_bytes()).collect();
+        let be: Vec<u8> = units.iter().flat_map(|u| u.to_be_bytes()).collect();
+        for bytes in [le, be] {
+            let cp = detect(&bytes, Some("ru"));
+            assert_eq!(decode(&bytes, cp, true).as_deref(), Some("Café, Привет"));
+            assert_eq!(decode(&bytes, cp, false).as_deref(), Some("Café, Привет"));
+        }
+    }
+
+    #[test]
     fn a_language_tag_decides() {
         // Bytes valid in 1250 and 1252 alike; the tag picks.
         let bytes = encode("Šťastný nový rok", 1250);
@@ -315,5 +382,44 @@ mod tests {
         let path = std::path::Path::new(r"C:\Movies\Film.2020.ru.srt");
         assert_eq!(language_of(path).as_deref(), Some("ru"));
         assert_eq!(language_of(std::path::Path::new("Film.2020.srt")), None);
+    }
+
+    /// File names end in words that are also language codes: "Be", "He", "El", "Sr". Such a
+    /// tag must not override text that clearly reads in another code page.
+    #[test]
+    fn a_tag_that_does_not_fit_the_text_is_ignored() {
+        let path = std::path::Path::new("Let_It_Be.srt");
+        assert_eq!(language_of(path).as_deref(), Some("Be"));
+        let bytes = encode("Café, ça va très bien.", 1252);
+        for tag in ["Be", "He", "El", "Sr", "ru"] {
+            assert_eq!(detect(&bytes, Some(tag)), 1252, "{tag}");
+        }
+        let russian = encode("Привет, как дела?", 1251);
+        assert_eq!(detect(&russian, Some("Be")), 1251);
+    }
+
+    #[test]
+    fn malformed_utf16_is_rejected_or_replaced() {
+        assert_eq!(decode(&[0xff, 0xfe, 0x41], UTF16LE, true), None);
+        assert_eq!(
+            decode(&[0xff, 0xfe, 0x41], UTF16LE, false).as_deref(),
+            Some("\u{fffd}")
+        );
+        assert_eq!(decode(&[0xfe, 0xff, 0xd8, 0x00], UTF16BE, true), None);
+        assert_eq!(
+            decode(&[0xfe, 0xff, 0xd8, 0x00], UTF16BE, false).as_deref(),
+            Some("\u{fffd}")
+        );
+    }
+
+    #[test]
+    fn native_decoding_handles_valid_and_invalid_bytes() {
+        assert_ne!(system_code_page(), 0);
+        assert_eq!(decode(b"caf\xe9", 1252, true).as_deref(), Some("café"));
+        assert_eq!(decode(b"\x82\xa0", 932, true).as_deref(), Some("あ"));
+        // Strict decoding rejects a lone lead byte; loose decoding uses Windows' fallback.
+        assert_eq!(decode(b"a\x82", 932, true), None);
+        assert_eq!(decode(b"a\x82", 932, false).as_deref(), Some("a・"));
+        assert_eq!(decode(b"x", 12345, false), None);
     }
 }

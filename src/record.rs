@@ -154,9 +154,22 @@ impl Recorder {
                 )
             }
         };
+        // The file exists from here on; a recording that can't start takes it away again.
+        Recorder::open(input, out, path.clone()).inspect_err(|_| {
+            if let Some(path) = &path {
+                _ = std::fs::remove_file(path);
+            }
+        })
+    }
+
+    /// Sets up the streams of `out`, written to `path` for a recording, and starts it.
+    fn open(
+        input: &ff::format::context::Input,
+        mut out: ff::format::context::Output,
+        path: Option<PathBuf>,
+    ) -> Result<Recorder, String> {
         // MPEG-TS, streamed or to a file, holds fewer codecs and wants H.264/HEVC in Annex B.
         let ts = path.as_deref().is_none_or(is_ts);
-        let mut out = out;
         let fail = |e: ff::Error| format!("can't copy this media: {e}");
         let mut routes = Vec::new();
         let mut kept = Vec::new();
@@ -490,6 +503,18 @@ mod tests {
         assert_eq!(names, ["h264", "aac"]);
         drop(check);
         std::fs::remove_file(&out).unwrap();
+    }
+
+    /// A recording that can't start leaves no empty file behind.
+    #[test]
+    fn leaves_no_file_when_nothing_can_be_recorded() {
+        // PCM sound and SubRip, neither of which MPEG-TS carries.
+        let clip = Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/test_zlib_subs.mkv");
+        let out =
+            std::env::temp_dir().join(format!("wushang-unrecorded-{}.ts", std::process::id()));
+        let input = ff::format::input(&clip).unwrap();
+        assert!(Recorder::start(&input, &Sink::File(out.clone())).is_err());
+        assert!(!out.exists(), "{} was left behind", out.display());
     }
 
     #[test]

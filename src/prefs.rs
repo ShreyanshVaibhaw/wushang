@@ -507,8 +507,11 @@ fn parse(text: &str) -> Prefs {
                     .split_whitespace()
                     .filter_map(|s| s.parse().ok())
                     .collect();
+                // The preamp first, on VLC's scale around its unity, then the bands.
+                let unity = crate::dsp::PREAMP_UNITY_DB;
                 if let Ok(bands) = <[f32; 11]>::try_from(n)
-                    && bands.iter().all(|b| (-20.0..=20.0).contains(b))
+                    && (unity - 20.0..=unity + 20.0).contains(&bands[0])
+                    && bands[1..].iter().all(|b| (-20.0..=20.0).contains(b))
                 {
                     p.eq_bands = bands;
                 }
@@ -651,6 +654,22 @@ mod tests {
         assert_eq!(p.volume, d.volume);
         assert_eq!(p.on_top, d.on_top);
         assert_eq!(p.hide_after, 4.0);
+    }
+
+    /// The first of the custom equalizer's values is the preamp on VLC's scale, where 12 dB is
+    /// unity: the panel reaches 20 dB either side of that, and a saved value there comes back.
+    #[test]
+    fn a_custom_preamp_keeps_its_whole_range() {
+        let line = |preamp: f32| format!("eq_bands = {preamp} 0 0 0 0 0 0 0 0 0 0");
+        let unity = crate::dsp::PREAMP_UNITY_DB;
+        assert_eq!(parse(&line(unity + 20.0)).eq_bands[0], unity + 20.0);
+        assert_eq!(parse(&line(unity - 20.0)).eq_bands[0], unity - 20.0);
+        assert_eq!(parse(&line(unity + 21.0)).eq_bands, EQ_FLAT);
+        // The bands themselves stay within 20 dB.
+        assert_eq!(
+            parse("eq_bands = 12 21 0 0 0 0 0 0 0 0 0").eq_bands,
+            EQ_FLAT
+        );
     }
 
     #[test]

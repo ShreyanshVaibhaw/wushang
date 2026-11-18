@@ -71,7 +71,8 @@ parsers=(h264 hevc av1 vp8 vp9 mpeg4video mpegvideo vc1 mjpeg
          aac aac_latm ac3 mpegaudio opus vorbis flac dca mlp
          dvdsub dvbsub)
 decoders=(h264 hevc av1 libdav1d vp8 vp9 mpeg4 mpeg2video mpeg1video vc1 wmv3 msmpeg4v3 mjpeg theora rawvideo
-          aac aac_latm mp3float mp2float ac3 eac3 opus vorbis flac alac dca truehd wmav2
+          wmv1 wmv2 msmpeg4v1 msmpeg4v2 vc1image wmv3image
+          aac aac_latm mp3float mp2float ac3 eac3 opus vorbis flac alac dca truehd wmav1 wmav2 wmapro wmalossless wmavoice
           pcm_s16le pcm_s16be pcm_s24le pcm_s32le pcm_f32le pcm_u8 pcm_alaw pcm_mulaw pcm_bluray pcm_dvd
           subrip srt ass ssa webvtt movtext text microdvd subviewer sami dvdsub dvbsub pgssub)
 # wushang uses the *_d3d11va2 hwaccels, which decode into AV_PIX_FMT_D3D11 textures it presents
@@ -103,6 +104,11 @@ cd "$SRC"
   --enable-hwaccel="$(join "${hwaccels[@]}")" \
   --extra-ldflags="-static-libgcc -L$DAV1D_PREFIX/lib" \
   --ln_s="cp -f" # D: is exFAT, which has no symlinks
+# Fail before packaging if configure silently drops an expected Windows Media decoder.
+for name in WMV1 WMV2 MSMPEG4V1 MSMPEG4V2 VC1IMAGE WMV3IMAGE WMAV1 WMAV2 WMAPRO WMALOSSLESS WMAVOICE; do
+  grep -q "^#define CONFIG_${name}_DECODER 1$" config_components.h ||
+    { echo "configure left out ${name}_DECODER" >&2; exit 1; }
+done
 make -j"$(nproc)"
 make install
 # MSVC import libraries land next to the DLLs; ffmpeg-sys-next looks for them in lib/.

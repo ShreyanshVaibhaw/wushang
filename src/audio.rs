@@ -18,6 +18,10 @@ const BUFFER_SECONDS: f64 = 0.3;
 /// WASAPI shared mode's mix format: interleaved f32.
 const DEVICE_FORMAT: ff::format::Sample = ff::format::Sample::F32(ff::format::sample::Type::Packed);
 
+/// How long the gain the callback applies takes from silence to full volume. Changed between
+/// two samples (a tab switch, mute, a volume step), it cuts the waveform, which can click.
+const RAMP_SECONDS: f64 = 0.005;
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 struct Format {
     rate: u32,
@@ -132,6 +136,37 @@ impl AudioRing {
     }
 }
 
+/// The gain the callback applies, moving to the one asked for over `RAMP_SECONDS` rather than
+/// at once.
+struct Ramp {
+    gain: f32,
+    /// The most it moves in a frame.
+    step: f32,
+}
+
+impl Ramp {
+    /// Starts silent, so a new stream fades in.
+    fn new(rate: u32) -> Ramp {
+        Ramp {
+            gain: 0.0,
+            step: (1.0 / (f64::from(rate) * RAMP_SECONDS)) as f32,
+        }
+    }
+
+    /// Scales `samples`, frames of `channels` interleaved, moving the gain towards `target`.
+    fn apply(&mut self, target: f32, samples: &mut [f32], channels: usize) {
+        for frame in samples.chunks_mut(channels) {
+            let gap = target - self.gain;
+            self.gain = if gap.abs() <= self.step {
+                target
+            } else {
+                self.gain + self.step.copysign(gap)
+            };
+            frame.iter_mut().for_each(|s| *s *= self.gain);
+        }
+    }
+}
+
 enum Output {
     Opening,
     Failed,
@@ -143,9 +178,10 @@ enum Output {
     },
 }
 
-/// The audio device, opened once for the whole run and shared by every file played. Opening
-/// WASAPI can take seconds (1.7 s in `IAudioClient::Initialize` on the test laptop), so it opens on
-/// a background thread at startup, and switching files only clears the ring.
+/// The audio device, opened once for a tab's whole life and shared by every file it plays.
+/// Opening a device can take a while (a Bluetooth headset wakes up first), so it opens on a
+/// background thread, and switching files only clears the ring. Each tab has its own, and the
+/// system mixes them.
 pub struct Device {
     shared: Arc<Shared>,
     effects: Arc<Effects>,
@@ -158,7 +194,9 @@ pub struct Device {
 }
 
 impl Device {
-    pub fn open(shared: Arc<Shared>) -> Arc<Device> {
+    /// Opens the output named as in `output_devices`, or the system default for None or when
+    /// that output isn't there.
+    pub fn open(shared: Arc<Shared>, name: Option<&str>) -> Arc<Device> {
         let device = Arc::new_cyclic(|me| Device {
             shared,
             effects: Arc::new(Effects::new()),
@@ -176,7 +214,7 @@ impl Device {
             opening: Mutex::new(()),
             me: me.clone(),
         });
-        device.reopen(None);
+        device.reopen(name.map(str::to_owned));
         device
     }
 
@@ -193,7 +231,7 @@ impl Device {
         self.reopen(name.map(str::to_owned));
     }
 
-    /// The device asked for last; None means the system default.
+    /// The output playing, by the name it was asked for; None means the system default.
     pub fn current_output(&self) -> Option<String> {
         match &*self.output.lock().unwrap() {
             Output::Open { name, .. } => name.clone(),
@@ -207,11 +245,27 @@ impl Device {
         };
         thread::spawn(move || {
             let _one_at_a_time = device.opening.lock().unwrap();
-            match device.build_stream(name.as_deref()) {
+            let mut name = name;
+            let mut built = device.build_stream(name.as_deref());
+            if let Err(e) = &built {
+                let which = name.as_deref().unwrap_or("the default device");
+                eprintln!("audio: cannot open {which} ({e})");
+                // Nothing plays yet and the output asked for is away (AirPods in their case):
+                // start on the system default rather than leave the tab without sound. Once
+                // something plays, a missing output leaves it playing.
+                let first = matches!(*device.output.lock().unwrap(), Output::Opening);
+                if first && name.is_some() {
+                    eprintln!("audio: using the default device");
+                    name = None;
+                    built = device.build_stream(None);
+                    if let Err(e) = &built {
+                        eprintln!("audio: cannot open the default device ({e})");
+                    }
+                }
+            }
+            match built {
                 Ok((stream, format)) => device.install(stream, format, name),
-                Err(e) => {
-                    let which = name.as_deref().unwrap_or("the default device");
-                    eprintln!("audio: cannot open {which} ({e})");
+                Err(_) => {
                     let mut output = device.output.lock().unwrap();
                     if matches!(*output, Output::Opening) {
                         eprintln!("audio: playing without sound");
@@ -270,6 +324,7 @@ impl Device {
             channels: usize::from(config.channels),
         };
         let rate = f64::from(format.rate);
+        let mut ramp = Ramp::new(format.rate);
         let shared = self.shared.clone();
         let effects = self.effects.clone();
         let feed = self.ring.clone();
@@ -304,14 +359,20 @@ impl Device {
                     // A new stream's first callback reports no latency; trust it only to start
                     // the clock, or a device switch would nudge the picture ahead for a moment.
                     if latency > 0.0 || shared.clock.get().is_none() {
-                        shared.clock.set(pts - latency * speed + effects.delay());
+                        let heard = pts - latency * speed;
+                        shared.clock.set_with_lead(heard, effects.delay());
                     }
                 }
-                let volume = shared.gain();
                 for (o, s) in out.iter_mut().zip(ring.samples.drain(..n)) {
-                    *o = s * volume;
+                    *o = s;
                 }
+                ramp.apply(shared.gain(), &mut out[..n], format.channels);
                 out[n..].fill(0.0);
+                // A gap (a pause, a seek, the decoder falling behind) cut the sound off, so
+                // what comes after it fades in.
+                if n < out.len() {
+                    ramp.gain = 0.0;
+                }
                 ring.consume(n / format.channels);
                 drop(ring);
                 // The visualizer's copy; skipped rather than waited for while the UI reads it.
@@ -408,6 +469,9 @@ pub fn spawn_decoder(
         let mut resampler: Option<ff::software::resampling::Context> = None;
         // The effect chain and the ring generation (device format) it was built for.
         let mut chain: Option<(Chain, u64)> = None;
+        // Reused for every frame: what the decoder hands out, and the device's samples made
+        // from it, which the effects then work on in place.
+        let mut frame = ff::frame::Audio::empty();
         let mut samples = Vec::new();
         let mut serial = shared.serial.load(Relaxed);
         let mut next_pts = 0.0;
@@ -432,7 +496,6 @@ pub fn spawn_decoder(
                 }
                 Some(Msg::Eof) => _ = decoder.send_eof(),
             }
-            let mut frame = ff::frame::Audio::empty();
             loop {
                 match decoder.receive_frame(&mut frame) {
                     Ok(()) => {}
@@ -485,25 +548,31 @@ pub fn spawn_decoder(
                     }
                 }
                 let resampler = resampler.as_mut().unwrap();
-                let Some(out) = resample(resampler, &frame, format.channels, format.rate) else {
+                let ch = format.channels;
+                let Some(n) = resample(resampler, &frame, ch, format.rate, &mut samples) else {
                     continue;
                 };
                 let pts = frame.timestamp().map_or(next_pts, |t| t as f64 * time_base);
-                let n = out.samples();
                 next_pts = pts + n as f64 / f64::from(format.rate);
                 // Before an exact seek's target: decoded only because the demuxer lands earlier.
                 if next_pts <= shared.seek_floor() {
                     continue;
                 }
-                let bytes = &out.data(0)[..n * format.channels * 4];
-                samples.clear();
-                samples.extend(
-                    bytes
-                        .as_chunks::<4>()
-                        .0
-                        .iter()
-                        .map(|b| f32::from_ne_bytes(*b)),
-                );
+                let (first, last) =
+                    crate::disc::clip_interval(&frame.metadata()).map_or((0, n), |(from, to)| {
+                        let sample = |t: f64| {
+                            ((t - pts) * f64::from(format.rate))
+                                .ceil()
+                                .clamp(0.0, n as f64) as usize
+                        };
+                        (sample(from), sample(to))
+                    });
+                if first >= last {
+                    continue;
+                }
+                let pts = pts + first as f64 / f64::from(format.rate);
+                samples.truncate(last * ch);
+                samples.drain(..first * ch);
                 let (c, generation) = chain.as_mut().unwrap();
                 let (out, start, end) = c.process(effects, &mut samples, pts);
                 ring.push(out, (start, end), *generation, serial, &shared);
@@ -516,7 +585,7 @@ pub fn spawn_decoder(
 /// WAV or Matroska often comes that way, and the frame itself needs the label too: swresample
 /// rejects a frame whose layout differs from the one it was set up with, which silenced every
 /// such file.
-fn label_layout(frame: &mut ff::frame::Audio) -> ff::ChannelLayout {
+pub(crate) fn label_layout(frame: &mut ff::frame::Audio) -> ff::ChannelLayout {
     let layout = frame.channel_layout();
     if !layout.is_empty() {
         return layout;
@@ -526,21 +595,35 @@ fn label_layout(frame: &mut ff::frame::Audio) -> ff::ChannelLayout {
     layout
 }
 
-/// Converts one decoded frame to interleaved f32 at the device's rate and channel count.
+/// Converts one decoded frame to interleaved f32 at the device's rate and channel count, into
+/// `out` in place of what it held, and returns how many frames that is.
 fn resample(
     resampler: &mut ff::software::resampling::Context,
     frame: &ff::frame::Audio,
     channels: usize,
     rate: u32,
-) -> Option<ff::frame::Audio> {
-    // Given an empty frame, ffmpeg-next's run() allocates room for only the input's sample count.
-    // Upsampling 44.1 to 48 kHz then leaves the extra 9% stuck inside swresample and the audio
-    // plays fast, so size the output for the converted count, plus slack for swresample's delay.
+    out: &mut Vec<f32>,
+) -> Option<usize> {
+    // Room for the converted count, plus slack for swresample's delay. With room for only the
+    // input's count, upsampling 44.1 to 48 kHz leaves the extra 9% stuck inside swresample and
+    // the audio plays fast.
     let capacity = frame.samples() * rate as usize / frame.rate() as usize + 64;
-    let layout = ff::ChannelLayout::default(channels as i32);
-    let mut out = ff::frame::Audio::new(DEVICE_FORMAT, capacity, layout);
-    resampler.run(frame, &mut out).ok()?;
-    Some(out)
+    out.clear();
+    out.reserve(capacity * channels);
+    let planes = [out.as_mut_ptr().cast::<u8>()];
+    let converted = unsafe {
+        ff::ffi::swr_convert(
+            resampler.as_mut_ptr(),
+            planes.as_ptr(),
+            capacity as i32,
+            (*frame.as_ptr()).extended_data as *const *const u8,
+            frame.samples() as i32,
+        )
+    };
+    let frames = usize::try_from(converted).ok()?;
+    // swresample wrote that many interleaved frames, at most `capacity`.
+    unsafe { out.set_len(frames * channels) };
+    Some(frames)
 }
 
 #[cfg(test)]
@@ -574,7 +657,7 @@ mod tests {
             48_000,
         )
         .unwrap();
-        assert!(resample(&mut resampler, &frame, 2, 48_000).is_some());
+        assert!(resample(&mut resampler, &frame, 2, 48_000, &mut Vec::new()).is_some());
     }
 
     #[test]
@@ -593,18 +676,27 @@ mod tests {
         )
         .unwrap();
         let mut total = 0;
+        let mut out = Vec::new();
         for _ in 0..44 {
             let mut frame = ff::frame::Audio::new(input_format, 1024, mono());
             frame.set_rate(44_100);
-            frame.plane_mut::<f32>(0).fill(0.0);
-            total += resample(&mut resampler, &frame, 2, 48_000)
-                .unwrap()
-                .samples();
+            frame.plane_mut::<f32>(0).fill(0.5);
+            let frames = resample(&mut resampler, &frame, 2, 48_000, &mut out).unwrap();
+            assert_eq!(out.len(), frames * 2);
+            total += frames;
         }
         let expected = 45_056 * 48_000 / 44_100;
         assert!(
             total.abs_diff(expected) < 64,
             "got {total} samples, expected about {expected}"
+        );
+        // Mono went to both channels, 3 dB down in each (swresample's centre mix), once the
+        // filter has settled.
+        let level = 0.5 * std::f32::consts::FRAC_1_SQRT_2;
+        assert!(
+            out.iter().all(|s| (s - level).abs() < 1e-3),
+            "{:?}",
+            &out[..4]
         );
     }
 
@@ -631,6 +723,48 @@ mod tests {
         assert!((pts - 10.05).abs() < 1e-9);
         ring.consume(3200);
         assert!(ring.head(48_000.0).is_none());
+    }
+
+    #[test]
+    fn gain_changes_ramp_rather_than_step() {
+        // Full scale stereo at 48 kHz, and a tab switch silences it.
+        let mut ramp = Ramp::new(48_000);
+        ramp.gain = 1.0;
+        let mut out = vec![1.0; 2 * 512];
+        ramp.apply(0.0, &mut out, 2);
+        let frames: Vec<f32> = out.chunks(2).map(|f| f[0]).collect();
+        assert!(
+            out.chunks(2).all(|f| f[0] == f[1]),
+            "channels move together"
+        );
+        assert!(frames[0] > 0.99, "no step down: {}", frames[0]);
+        let biggest = frames.windows(2).map(|w| (w[1] - w[0]).abs());
+        assert!(biggest.fold(0.0, f32::max) <= 1.01 / 240.0);
+        // Silent within 5 ms (240 frames), and exactly so.
+        assert!(frames[240..].iter().all(|s| *s == 0.0));
+
+        // Back to 50% across buffers shorter than the ramp: it carries on from where the
+        // last one ended.
+        let mut first = vec![1.0; 2 * 64];
+        let mut second = vec![1.0; 2 * 64];
+        ramp.apply(0.5, &mut first, 2);
+        ramp.apply(0.5, &mut second, 2);
+        let joint = second[0] - first[first.len() - 1];
+        assert!(joint > 0.0 && joint <= 1.01 / 240.0, "joint {joint}");
+        assert_eq!(second[second.len() - 1], 0.5);
+        // Held there: the samples are only scaled.
+        let mut held = vec![0.25, -0.5];
+        ramp.apply(0.5, &mut held, 2);
+        assert_eq!(held, [0.125, -0.25]);
+    }
+
+    #[test]
+    fn a_new_stream_fades_in() {
+        let mut ramp = Ramp::new(44_100);
+        let mut out = vec![1.0; 441];
+        ramp.apply(1.0, &mut out, 1);
+        assert!(out[0] > 0.0 && out[0] < 0.01, "first sample {}", out[0]);
+        assert!(out[220] == 1.0 && out[440] == 1.0);
     }
 
     #[test]
@@ -661,6 +795,42 @@ mod tests {
         );
     }
 
+    /// A tab opened with Settings' output away (AirPods in their case) plays on the system
+    /// default rather than without sound for its whole life. Once it plays, a switch to a
+    /// missing output keeps what plays. Silent: nothing is queued.
+    #[test]
+    fn a_missing_output_opens_the_default_instead() {
+        let Some(default) = output_devices().into_iter().next() else {
+            eprintln!("no audio output device here; skipping");
+            return;
+        };
+        let shared = Arc::new(Shared::new());
+        shared.toggle_mute();
+        let missing = "wushang test: no such output";
+        let device = Device::open(shared.clone(), Some(missing));
+        let packets = PacketQueue::default();
+        assert!(
+            device.ring(&shared, &packets).is_some(),
+            "the tab plays without sound"
+        );
+        assert_eq!(device.current_output(), None, "reported as the default");
+
+        // A switch runs on a thread of its own: let it start, then wait for it to finish.
+        let switch = |name| {
+            device.switch_to(Some(name));
+            thread::sleep(Duration::from_millis(200));
+            drop(device.opening.lock().unwrap());
+        };
+        switch(&default);
+        assert_eq!(device.current_output().as_ref(), Some(&default));
+        switch(missing);
+        assert_eq!(
+            device.current_output(),
+            Some(default),
+            "kept, not the default"
+        );
+    }
+
     /// Starts the audio of `path` on `device`, like a session with no video.
     fn play(path: &PathBuf, shared: &Arc<Shared>, device: &Arc<Device>) -> Vec<JoinHandle<()>> {
         let input = ff::format::input(path).unwrap();
@@ -684,6 +854,25 @@ mod tests {
                 None,
             ),
         ]
+    }
+
+    /// Switches to `name` and waits for the switch to settle: until it is the output named (an
+    /// output that fails to open leaves the current one playing, so that wait gives up after a
+    /// while), then for the new output's first callbacks. The switch opens it on another thread,
+    /// and its start moves the clock once by the difference in the outputs' latency (the sound
+    /// queued in the old one never plays), so a rate measured across it would count that jump.
+    /// Reopening the default shows no change of name, and the settling wait alone covers it.
+    fn switch_and_settle(device: &Device, name: Option<&str>) {
+        device.switch_to(name);
+        let start = Instant::now();
+        while device.current_output().as_deref() != name
+            && start.elapsed() < Duration::from_secs(10)
+        {
+            thread::sleep(Duration::from_millis(10));
+        }
+        // Its first callbacks, which set the clock from the new latency; a Bluetooth output
+        // takes a while to start.
+        thread::sleep(Duration::from_secs(1));
     }
 
     /// Clock rate in media seconds per second, measured over `seconds`.
@@ -712,7 +901,7 @@ mod tests {
         eprintln!("output devices: {:?}", output_devices());
         let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("testdata/test_60s.mp4");
         let shared = Arc::new(Shared::new());
-        let device = Device::open(shared.clone());
+        let device = Device::open(shared.clone(), None);
         device.effects().set_speed(1.5);
         let threads = play(&path, &shared, &device);
 
@@ -732,7 +921,7 @@ mod tests {
         device.effects().set_delay(0.0);
         thread::sleep(Duration::from_millis(100)); // let a callback apply it
 
-        device.switch_to(None);
+        switch_and_settle(&device, None);
         let rate = clock_rate(&shared, 3.0);
         eprintln!("across a device reopen: clock ran at {rate:.3}");
         assert!((rate - 1.5).abs() < 0.1, "clock ran at {rate}");
@@ -741,7 +930,7 @@ mod tests {
         // leaves the current one playing, so the rate holds either way.
         let devices = output_devices();
         if let Some(other) = devices.get(1) {
-            device.switch_to(Some(other));
+            switch_and_settle(&device, Some(other));
             let rate = clock_rate(&shared, 3.0);
             eprintln!(
                 "on {other:?}: clock ran at {rate:.3}, current {:?}",

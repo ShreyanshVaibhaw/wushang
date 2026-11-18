@@ -32,17 +32,15 @@ const DASH: u32 = 0x3A3A3A;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Target {
+    /// Anywhere else, the palette's and groups' empty parts among it. Drops go by
+    /// [`Geometry::drop_at`], not by target.
     Body,
     Close,
     Cancel,
     Save,
-    /// The palette outside its items: a drop there takes the item out of the bars.
-    Box,
     Palette(Item),
     /// An item in the bars, by zone and index.
     Placed(Zone, usize),
-    /// A group's empty part.
-    Zone(Zone),
 }
 
 /// An item on its way somewhere, and where the pointer is.
@@ -52,6 +50,8 @@ pub struct Drag {
     /// Its place in the bars, or None from the palette.
     pub from: Option<(Zone, usize)>,
     pub at: (f32, f32),
+    /// Where the press was: a drop that hasn't moved from it is a click.
+    pub start: (f32, f32),
 }
 
 /// Where a dragged item would land.
@@ -67,13 +67,21 @@ pub struct State {
     pub drag: Option<Drag>,
 }
 
+/// How far the pointer moves between press and release before it is a drag, not a click.
+const CLICK_SLOP: f32 = 4.0;
+
+/// A palette cell: its item, where it is, and for an item in the bar, its place there.
+type Cell = (Item, Rect, Option<(Zone, usize)>);
+
 /// The open dialog in dialog units (0..W, 0..h), and the bars' parts in window DIPs.
 #[derive(Clone, Default)]
 pub struct Geometry {
     origin: (f32, f32),
     scale: f32,
     h: f32,
-    cells: Vec<(Item, Rect)>,
+    /// The palette's items, then the bar's items the window has no room for, with their place
+    /// in the bar: these drag from there, back into a group or out of the bar.
+    cells: Vec<Cell>,
     placed: Vec<Placed>,
     zones: [Rect; 4],
 }
@@ -98,6 +106,15 @@ impl Geometry {
         )
     }
 
+    /// The window point of dialog point (x, y), `local`'s inverse.
+    #[cfg(test)]
+    fn screen(&self, x: f32, y: f32) -> (f32, f32) {
+        (
+            self.origin.0 + x * self.scale,
+            self.origin.1 + y * self.scale,
+        )
+    }
+
     fn frame(&self) -> Rect {
         Rect::new(
             self.origin.0,
@@ -119,20 +136,17 @@ impl Geometry {
             if save(self.h).contains(x, y) {
                 return Target::Save;
             }
-            return self
-                .cells
-                .iter()
-                .find(|(_, r)| r.contains(x, y))
-                .map_or(Target::Box, |(item, _)| Target::Palette(*item));
+            return self.cells.iter().find(|(_, r, _)| r.contains(x, y)).map_or(
+                Target::Body,
+                |(item, _, from)| match from {
+                    Some((zone, index)) => Target::Placed(*zone, *index),
+                    None => Target::Palette(*item),
+                },
+            );
         }
-        if let Some(p) = self.placed.iter().find(|p| p.r.contains(x, y)) {
-            return Target::Placed(p.zone, p.index);
-        }
-        ZONES
-            .iter()
-            .zip(self.zones)
-            .find(|(_, r)| r.contains(x, y))
-            .map_or(Target::Body, |(z, _)| Target::Zone(*z))
+        (self.placed.iter())
+            .find(|p| p.r.contains(x, y))
+            .map_or(Target::Body, |p| Target::Placed(p.zone, p.index))
     }
 
     /// Where an item dropped at (x, y) goes: the palette takes it out, a group takes it
@@ -174,16 +188,28 @@ impl Geometry {
 impl Layout {
     /// Lays the dialog out over a player layout built from the draft.
     pub fn add_customize(&mut self, st: &State) {
-        let palette = st.draft.palette();
+        // The bar's items left out for want of room: an index past those its zone placed.
+        let left_out = ZONES.iter().flat_map(|&zone| {
+            let shown = (self.tools.placed.iter())
+                .filter(|p| p.zone == zone)
+                .count();
+            let items = st.draft.zone(zone).iter().enumerate().skip(shown);
+            items.map(move |(index, item)| (*item, Some((zone, index))))
+        });
+        let palette: Vec<(Item, Option<(Zone, usize)>)> = (st.draft.palette().into_iter())
+            .map(|item| (item, None))
+            .chain(left_out)
+            .collect();
         let rows = palette.len().div_ceil(COLUMNS).max(4);
         let h = H + CELL_PITCH_Y * (rows - 4) as f32;
         let cells = palette
             .iter()
             .enumerate()
-            .map(|(i, item)| {
+            .map(|(i, (item, from))| {
                 let cx = CELL_X + CELL_PITCH_X * (i % COLUMNS) as f32;
                 let cy = CELL_Y + CELL_PITCH_Y * (i / COLUMNS) as f32;
-                (*item, Rect::new(cx - 50.0, cy - 24.0, cx + 50.0, cy + 74.0))
+                let r = Rect::new(cx - 50.0, cy - 24.0, cx + 50.0, cy + 74.0);
+                (*item, r, *from)
             })
             .collect();
         // Between the bars, with a margin; smaller windows scale it down.
@@ -242,6 +268,7 @@ impl Ui {
             item,
             from,
             at: (x, y),
+            start: (x, y),
         });
         self.drag = Some(Hit::Customize(target));
     }
@@ -263,8 +290,23 @@ impl Ui {
             return;
         };
         match (target, d.from) {
-            (Some(Drop::Into(zone, index)), from) => st.draft.place(d.item, from, zone, index),
-            (Some(Drop::Remove), Some((zone, index))) => st.draft.remove(zone, index),
+            (Some(Drop::Into(zone, index)), from) => {
+                // A drop the window has no room for is refused: the bar would leave an item out
+                // of every group, where Customize could neither show it nor take it back.
+                let (w, h) = (self.layout.width, self.layout.height);
+                let mut moved = st.draft.clone();
+                moved.place(d.item, from, zone, index);
+                if toolbar::left_out(&moved, w, h) <= toolbar::left_out(&st.draft, w, h) {
+                    st.draft = moved;
+                }
+            }
+            // A click on a bar item shown in the palette (one the window has no room for)
+            // isn't a drag out of the bar.
+            (Some(Drop::Remove), Some((zone, index)))
+                if (x - d.start.0).hypot(y - d.start.1) > CLICK_SLOP =>
+            {
+                st.draft.remove(zone, index)
+            }
             _ => {}
         }
         self.relayout = true;
@@ -416,13 +458,19 @@ impl Painter {
             }
             self.prefs_glyph(ctx, &base, &self.icons.close, W - 24.0, 24.0, 24.0);
 
-            for (item, cell) in &g.cells {
+            for (item, cell, from) in &g.cells {
                 let (cx, cy) = ((cell.l + cell.r) / 2.0, cell.t + 24.0);
                 let icon_box = Rect::around(cx, cy, ICON_BOX);
-                if hover(Target::Palette(*item)) {
+                let target = match from {
+                    Some((zone, index)) => Target::Placed(*zone, *index),
+                    None => Target::Palette(*item),
+                };
+                if hover(target) {
                     rt.FillRoundedRectangle(&rounded(icon_box, 4.0), &self.hover);
                 }
-                rt.DrawRoundedRectangle(&rounded(icon_box, 4.0), &r.dash, 1.0, &r.dashes);
+                // A bar item the window has no room for is solid, as it is still in the bar.
+                let dashes = from.is_none().then_some(&r.dashes);
+                rt.DrawRoundedRectangle(&rounded(icon_box, 4.0), &r.dash, 1.0, dashes);
                 self.prefs_glyph(ctx, &base, self.tool_icon(*item), cx, cy, 24.0);
                 self.tool_number(rt, *item, cx, cy);
                 let label = Rect::new(cell.l, cy + 30.0, cell.r, cy + 72.0);
@@ -494,8 +542,105 @@ mod tests {
         assert!(
             g.cells
                 .iter()
-                .all(|(i, _)| !matches!(i, Item::Play | Item::Queue))
+                .all(|(i, _, _)| !matches!(i, Item::Play | Item::Queue))
         );
+    }
+
+    /// Items a narrower window has no room for, from a bar made in a wider one, show in the
+    /// palette, where they can be dragged back into a group or out of the bar.
+    #[test]
+    fn items_the_window_has_no_room_for_are_in_the_palette() {
+        let mut ui = Ui::new();
+        ui.toolbar.left.extend(
+            toolbar::PALETTE[2..12]
+                .iter()
+                .copied()
+                .filter(|i| !i.repeats()),
+        );
+        ui.open_customize();
+        let lay = |ui: &mut Ui| {
+            let st = ui.customize.as_ref().unwrap();
+            let mut layout = Layout::player(800.0, 450.0, true, false, &st.draft);
+            layout.add_customize(st);
+            ui.layout = layout;
+        };
+        lay(&mut ui);
+        let draft = ui.customize.as_ref().unwrap().draft.clone();
+        let shown = toolbar::layout(&draft, 800.0, 450.0).placed.len();
+        let left_out = toolbar::left_out(&draft, 800.0, 450.0);
+        assert!(
+            left_out > 0,
+            "the window is too small for them all ({shown} shown)"
+        );
+        let g = ui.layout.customize.as_ref().unwrap();
+        let hidden: Vec<(Item, Option<(Zone, usize)>)> = g
+            .cells
+            .iter()
+            .filter(|c| c.2.is_some())
+            .map(|c| (c.0, c.2))
+            .collect();
+        assert_eq!(hidden.len(), left_out);
+        // The last one, dropped on the dialog, leaves the bar.
+        let (item, from) = *hidden.last().unwrap();
+        let (zone, index) = from.unwrap();
+        assert_eq!(draft.zone(zone)[index], item);
+        let cell = g.cells.iter().find(|c| c.2 == from).unwrap().1;
+        let at = g.screen((cell.l + cell.r) / 2.0, cell.t + 24.0);
+        assert_eq!(g.hit(at.0, at.1), Target::Placed(zone, index));
+        ui.customize_down(Target::Placed(zone, index), 0.0, 0.0);
+        let frame = ui.layout.customize.as_ref().unwrap().frame();
+        ui.customize_drop((frame.l + frame.r) / 2.0, (frame.t + frame.b) / 2.0);
+        let st = ui.customize.as_ref().unwrap();
+        assert_eq!(st.draft.zone(zone).len(), draft.zone(zone).len() - 1);
+
+        // A click on one, which drops it where it was pressed, keeps it in the bar.
+        lay(&mut ui);
+        let g = ui.layout.customize.as_ref().unwrap();
+        let (_, cell, from) = *g.cells.iter().find(|c| c.2.is_some()).unwrap();
+        let (zone, index) = from.unwrap();
+        let at = g.screen((cell.l + cell.r) / 2.0, cell.t + 24.0);
+        let before = ui.customize.as_ref().unwrap().draft.clone();
+        ui.customize_down(Target::Placed(zone, index), at.0, at.1);
+        ui.customize_drop(at.0, at.1);
+        assert_eq!(ui.customize.as_ref().unwrap().draft, before);
+    }
+
+    /// A drop the window has no room for is refused: the bar would leave the item out of every
+    /// group, where Customize could neither show it nor take it back.
+    #[test]
+    fn a_drop_with_no_room_is_refused() {
+        let mut ui = Ui::new();
+        ui.open_customize();
+        let lay = |ui: &mut Ui| {
+            let st = ui.customize.as_ref().unwrap();
+            let mut layout = Layout::player(800.0, 450.0, true, false, &st.draft);
+            layout.add_customize(st);
+            ui.layout = layout;
+        };
+        lay(&mut ui);
+        // Keep dropping palette items at the left group's end until the window refuses one.
+        let mut refused = false;
+        for _ in 0..20 {
+            let st = ui.customize.as_ref().unwrap();
+            let (Some(&item), before) = (
+                st.draft.palette().iter().find(|i| !i.repeats()),
+                st.draft.clone(),
+            ) else {
+                break;
+            };
+            let zone = ui.layout.tools.zones[ZONES.iter().position(|z| *z == Zone::Left).unwrap()];
+            ui.customize_down(Target::Palette(item), 0.0, 0.0);
+            ui.customize_drop(zone.l + 1.0, (zone.t + zone.b) / 2.0);
+            let st = ui.customize.as_ref().unwrap();
+            let left_out = toolbar::left_out(&st.draft, 800.0, 450.0);
+            assert_eq!(left_out, 0, "every item placed is on the bar");
+            if st.draft == before {
+                refused = true;
+                break;
+            }
+            lay(&mut ui);
+        }
+        assert!(refused, "the window ran out of room");
     }
 
     #[test]

@@ -21,17 +21,34 @@ pub struct Bookmarks {
     file: PathBuf,
     /// Every file's bookmarks, each file's in time order.
     items: Vec<Bookmark>,
+    /// The file is there but couldn't be read: saving would replace it with this run's alone.
+    unreadable: bool,
 }
 
 impl Bookmarks {
-    /// Reads `dir`\bookmarks.txt; a missing or unreadable file means no bookmarks.
+    /// Reads `dir`/bookmarks.txt; a missing file means no bookmarks. Bytes that aren't UTF-8
+    /// read as U+FFFD, so one stray byte doesn't lose the rest.
     pub fn load(dir: &Path) -> Bookmarks {
         let file = dir.join(FILE);
-        let items = fs::read_to_string(&file).map_or_else(|_| Vec::new(), |t| parse(&t));
-        Bookmarks { file, items }
+        let (items, unreadable) = match fs::read(&file) {
+            Ok(bytes) => (parse(&String::from_utf8_lossy(&bytes)), false),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => (Vec::new(), false),
+            Err(e) => {
+                eprintln!("bookmarks: can't read them, so this run won't save them: {e}");
+                (Vec::new(), true)
+            }
+        };
+        Bookmarks {
+            file,
+            items,
+            unreadable,
+        }
     }
 
     pub fn save(&self) -> io::Result<()> {
+        if self.unreadable {
+            return Err(io::Error::other("the bookmarks file couldn't be read"));
+        }
         if let Some(dir) = self.file.parent() {
             fs::create_dir_all(dir)?;
         }
@@ -118,7 +135,7 @@ fn parse(text: &str) -> Vec<Bookmark> {
             let seconds: f64 = fields.next()?.trim().parse().ok()?;
             let name = fields.next()?.trim();
             (seconds.is_finite() && seconds >= 0.0).then(|| Bookmark {
-                path: PathBuf::from(path),
+                path: key(Path::new(path)),
                 seconds,
                 name: name.to_owned(),
             })
@@ -138,6 +155,35 @@ mod tests {
             std::env::temp_dir().join(format!("wushang-bookmarks-{name}-{}", std::process::id()));
         _ = fs::remove_dir_all(&dir);
         dir
+    }
+
+    /// A byte that isn't UTF-8 (a hand edit in Latin-1) costs only its own line's spelling: the
+    /// rest load, and the file isn't wiped by the next save.
+    #[test]
+    fn a_stray_byte_loses_no_bookmarks() {
+        let dir = temp_dir("latin1");
+        fs::create_dir_all(&dir).unwrap();
+        let mut bytes = b"# wushang bookmarks v1\n/v/a.mp4\t10\tCaf".to_vec();
+        bytes.extend(b"\xe9\n/v/a.mp4\t20\tKept\n");
+        fs::write(dir.join(FILE), &bytes).unwrap();
+        let mut marks = Bookmarks::load(&dir);
+        assert_eq!(marks.for_file(Path::new("/v/a.mp4")).len(), 2);
+        marks.add(Path::new("/v/a.mp4"), 30.0);
+        marks.save().unwrap();
+        let again = Bookmarks::load(&dir);
+        let names: Vec<&str> = (again.for_file(Path::new("/v/a.mp4")).iter())
+            .map(|b| b.name.as_str())
+            .collect();
+        assert_eq!(names, ["Caf\u{fffd}", "Kept", "Bookmark 1"]);
+
+        // One that can't be read at all is left alone.
+        fs::remove_file(dir.join(FILE)).unwrap();
+        fs::create_dir(dir.join(FILE)).unwrap();
+        let mut marks = Bookmarks::load(&dir);
+        marks.add(Path::new("/v/a.mp4"), 5.0);
+        assert!(marks.save().is_err());
+        assert!(dir.join(FILE).is_dir());
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

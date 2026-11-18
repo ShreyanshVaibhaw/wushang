@@ -88,6 +88,17 @@ pub enum MenuAction {
     /// Plays the DVD or Blu-ray in a drive or folder; None asks for the folder.
     OpenDisc(Option<PathBuf>),
     OpenDiscImage,
+    /// Picks files to play in a new tab.
+    NewTab,
+    /// Plays a file in a new tab, with its folder as that tab's queue.
+    PlayInNewTab(PathBuf),
+    /// Closes the tab on screen.
+    CloseTab,
+    /// Shows the tab after or before the one on screen, wrapping around.
+    NextTab,
+    PreviousTab,
+    /// Shows the tab at this index (Ctrl+1 to Ctrl+9).
+    SelectTab(usize),
     /// Converts a file into an MP4 or an MP3.
     Convert(PathBuf, Format),
     /// Converts the open file into an MP4 (Ctrl+R).
@@ -787,6 +798,10 @@ pub fn main_menu(
         Item::new("Open File(s)", MenuAction::OpenFiles)
             .icon(Icon::OpenFile)
             .key("Ctrl + O"),
+        Item::new("Open in New Tab...", MenuAction::NewTab)
+            .icon(Icon::Add)
+            .key("Ctrl + T"),
+        Item::new("Close Tab", MenuAction::CloseTab).key("Ctrl + W"),
         Item::new("Open Folder", MenuAction::OpenFolder)
             .icon(Icon::Folder)
             .key("Ctrl + F"),
@@ -1088,6 +1103,7 @@ fn add_to_playlist(path: &Path, playlists: &[String]) -> Vec<Item> {
 fn stream_menu(path: &Path, playlists: &[String], saved: bool) -> Vec<Item> {
     let mut items = vec![
         Item::new("Play", MenuAction::Play(path.to_owned())).icon(Icon::Play),
+        Item::new("Play in New Tab", MenuAction::PlayInNewTab(path.to_owned())).icon(Icon::Add),
         Item::new(
             "Add to Queue",
             MenuAction::AddToQueue(vec![path.to_owned()]),
@@ -1122,6 +1138,7 @@ fn file_menu(path: &Path, playlists: &[String], within: Option<&str>) -> Vec<Ite
     let add = add_to_playlist(path, playlists);
     let mut items = vec![
         Item::new("Play", MenuAction::Play(path.to_owned())).icon(Icon::Play),
+        Item::new("Play in New Tab", MenuAction::PlayInNewTab(path.to_owned())).icon(Icon::Add),
         Item::new("Mark as Watched", MenuAction::MarkWatched(path.to_owned())).icon(Icon::Watched),
         Item::new("Favorite", MenuAction::Favorite(path.to_owned())).icon(Icon::Heart),
         Item::new("Stream", MenuAction::StreamFile(path.to_owned())).icon(Icon::Network),
@@ -1508,13 +1525,13 @@ mod tests {
         );
         let g = Geometry::new(&s, 1600.0, 900.0);
         let level = &g.levels[0];
-        // 12 rows of 48 and one divider, inside 4 DIPs of padding: the design's 375 x 585.
-        assert_eq!(level.frame, Rect::new(51.0, 38.0, 426.0, 623.0));
+        // Fourteen 48-DIP rows, one divider, and 4-DIP padding retain the design's row sizes.
+        assert_eq!(level.frame, Rect::new(51.0, 38.0, 426.0, 719.0));
         assert_eq!(g.hit(100.0, 38.0 + 4.0 + 24.0), Some(Target::Row(0, 0)));
-        assert_eq!(g.hit(100.0, 38.0 + 4.0 + 7.0 * 48.0), Some(Target::Body(0)));
+        assert_eq!(g.hit(100.0, 38.0 + 4.0 + 9.0 * 48.0), Some(Target::Body(0)));
         assert_eq!(
-            g.hit(100.0, 38.0 + 5.0 + 7.0 * 48.0),
-            Some(Target::Row(0, 8))
+            g.hit(100.0, 38.0 + 5.0 + 9.0 * 48.0),
+            Some(Target::Row(0, 10))
         );
         assert_eq!(g.hit(40.0, 100.0), None);
     }
@@ -1581,6 +1598,8 @@ mod tests {
         // Settings opens without a file; Open Recent needs recent files.
         let main = main_menu(&[], &[], "Movies", &[], Converting::Nothing);
         assert!(main.iter().find(|i| i.label == "Settings").unwrap().enabled);
+        assert!(main.iter().any(|i| i.action == Some(MenuAction::NewTab)));
+        assert!(main.iter().any(|i| i.action == Some(MenuAction::CloseTab)));
         assert!(
             !main
                 .iter()

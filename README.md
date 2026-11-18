@@ -189,6 +189,21 @@ The progress bar seeks with a click or a drag.
 The queue button opens the queue above the video, in the design's style, with sort, remove and add; the window grows upward to make room.
 Esc or Ctrl+M also leaves the mini player window.
 
+### Tabs
+
+Up to eight files can play at once in separate tabs.
+Only the active tab is heard; the other tabs keep playing silently.
+Each tab keeps its own queue, position, audio and subtitle tracks, picture settings, volume, mute and sound effects.
+
+Ctrl+T, the title bar's + button, or "Open in New Tab..." in the menu opens a file picker for a new tab.
+A library file or stream also has "Play in New Tab" in its context menu.
+When two or more tabs are open, they replace the centered file title.
+Click a tab, use Ctrl+Tab or Ctrl+Shift+Tab, or use Ctrl+1 through Ctrl+8 to switch.
+Ctrl+9 selects the last tab.
+Ctrl+W or a tab's close button closes it and saves its playback position.
+Closing the last tab stops playback and keeps one empty tab available.
+An empty active tab is reused when opening a file in a new tab.
+
 ### Network
 
 Ctrl+N, "Open Network Stream" in the "..." menu, or "Add Network Stream" on the Network page asks for an address and plays it: http, https, HLS (`.m3u8`), RTSP, UDP or RTP.

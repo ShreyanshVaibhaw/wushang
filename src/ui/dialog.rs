@@ -139,7 +139,7 @@ const FG_BUTTON_OFF: u32 = 0x606060;
 /// The keys main.rs handles, for the Keyboard Shortcuts dialog.
 // ponytail: a copy of on_key and the menus' accelerators; one table both read would keep them
 // in step.
-const SHORTCUTS: [(&str, &str); 24] = [
+const SHORTCUTS: [(&str, &str); 30] = [
     ("Space", "Play or pause"),
     ("Left / Right", "Skip back or forward (Settings > Controls)"),
     (
@@ -159,6 +159,12 @@ const SHORTCUTS: [(&str, &str); 24] = [
     ("Shift + S", "Snapshot, saved in Pictures\\wushang"),
     ("R", "Record, saved in Videos\\wushang; R again stops"),
     ("Ctrl + O", "Open files"),
+    ("Ctrl + D", "Open a DVD or Blu-ray folder"),
+    ("Ctrl + T", "Open files in a new tab"),
+    ("Ctrl + W", "Close the tab"),
+    ("Ctrl + Tab", "Next tab"),
+    ("Ctrl + Shift + Tab", "Previous tab"),
+    ("Ctrl + 1 to 8, Ctrl + 9", "That tab, or the last tab"),
     ("Ctrl + F", "Open a folder"),
     ("Ctrl + N", "Open a network stream"),
     (

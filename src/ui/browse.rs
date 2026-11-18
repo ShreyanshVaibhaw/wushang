@@ -257,6 +257,17 @@ impl Browse {
         self.stale = false;
         self.context = None;
         self.times.clear();
+        if self.sort.uses_time() {
+            let paths: Vec<_> = self
+                .all
+                .iter()
+                .filter_map(entry_path)
+                .map(std::path::Path::to_path_buf)
+                .collect();
+            if let Some(times) = library.modified_times(&paths) {
+                self.times = paths.into_iter().zip(times).collect();
+            }
+        }
         self.apply();
     }
 
@@ -277,14 +288,6 @@ impl Browse {
             .partition(|e| matches!(e, Entry::Action { .. }));
         // Home is ordered by section; elsewhere "Add" stays first and the rest is sorted.
         if self.place != Place::Home {
-            if self.sort.uses_time() {
-                for path in rest.iter().filter_map(entry_path) {
-                    if !self.times.contains_key(path) {
-                        let t = std::fs::metadata(path).and_then(|m| m.modified()).ok();
-                        self.times.insert(path.to_owned(), t);
-                    }
-                }
-            }
             let times = &self.times;
             sort_entries(&mut rest, self.sort, |e| {
                 entry_path(e).and_then(|p| times.get(p).copied().flatten())
@@ -304,6 +307,7 @@ impl Browse {
 
     pub fn set_sort(&mut self, mode: SortMode) {
         self.sort = mode;
+        self.stale = true;
         self.apply();
     }
 

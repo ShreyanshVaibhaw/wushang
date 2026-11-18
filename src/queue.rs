@@ -104,7 +104,7 @@ impl Queue {
     /// after the item that was playing, so the rest of the shuffled order still comes after it.
     pub fn play_at(&mut self, i: usize) -> Option<PathBuf> {
         let path = self.items.get(i)?.clone();
-        if self.shuffle {
+        if self.shuffle && self.current != Some(i) {
             let from = self.order.iter().position(|&o| o == i)?;
             self.order.remove(from);
             let at = match self.current.and_then(|c| self.pos(c)) {
@@ -541,6 +541,22 @@ mod tests {
             q.on_end().as_deref(),
             q.items().get(last).map(PathBuf::as_path)
         );
+    }
+
+    /// Playing the item already playing (a click on its row) leaves the shuffled order alone:
+    /// it used to move to the front, so the items before it played again.
+    #[test]
+    fn play_at_the_current_item_while_shuffled_changes_nothing() {
+        let items: Vec<PathBuf> = (0..10).map(|i| PathBuf::from(format!("{i}"))).collect();
+        let mut q = Queue::new(items, Some(Path::new("0")));
+        q.toggle_shuffle();
+        q.next();
+        q.next();
+        let (order, at) = (q.order.clone(), q.current().unwrap());
+        assert_eq!(q.play_at(at), q.items().get(at).cloned());
+        assert_eq!((&q.order, q.current()), (&order, Some(at)));
+        let next = q.next();
+        assert_eq!(next, q.items().get(order[3]).cloned());
     }
 
     #[test]

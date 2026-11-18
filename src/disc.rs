@@ -73,6 +73,16 @@ pub fn url(path: &Path) -> Result<String, String> {
     Ok(format!("concat:{}", parts.join("|")))
 }
 
+/// The current concat item's media interval, in seconds, when the demuxer supplies it.
+pub fn clip_interval(metadata: &ffmpeg_next::DictionaryRef) -> Option<(f64, f64)> {
+    let start: i64 = metadata.get("lavf.concatdec.start_time")?.parse().ok()?;
+    let duration: i64 = metadata.get("lavf.concatdec.duration")?.parse().ok()?;
+    (duration > 0).then_some((
+        start as f64 / 1_000_000.0,
+        start.checked_add(duration)? as f64 / 1_000_000.0,
+    ))
+}
+
 /// The main title of the DVD at a `dvd://` address.
 pub fn dvd_title(path: &Path) -> Option<Title> {
     path.to_str()?
@@ -89,6 +99,20 @@ pub struct Title {
     pub chapters: Vec<f64>,
 }
 
+/// Refuse oversized disc metadata before it can fill memory.
+const MAX_IFO: u64 = 16 << 20;
+
+fn read_capped(path: &Path, limit: u64) -> Option<Vec<u8>> {
+    use std::io::Read;
+    let mut bytes = Vec::new();
+    std::fs::File::open(path)
+        .ok()?
+        .take(limit + 1)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    (bytes.len() as u64 <= limit).then_some(bytes)
+}
+
 /// The longest title of the DVD whose VIDEO_TS is in `root`.
 pub fn dvd(root: &Path) -> Option<Title> {
     let dir = root.join("VIDEO_TS");
@@ -96,7 +120,7 @@ pub fn dvd(root: &Path) -> Option<Title> {
     // Title sets VTS_01 to VTS_99, each with an IFO and VOBs _1 to _9 (_0 holds its menus).
     for set in 1..=99 {
         let ifo = dir.join(format!("VTS_{set:02}_0.IFO"));
-        let Ok(bytes) = std::fs::read(&ifo) else {
+        let Some(bytes) = read_capped(&ifo, MAX_IFO) else {
             if set > 1 && best.is_some() {
                 break;
             }
@@ -204,6 +228,30 @@ pub fn drives() -> Vec<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clip_intervals_require_a_positive_duration_and_no_overflow() {
+        let mut metadata = ffmpeg_next::Dictionary::new();
+        assert_eq!(clip_interval(&metadata), None);
+        metadata.set("lavf.concatdec.start_time", "1500000");
+        metadata.set("lavf.concatdec.duration", "2000000");
+        assert_eq!(clip_interval(&metadata), Some((1.5, 3.5)));
+        metadata.set("lavf.concatdec.duration", "-1");
+        assert_eq!(clip_interval(&metadata), None);
+        metadata.set("lavf.concatdec.start_time", &i64::MAX.to_string());
+        metadata.set("lavf.concatdec.duration", "1");
+        assert_eq!(clip_interval(&metadata), None);
+    }
+
+    #[test]
+    fn metadata_reads_stop_at_the_limit() {
+        let path = std::env::temp_dir().join(format!("wushang-ifo-limit-{}", std::process::id()));
+        std::fs::write(&path, b"1234").unwrap();
+        assert_eq!(read_capped(&path, 4).as_deref(), Some(&b"1234"[..]));
+        assert!(read_capped(&path, 3).is_none());
+        std::fs::remove_file(&path).unwrap();
+        assert!(read_capped(&path, 4).is_none());
+    }
 
     /// A title set IFO with one program chain of `cells` cells of `secs` seconds each (29.97
     /// fps), every cell a chapter.

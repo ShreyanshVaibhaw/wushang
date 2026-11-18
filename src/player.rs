@@ -49,6 +49,9 @@ pub struct Clock(Mutex<ClockState>);
 
 struct ClockState {
     pts: f64,
+    /// How far `pts` runs ahead of the media: the audio delay, which moves the picture (that
+    /// follows the clock) ahead of the sound.
+    lead: f64,
     at: Instant,
     paused: bool,
     valid: bool,
@@ -56,10 +59,23 @@ struct ClockState {
     speed: f64,
 }
 
+impl ClockState {
+    fn now(&self) -> Option<f64> {
+        self.valid.then(|| {
+            if self.paused {
+                self.pts
+            } else {
+                self.pts + self.at.elapsed().as_secs_f64() * self.speed
+            }
+        })
+    }
+}
+
 impl Clock {
     fn new() -> Self {
         Clock(Mutex::new(ClockState {
             pts: 0.0,
+            lead: 0.0,
             at: Instant::now(),
             paused: false,
             valid: false,
@@ -68,21 +84,28 @@ impl Clock {
     }
 
     pub fn set(&self, pts: f64) {
+        self.set_with_lead(pts, 0.0);
+    }
+
+    /// Sets the clock to media time `pts` plus `lead`, the audio delay: what the picture
+    /// follows. `media` takes the lead back off.
+    pub fn set_with_lead(&self, pts: f64, lead: f64) {
         let mut s = self.0.lock().unwrap();
-        s.pts = pts;
+        s.pts = pts + lead;
+        s.lead = lead;
         s.at = Instant::now();
         s.valid = true;
     }
 
+    /// The time the picture follows: the media time plus the audio delay.
     pub fn get(&self) -> Option<f64> {
+        self.0.lock().unwrap().now()
+    }
+
+    /// Where playback is in the media, without the audio delay's lead.
+    pub fn media(&self) -> Option<f64> {
         let s = self.0.lock().unwrap();
-        s.valid.then(|| {
-            if s.paused {
-                s.pts
-            } else {
-                s.pts + s.at.elapsed().as_secs_f64() * s.speed
-            }
-        })
+        s.now().map(|t| t - s.lead)
     }
 
     pub fn set_paused(&self, paused: bool) {
@@ -126,6 +149,9 @@ pub struct Shared {
     exact: AtomicBool,
     volume: AtomicU32,
     pub muted: AtomicBool,
+    /// Set while this playback's tab is out of sight: its sound goes on silently, so its clock
+    /// keeps running, apart from the user's own mute.
+    pub silenced: AtomicBool,
     seek: Mutex<Seek>,
     pub video_done: AtomicBool,
     /// True when audio is playing or about to, so the audio callback owns the clock.
@@ -214,6 +240,7 @@ impl Shared {
             exact: AtomicBool::new(true),
             volume: AtomicU32::new(1.0f32.to_bits()),
             muted: AtomicBool::new(false),
+            silenced: AtomicBool::new(false),
             seek: Mutex::default(),
             video_done: AtomicBool::new(false),
             audio_master: AtomicBool::new(false),
@@ -262,9 +289,10 @@ impl Shared {
         self.muted.store(false, Relaxed);
     }
 
-    /// The gain the audio callback applies: zero while muted.
+    /// The gain the audio callback applies, which it ramps to over a few milliseconds: zero
+    /// while muted or silenced.
     pub fn gain(&self) -> f32 {
-        if self.muted.load(Relaxed) {
+        if self.muted.load(Relaxed) || self.silenced.load(Relaxed) {
             0.0
         } else {
             self.volume()
@@ -299,7 +327,7 @@ impl Shared {
 
     pub fn seek_by(&self, delta: f64) {
         let mut seek = self.seek.lock().unwrap();
-        let from = self.clock.get().unwrap_or(seek.last);
+        let from = self.clock.media().unwrap_or(seek.last);
         seek.last = (from + delta).max(0.0);
         seek.pending = Some(seek.last);
         // No move at all re-reads where playback is (a recording starting), exactly.
@@ -308,6 +336,12 @@ impl Shared {
         } else {
             SeekKind::Jump(delta > 0.0)
         };
+    }
+
+    /// Where the last seek went (0 before any): playback's place while the clock waits for the
+    /// first sound or frame after it.
+    pub fn seek_target(&self) -> f64 {
+        self.seek.lock().unwrap().last
     }
 
     /// The seek the demuxer should do, and how it lands.
@@ -940,6 +974,11 @@ pub fn spawn_video_decoder(
                         }
                         let pts = frame.timestamp().map_or(next_pts, |t| t as f64 * time_base);
                         next_pts = pts + frame_duration;
+                        if crate::disc::clip_interval(&frame.metadata())
+                            .is_some_and(|(from, to)| pts < from || pts >= to)
+                        {
+                            continue;
+                        }
                         // Decoded only to reach the seek target from the keyframe before it.
                         if shared.exact() && pts + frame_duration / 2.0 < shared.seek_floor() {
                             continue;
@@ -993,6 +1032,18 @@ pub fn spawn_video_decoder(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn audio_delay_does_not_shift_seek_targets() {
+        let shared = Shared::new();
+        shared.clock.set_paused(true);
+        shared.clock.set_with_lead(30.0, 2.5);
+        assert_eq!(shared.clock.get(), Some(32.5));
+        assert_eq!(shared.clock.media(), Some(30.0));
+        shared.seek_by(10.0);
+        assert_eq!(shared.seek_target(), 40.0);
+        assert_eq!(shared.take_seek().map(|s| s.0), Some(40.0));
+    }
 
     #[test]
     fn skips_jump_to_keyframes_and_the_seek_bar_lands_exactly() {

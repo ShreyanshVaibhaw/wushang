@@ -1,0 +1,9 @@
+Generated with the built-in image_gen tool.
+
+Use case: logo-brand.
+Asset type: original Windows desktop app icon for Wushang, a fast, lightweight media player for music and films.
+Primary request: create one exceptionally clear, memorable logo icon. A bold, flowing letter W built from a single folded ribbon, with a small right-facing play triangle suggested by its internal negative space. The gesture should feel swift and controlled, subtly inspired by a martial-arts movement, translated into contemporary abstract geometry. Media playback and forward motion are the idea.
+Style: precise vector-like graphic design, flat colors, smooth decisive curves balanced with sharp folded cuts. Clean silhouette recognizable at 24 pixels. No texture or tiny details.
+Composition: one large centered mark on one dark charcoal rounded-square app tile, straight-on, with generous even padding. The W is the hero, not a generic large play-button badge. Square canvas, tile nearly fills the canvas, transparent outside the rounded tile.
+Palette: vivid warm vermilion orange mark against near-black charcoal. Flat high contrast. Can use one slightly lighter orange face only if needed to clarify the fold.
+Constraints: one final icon only. No lettering, no wordmark, no mockup, no presentation board, no alternative icons, no watermark, no drop shadow outside the tile, no bevel, no 3D, no glow, no gradients. No traffic cone, no dragon, no literal weapons, no Chinese characters. Original logo, not copied from an existing brand.

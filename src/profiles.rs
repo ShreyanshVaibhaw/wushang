@@ -67,6 +67,11 @@ impl Profiles {
             .cloned()
             .ok_or(ErrorKind::NotFound)?;
         let folder = self.dir.join(DIR).join(&name);
+        // The profile in use: its saved copy is older than `live`, which stays as it is.
+        if name == self.current {
+            live.save(&folder)?;
+            return Ok(live.clone());
+        }
         let mut new = if folder.join("settings.txt").exists() {
             Prefs::load(&folder)
         } else {
@@ -139,6 +144,26 @@ mod tests {
         assert_eq!(p.names().last().unwrap(), "Late Night");
         assert_eq!(p.current(), "Late Night");
         assert_eq!(p.switch("Music", &work).unwrap().theme, 1);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Picking the profile already in use changes nothing: it used to bring back what that
+    /// profile last saved, over the changes made since.
+    #[test]
+    fn picking_the_current_profile_keeps_its_changes() {
+        let dir = std::env::temp_dir().join(format!("wushang-reprofile-{}", std::process::id()));
+        _ = fs::remove_dir_all(&dir);
+        let mut p = Profiles::load(&dir);
+        let start = Prefs::default();
+        let music = p.switch("Music", &start).unwrap();
+        let mut movies = p.switch("Movies", &music).unwrap();
+        movies.theme = 2;
+        movies.speed = 1.25;
+        let again = p.switch("movies", &movies).unwrap();
+        assert_eq!((p.current(), again.theme, again.speed), ("Movies", 2, 1.25));
+        // And Movies' saved copy is the live one, for a switch away and back.
+        let music = p.switch("Music", &again).unwrap();
+        assert_eq!(p.switch("Movies", &music).unwrap().theme, 2);
         fs::remove_dir_all(dir).unwrap();
     }
 }

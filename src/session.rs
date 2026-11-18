@@ -168,6 +168,15 @@ fn local_formats() -> &'static str {
     })
 }
 
+/// What a file is called on screen: its name without the extension, underscores as spaces
+/// ("The_Wand_S01E04.mp4" is "The Wand S01E04").
+pub fn file_title(path: &Path) -> String {
+    path.file_stem()
+        .unwrap_or(path.as_os_str())
+        .to_string_lossy()
+        .replace('_', " ")
+}
+
 /// Whether `path` is a live stream FFmpeg doesn't reconnect itself (it does http and HLS), so
 /// the demuxer opens it again when it drops.
 fn reopens(path: &Path) -> bool {
@@ -372,11 +381,7 @@ impl Session {
             Some(url) => meta(&input.metadata(), c"icy-name")
                 .or_else(|| meta(&input.metadata(), c"title"))
                 .unwrap_or_else(|| net::url_name(url)),
-            None => path
-                .file_stem()
-                .unwrap_or(path.as_os_str())
-                .to_string_lossy()
-                .replace('_', " "),
+            None => file_title(path),
         };
         let folder = match &url {
             _ if capture || disc => String::new(),
@@ -480,8 +485,12 @@ impl Session {
     /// Where playback is in the media. The clock runs ahead by the audio delay (that is how the
     /// delay shifts the picture), so take it back off.
     pub fn position(&self) -> Option<f64> {
-        let delay = self.audio.effects().delay();
-        self.shared.clock.get().map(|t| t - delay)
+        self.shared.clock.media()
+    }
+
+    /// Keep a paused seek's destination while its new audio clock is not running yet.
+    pub fn place(&self) -> f64 {
+        self.position().unwrap_or_else(|| self.shared.seek_target())
     }
 
     fn open_video(&self, stream: usize) -> Result<ff::decoder::Video, String> {
@@ -1060,7 +1069,7 @@ mod tests {
             let shared = Arc::new(Shared::new());
             // Tests play on the real device; keep them silent.
             shared.toggle_mute();
-            let audio = audio::Device::open(shared.clone());
+            let audio = audio::Device::open(shared.clone(), None);
             let session = Session::open(
                 &clip(),
                 None,
@@ -1173,6 +1182,42 @@ mod tests {
         })
     }
 
+    /// Two tabs: two sessions at once, each on its own clock and sound output. Both play on;
+    /// the one out of sight is silenced, the other heard, here at -120 dB so the test stays
+    /// silent while the samples it sends aren't zero. Then they swap.
+    #[test]
+    fn two_sessions_play_at_once_and_only_one_is_heard() {
+        let heard = Player::start();
+        let unseen = Player::start();
+        // `start` mutes; setting a volume unmutes.
+        heard.shared.set_volume(1e-6);
+        unseen.shared.set_volume(1e-6);
+        unseen.shared.silenced.store(true, Relaxed);
+        if !heard.has_audio_device() || !unseen.has_audio_device() {
+            return;
+        }
+        // The clip is 5 s long, so measure in short spans.
+        assert!(heard.advances(0.5), "the tab on screen plays");
+        assert!(unseen.advances(0.5), "the tab out of sight plays on");
+        // What the callback last sent to the device, after the gain.
+        let sounding = |p: &Player| (p.shared.scope.lock().unwrap().1.iter()).any(|s| *s != 0.0);
+        assert!(sounding(&heard));
+        assert!(!sounding(&unseen));
+        assert_eq!(unseen.shared.gain(), 0.0);
+        assert!(
+            !unseen.shared.muted.load(Relaxed),
+            "the user's mute is untouched"
+        );
+
+        heard.shared.silenced.store(true, Relaxed);
+        unseen.shared.silenced.store(false, Relaxed);
+        // The scope holds about 20 ms; give the callbacks time to replace it.
+        thread::sleep(Duration::from_millis(300));
+        assert!(heard.advances(0.3) && unseen.advances(0.3));
+        assert!(!sounding(&heard));
+        assert!(sounding(&unseen));
+    }
+
     #[test]
     fn lists_tracks_like_vlc() {
         let mut p = Player::start();
@@ -1214,7 +1259,7 @@ mod tests {
     fn lists_chapters() {
         let shared = Arc::new(Shared::new());
         shared.toggle_mute();
-        let audio = audio::Device::open(shared.clone());
+        let audio = audio::Device::open(shared.clone(), None);
         // test_tracks.mkv remuxed with three chapters, the middle one without a title.
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/test_chapters.mkv");
         let s = Session::open(&path, None, &TrackChoice::default(), &shared, None, &audio).unwrap();
@@ -1375,8 +1420,10 @@ mod tests {
         // A seek reaches the external file's demuxer too, and both play on from there.
         p.shared.seek_to(1.5);
         assert!(p.advances(0.3), "stalled after seeking");
-        // Audio restarts with the whole frame holding the target, a few ms early.
-        assert!(p.position() >= 1.4, "seek went to {:.2}", p.position());
+        // Audio restarts with the whole frame holding the target, a few ms early. The clock is
+        // what is heard, so it trails that by the output's latency: a few ms on the built-in
+        // speakers, up to about 300 ms on Bluetooth headphones.
+        assert!(p.position() >= 1.15, "seek went to {:.2}", p.position());
 
         p.session().select(TrackKind::Audio, Some(ENGLISH)).unwrap();
         assert!(p.advances(0.3), "stalled after switching back");

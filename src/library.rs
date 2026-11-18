@@ -7,13 +7,13 @@
 
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::fmt::Write as _;
 use std::io::ErrorKind;
 use std::os::windows::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering::Relaxed;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::SystemTime;
 use std::{env, fs, io};
 
 use crate::net::{self, Feed, NetKind, Station};
@@ -288,6 +288,73 @@ pub fn write_replacing(file: &Path, bytes: &[u8]) -> io::Result<()> {
     fs::rename(tmp, file)
 }
 
+/// Files handed to [`write_later`] that aren't on disk yet, and whether a thread is writing them.
+struct Writes {
+    pending: VecDeque<(PathBuf, Vec<u8>)>,
+    running: bool,
+}
+
+static WRITES: Mutex<Writes> = Mutex::new(Writes {
+    pending: VecDeque::new(),
+    running: false,
+});
+/// Signalled when the writer thread runs out of files.
+static WRITTEN: Condvar = Condvar::new();
+
+/// Replaces `file` with `bytes` as [`write_replacing`] does, but on a background thread, so the
+/// caller doesn't wait for the flush to disk (a full flush on macOS, which can take long enough
+/// to drop frames). Bytes still waiting from an earlier call for the same file are replaced, so
+/// only the newest are written. A write that fails is reported on stderr.
+pub fn write_later(file: PathBuf, bytes: Vec<u8>) {
+    let mut w = WRITES.lock().unwrap();
+    match w.pending.iter_mut().find(|(f, _)| *f == file) {
+        Some(waiting) => waiting.1 = bytes,
+        None => w.pending.push_back((file, bytes)),
+    }
+    if !w.running {
+        w.running = true;
+        std::thread::spawn(write_pending);
+    }
+}
+
+/// The writer thread: writes the files handed to [`write_later`] in order until none are left.
+fn write_pending() {
+    let mut w = WRITES.lock().unwrap();
+    while let Some((file, bytes)) = w.pending.pop_front() {
+        drop(w);
+        if let Err(e) = write_replacing(&file, &bytes) {
+            eprintln!("wushang: can't save {}: {e}", file.display());
+        }
+        w = WRITES.lock().unwrap();
+    }
+    w.running = false;
+    WRITTEN.notify_all();
+}
+
+/// Waits until every file handed to [`write_later`] so far is on disk.
+pub fn finish_writes() {
+    let mut w = WRITES.lock().unwrap();
+    while w.running {
+        w = WRITTEN.wait(w).unwrap();
+    }
+}
+
+/// The file or address a playlist line lists, if it lists one: comments, blank lines and
+/// other protocols list nothing. Relative lines resolve against the playlists folder `dir`.
+fn playlist_entry(line: &str, dir: &Path) -> Option<PathBuf> {
+    let line = line.trim_start_matches('\u{feff}').trim();
+    if line.is_empty() || line.starts_with('#') {
+        None
+    } else if net::is_url(line) {
+        net::normalize_url(line).ok().map(PathBuf::from)
+    } else if line.contains("://") {
+        // Imported playlists must not open capture devices or other FFmpeg protocols.
+        None
+    } else {
+        Some(dir.join(line))
+    }
+}
+
 impl Library {
     /// %APPDATA%\wushang, or the WUSHANG_HOME environment variable when set (tests and dev runs use it).
     pub fn default_dir() -> PathBuf {
@@ -303,7 +370,9 @@ impl Library {
         Self::open(dir, env::var_os("WUSHANG_HOME").is_none())
     }
 
-    fn open(dir: &Path, seed: bool) -> Library {
+    pub(crate) fn open(dir: &Path, seed: bool) -> Library {
+        // A library saved just before is read as saved.
+        finish_writes();
         let mut lib = Library {
             dir: dir.to_path_buf(),
             video_roots: Vec::new(),
@@ -431,8 +500,10 @@ impl Library {
         }
     }
 
-    /// Writes state.txt through a temporary file, so a crash mid-write keeps the old state.
-    /// Paths that are not valid Unicode are left out.
+    /// Writes state.txt through a temporary file, so a crash mid-write keeps the old state. The
+    /// render loop saves every 30 seconds during playback, so the writing happens in the
+    /// background ([`write_later`]); dropping the library waits for it. Paths that are not valid
+    /// Unicode are left out.
     pub fn save(&self) -> io::Result<()> {
         if self.unreadable {
             return Ok(());
@@ -489,7 +560,8 @@ impl Library {
             put(&["address", a.kind.key(), &a.url, &name]);
         }
         fs::create_dir_all(&self.dir)?;
-        write_replacing(&self.dir.join(STATE_FILE), out.as_bytes())
+        write_later(self.dir.join(STATE_FILE), out.into_bytes());
+        Ok(())
     }
 
     fn root_list(&self, section: Section) -> &[PathBuf] {
@@ -519,7 +591,7 @@ impl Library {
 
     /// What a page shows, in display order.
     pub fn entries(&self, place: &Place) -> Vec<Entry> {
-        let mut entries = self.raw_entries(place);
+        let mut entries = self.raw_entries(place, PAGE);
         let watched: HashMap<&Path, f64> = self
             .recent
             .iter()
@@ -541,10 +613,11 @@ impl Library {
         entries
     }
 
-    /// Entries without watch progress, which [`Library::entries`] fills in.
-    fn raw_entries(&self, place: &Place) -> Vec<Entry> {
+    /// Entries without watch progress, which [`Library::entries`] fills in. `wait` is how long a
+    /// folder listing or Home's checks may wait for the file system the first time.
+    fn raw_entries(&self, place: &Place, patience: Patience) -> Vec<Entry> {
         match place {
-            Place::Home => self.home(),
+            Place::Home => self.home(patience.wait),
             Place::Videos | Place::Music => {
                 let section = place.section();
                 let mut out = vec![action("Add", Action::AddFolder(section))];
@@ -609,7 +682,9 @@ impl Library {
                 .map(|r| self.file_media(&r.path))
                 .collect(),
             Place::Folder(section, dir) => {
-                let (dirs, files) = list_dir(dir);
+                let Some((dirs, files)) = self.media_dirs.listing(dir, patience) else {
+                    return vec![notice("Loading...")];
+                };
                 let dirs = (self.media_dirs.keep(dirs).into_iter())
                     .map(|(name, d)| folder(&name, Place::Folder(*section, d)));
                 let files = files
@@ -656,12 +731,25 @@ impl Library {
         }
     }
 
-    fn home(&self) -> Vec<Entry> {
+    /// Home. Whether the files and folders it shows are still there is looked up off this thread,
+    /// as a share may not answer: what isn't known after `wait` shows, and the page is redone
+    /// once the answers come.
+    fn home(&self, wait: std::time::Duration) -> Vec<Entry> {
+        let asked = std::cell::RefCell::new(Vec::new());
+        let out = self.home_with(&|p| self.media_dirs.found(p, &mut asked.borrow_mut()));
+        if !self.media_dirs.wait_for(asked.into_inner(), wait) {
+            return out;
+        }
+        self.home_with(&|p| self.media_dirs.found(p, &mut Vec::new()))
+    }
+
+    /// Home, with `found` telling what is at a path, or None when that isn't known yet.
+    fn home_with(&self, found: &dyn Fn(&Path) -> Option<Found>) -> Vec<Entry> {
         let mut out = Vec::new();
         let favorites: Vec<Entry> = self
             .favorites
             .iter()
-            .filter_map(|p| self.favorite_entry(p))
+            .filter_map(|p| self.favorite_entry(p, found))
             .collect();
         if !favorites.is_empty() {
             out.push(Entry::Header {
@@ -690,7 +778,7 @@ impl Library {
             .filter(|r| {
                 r.fraction()
                     .is_some_and(|f| (RESUME_FROM..FINISHED_AT).contains(&f))
-                    && r.path.exists()
+                    && found(&r.path) != Some(Found::Nothing)
             })
             .take(HOME_RECENT)
             .map(|r| self.file_media(&r.path))
@@ -710,7 +798,7 @@ impl Library {
             .into_iter()
             .filter_map(|p| {
                 let section = self.section_of(p)?;
-                p.is_dir()
+                (found(p).is_none_or(|f| f == Found::Folder))
                     .then(|| folder(&name_of(p), Place::Folder(section, p.clone())))
             })
             .take(4)
@@ -935,7 +1023,7 @@ impl Library {
 
     /// The playable files of a place in display order (the play queue for next and previous).
     pub fn media_in(&self, place: &Place) -> Vec<PathBuf> {
-        let entries = self.raw_entries(place).into_iter();
+        let entries = self.raw_entries(place, QUEUE).into_iter();
         entries
             .filter_map(|e| match e {
                 Entry::Media { path, .. } => Some(path),
@@ -1033,19 +1121,21 @@ impl Library {
             .ok_or_else(|| {
                 io::Error::new(ErrorKind::InvalidInput, "path can't go in a playlist")
             })?;
-        let mut text = match fs::read_to_string(&file) {
-            Ok(text) => text,
-            Err(e) if e.kind() == ErrorKind::NotFound => String::new(),
+        // As bytes: a playlist from another program may not be UTF-8, and its lines stay as
+        // they are.
+        let mut bytes = match fs::read(&file) {
+            Ok(bytes) => bytes,
+            Err(e) if e.kind() == ErrorKind::NotFound => Vec::new(),
             Err(e) => return Err(e),
         };
-        if text.is_empty() {
-            text = format!("{M3U_HEADER}\n");
-        } else if !text.ends_with('\n') {
-            text.push('\n');
+        if bytes.is_empty() {
+            bytes = format!("{M3U_HEADER}\n").into_bytes();
+        } else if !bytes.ends_with(b"\n") {
+            bytes.push(b'\n');
         }
-        writeln!(text, "{line}").unwrap();
+        bytes.extend_from_slice(format!("{line}\n").as_bytes());
         fs::create_dir_all(self.playlist_dir())?;
-        write_replacing(&file, text.as_bytes())
+        write_replacing(&file, &bytes)
     }
 
     /// The files of a playlist in order. Relative lines resolve against the playlists folder.
@@ -1059,18 +1149,7 @@ impl Library {
         let dir = self.playlist_dir();
         String::from_utf8_lossy(&bytes)
             .lines()
-            .map(|l| l.trim_start_matches('\u{feff}').trim())
-            .filter(|l| !l.is_empty() && !l.starts_with('#'))
-            .filter_map(|line| {
-                if net::is_url(line) {
-                    net::normalize_url(line).ok().map(PathBuf::from)
-                } else if line.contains("://") {
-                    // Imported playlists must not open capture devices or other FFmpeg protocols.
-                    None
-                } else {
-                    Some(dir.join(line))
-                }
-            })
+            .filter_map(|line| playlist_entry(line, &dir))
             .collect()
     }
 
@@ -1085,16 +1164,49 @@ impl Library {
         self.playlist_file(name).ok().map(|p| abs(&p))
     }
 
-    /// Renames a playlist with its play count, thumbnail and favourite. Fails if either name is
-    /// invalid or `new` is taken; a change of case only is allowed.
+    /// Renames a playlist with its play count, thumbnail, favourite and track choices. Fails if
+    /// either name is invalid or `new` is taken; a change of case only is allowed.
     pub fn rename_playlist(&mut self, old: &str, new: &str) -> io::Result<()> {
         let from = self.playlist_file(old)?;
         let to = self.playlist_file(new)?;
         if old == new {
             return Ok(());
         }
-        // Windows file names ignore case, so "mix" -> "Mix" finds itself at the target.
-        if to.exists() && old.to_lowercase() != new.to_lowercase() {
+        let same_file = |a: &Path, b: &Path| {
+            use windows::Win32::Foundation::CloseHandle;
+            use windows::Win32::Storage::FileSystem::{
+                BY_HANDLE_FILE_INFORMATION, CreateFileW, FILE_FLAG_BACKUP_SEMANTICS,
+                FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+                GetFileInformationByHandle, OPEN_EXISTING,
+            };
+            use windows::core::HSTRING;
+            let identity = |path: &Path| unsafe {
+                let handle = CreateFileW(
+                    &HSTRING::from(path.as_os_str()),
+                    FILE_READ_ATTRIBUTES.0,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                    None,
+                    OPEN_EXISTING,
+                    FILE_FLAG_BACKUP_SEMANTICS,
+                    None,
+                )
+                .ok()?;
+                let mut info = BY_HANDLE_FILE_INFORMATION::default();
+                let result = GetFileInformationByHandle(handle, &mut info);
+                _ = CloseHandle(handle);
+                result.ok()?;
+                Some((
+                    info.dwVolumeSerialNumber,
+                    info.nFileIndexHigh,
+                    info.nFileIndexLow,
+                ))
+            };
+            match (identity(a), identity(b)) {
+                (Some(a), Some(b)) => a == b,
+                _ => false,
+            }
+        };
+        if to.exists() && !same_file(&from, &to) {
             return Err(io::Error::new(
                 ErrorKind::AlreadyExists,
                 format!("a playlist called {new:?} already exists"),
@@ -1107,6 +1219,9 @@ impl Library {
         }
         if let Some(p) = self.thumbnails.remove(old) {
             self.thumbnails.insert(new.into(), p);
+        }
+        if let Some(t) = self.picks.remove(&playlist_scope(old)) {
+            self.picks.insert(playlist_scope(new), t);
         }
         for p in &mut self.favorites {
             if *p == old_path {
@@ -1123,22 +1238,29 @@ impl Library {
         fs::remove_file(file)?;
         self.playlist_plays.remove(name);
         self.thumbnails.remove(name);
+        self.picks.remove(&playlist_scope(name));
         self.favorites.retain(|p| *p != path);
         Ok(())
     }
 
     /// Removes item `index` (as [`Library::playlist_items`] counts) and its `#EXTINF` line,
-    /// keeping every other line of the file as it was.
+    /// keeping every other line of the file byte for byte as it was, line end and encoding too.
     pub fn remove_from_playlist(&mut self, name: &str, index: usize) -> io::Result<()> {
         let file = self.playlist_file(name)?;
-        let text = String::from_utf8_lossy(&fs::read(&file)?).into_owned();
-        let lines: Vec<&str> = text.lines().collect();
-        let is_item = |l: &str| {
-            let l = l.trim_start_matches('\u{feff}').trim();
-            !l.is_empty() && !l.starts_with('#')
-        };
-        let at = (0..lines.len())
-            .filter(|&i| is_item(lines[i]))
+        let bytes = fs::read(&file)?;
+        // Each line with its line end, and as `playlist_items` reads it.
+        let raw: Vec<&[u8]> = bytes.split_inclusive(|&b| b == b'\n').collect();
+        let text: Vec<String> = (raw.iter())
+            .map(|l| {
+                let l = l.strip_suffix(b"\n").unwrap_or(l);
+                let l = l.strip_suffix(b"\r").unwrap_or(l);
+                String::from_utf8_lossy(l).into_owned()
+            })
+            .collect();
+        let dir = self.playlist_dir();
+        let is_item = |l: &str| playlist_entry(l, &dir).is_some();
+        let at = (0..text.len())
+            .filter(|&i| is_item(&text[i]))
             .nth(index)
             .ok_or_else(|| {
                 io::Error::new(
@@ -1147,14 +1269,10 @@ impl Library {
                 )
             })?;
         let mut start = at;
-        while start > 0 && lines[start - 1].trim().starts_with("#EXTINF") {
+        while start > 0 && text[start - 1].trim().starts_with("#EXTINF") {
             start -= 1;
         }
-        let mut out = String::new();
-        for line in lines[..start].iter().chain(&lines[at + 1..]) {
-            writeln!(out, "{line}").unwrap();
-        }
-        write_replacing(&file, out.as_bytes())
+        write_replacing(&file, &[&raw[..start], &raw[at + 1..]].concat().concat())
     }
 
     pub fn playlist_thumbnail(&self, name: &str) -> Option<&Path> {
@@ -1212,20 +1330,18 @@ impl Library {
     }
 
     /// How a favourite shows on Home: a playlist, a media file or a folder. Playlists and folders
-    /// that are gone are left out.
-    fn favorite_entry(&self, path: &Path) -> Option<Entry> {
+    /// that are gone are left out; `found` is as for [`Library::home_with`].
+    fn favorite_entry(&self, path: &Path, found: &dyn Fn(&Path) -> Option<Found>) -> Option<Entry> {
+        let is = |want: Found| found(path).is_none_or(|f| f == want);
         if path.parent() == Some(abs(&self.playlist_dir()).as_path()) {
             let name = stem_of(path);
-            return path
-                .is_file()
-                .then(|| folder(&name, Place::Playlist(name.clone())));
+            return is(Found::File).then(|| folder(&name, Place::Playlist(name.clone())));
         }
         if media_kind(path).is_some() {
             return Some(self.file_media(path));
         }
         let section = self.section_of(path).unwrap_or(Section::Videos);
-        path.is_dir()
-            .then(|| folder(&name_of(path), Place::Folder(section, path.to_owned())))
+        is(Found::Folder).then(|| folder(&name_of(path), Place::Folder(section, path.to_owned())))
     }
 
     /// Replaces the music index with the result of a scan. Blank tags count as missing.
@@ -1254,7 +1370,15 @@ impl Library {
         self.media_dirs.take_changed()
     }
 
-    /// Searches every folder for media again on its next listing (Resync).
+    /// When each of `paths` was last modified, for the date sorts. They are read off the
+    /// caller's thread, as a folder's listing is: the last times read, or those read within a
+    /// moment the first time. None until then; the page is redone when they come (see
+    /// [`Library::media_folders_changed`]).
+    pub fn modified_times(&self, paths: &[PathBuf]) -> Option<Vec<Option<SystemTime>>> {
+        self.media_dirs.times(paths, PAGE)
+    }
+
+    /// Lists every folder and searches it for media again the next time it shows (Resync).
     pub fn forget_media_folders(&self) {
         self.media_dirs.forget();
     }
@@ -1286,6 +1410,13 @@ impl Library {
         [Section::Videos, Section::Music]
             .into_iter()
             .find(|&s| self.root_list(s).iter().any(|r| path.starts_with(r)))
+    }
+}
+
+/// The last save before quitting is on disk before the process ends.
+impl Drop for Library {
+    fn drop(&mut self) {
+        finish_writes();
     }
 }
 
@@ -1403,7 +1534,10 @@ fn stem_of(path: &Path) -> String {
 }
 
 /// Absolute form of `path`, so lookups match however the file was opened. A stream address
-/// stays as it is; Windows would read it as a relative path with backslashes.
+/// stays as it is; it would read as a path relative to the current folder.
+///
+/// Windows resolves dot components before following junctions. Use the same path rules
+/// without resolving the junction itself, so existing library keys stay stable.
 pub fn abs(path: &Path) -> PathBuf {
     if crate::net::is_address(path) {
         return path.to_path_buf();
@@ -1446,9 +1580,42 @@ type Named = Vec<(String, PathBuf)>;
 /// Settings' "Show hidden files": folder listings include hidden and dot files.
 pub static SHOW_HIDDEN: AtomicBool = AtomicBool::new(false);
 
+/// What is at a path.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Found {
+    Folder,
+    File,
+    Nothing,
+}
+
+/// What is at `path`, following links. Anything that can't be read counts as nothing.
+fn found_at(path: &Path) -> Found {
+    #[cfg(test)]
+    tests::stall(path);
+    match fs::metadata(path) {
+        Ok(m) if m.is_dir() => Found::Folder,
+        Ok(_) => Found::File,
+        Err(_) => Found::Nothing,
+    }
+}
+
+/// When `path` was last modified, following links; None when it can't be read.
+fn modified_at(path: &Path) -> Option<SystemTime> {
+    #[cfg(test)]
+    tests::stall(path);
+    fs::metadata(path).and_then(|m| m.modified()).ok()
+}
+
 /// The visible subfolders and files of `dir`, each sorted by name in natural order.
 fn list_dir(dir: &Path) -> (Named, Named) {
+    list_dir_as(dir, SHOW_HIDDEN.load(Relaxed))
+}
+
+/// [`list_dir`], with hidden files and folders shown when `show_hidden` is set.
+fn list_dir_as(dir: &Path, show_hidden: bool) -> (Named, Named) {
     const FILE_ATTRIBUTE_HIDDEN: u32 = 0x2;
+    #[cfg(test)]
+    tests::stall(dir);
     let (mut dirs, mut files) = (Vec::new(), Vec::new());
     for entry in fs::read_dir(dir).into_iter().flatten().flatten() {
         let name = entry.file_name().to_string_lossy().into_owned();
@@ -1456,7 +1623,7 @@ fn list_dir(dir: &Path) -> (Named, Named) {
         let hidden = entry
             .metadata()
             .is_ok_and(|m| m.file_attributes() & FILE_ATTRIBUTE_HIDDEN != 0);
-        if (hidden || name.starts_with('.')) && !SHOW_HIDDEN.load(Relaxed) {
+        if (hidden || name.starts_with('.')) && !show_hidden {
             continue;
         }
         let path = entry.path();
@@ -1477,15 +1644,71 @@ fn list_dir(dir: &Path) -> (Named, Named) {
 
 /// Which folders hold media, searched for by one background thread so a listing never waits on
 /// it: a drive root can hold thousands of folders, and the window froze for minutes walking them.
-/// A subfolder lists until the search finds no media in it. A listing shows the answers it has
+/// A subfolder lists until the search finds it holds no media. A listing shows the answers it has
 /// at once and checks those older than `MEDIA_RECHECK` again, so a folder that gains or loses its
 /// media shows or goes the next time its parent is opened. `forget` (Resync) drops them all.
+///
+/// The pages' own file system calls (a folder's listing, Home's checks that what it shows is
+/// still there, the date sorts' modification times) are made off the caller's thread too, each [`Ask`] on a thread of its own, since
+/// a share that doesn't answer holds a call up for the network timeout. See [`MediaDirs::look`].
 #[derive(Default)]
-struct MediaDirs(Arc<Mutex<DirSearch>>);
+struct MediaDirs(Arc<(Mutex<DirSearch>, Condvar)>);
 
 /// How old a folder's answer gets before a listing has it searched again. Long enough that the
 /// listings the search's own answers redo don't start it over.
 const MEDIA_RECHECK: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// How long a page waits for an answer it has never had before showing without it, so a local
+/// folder still lists at once. Tests allow longer, since they run many at a time.
+const LOOKUP_WAIT: std::time::Duration =
+    std::time::Duration::from_millis(if cfg!(test) { 1000 } else { 100 });
+/// How long making a play queue from a folder waits for its listing: a queue made without it
+/// would hold nothing.
+const QUEUE_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+/// How old an answer gets before the page that uses it has it asked again, showing the old
+/// answer meanwhile.
+const LOOK_AGAIN: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// How long a caller waits for the file system's answers, and whether one older than
+/// `LOOK_AGAIN` will do meanwhile.
+#[derive(Clone, Copy, Debug)]
+struct Patience {
+    wait: std::time::Duration,
+    fresh: bool,
+}
+
+/// A page shows at once with what it knows, and is redone when newer answers come.
+const PAGE: Patience = Patience {
+    wait: LOOKUP_WAIT,
+    fresh: false,
+};
+/// A play queue is made once and nothing redoes it, so it waits for the folder as it is now,
+/// taking the old listing only when the new one doesn't come in time.
+const QUEUE: Patience = Patience {
+    wait: QUEUE_WAIT,
+    fresh: true,
+};
+/// Answers kept; the oldest goes beyond that.
+const MAX_ANSWERS: usize = 1000;
+
+/// A page's question for the file system.
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+enum Ask {
+    /// A folder's visible subfolders and files, as [`list_dir`] gives them, and whether hidden
+    /// ones show (`SHOW_HIDDEN`), so a listing made before that changed isn't shown after.
+    List(PathBuf, bool),
+    /// What is at a path, as [`found_at`] tells.
+    Kind(PathBuf),
+    /// When each of a page's files and folders was last modified, all in one go.
+    Times(Vec<PathBuf>),
+}
+
+#[derive(Clone, PartialEq, Debug)]
+enum Answer {
+    List(Named, Named),
+    Kind(Found),
+    Times(Vec<Option<SystemTime>>),
+}
 
 #[derive(Default)]
 struct DirSearch {
@@ -1494,15 +1717,108 @@ struct DirSearch {
     /// The folders the latest listing asked about and the search hasn't reached.
     queue: VecDeque<PathBuf>,
     running: bool,
-    /// Set when the search's answer for a listed folder changed, so the listing should be redone.
+    /// Set when the search's answer for a listed folder changed, or a page's answer came after
+    /// the page was shown without it, so the page should be redone.
     changed: bool,
+    /// The pages' answers, and when each was found.
+    answers: HashMap<Ask, (Answer, std::time::Instant)>,
+    /// The asks a thread is answering, and those of them a caller is waiting for.
+    asking: HashSet<Ask>,
+    waiting: HashSet<Ask>,
 }
 
 impl MediaDirs {
+    fn state(&self) -> std::sync::MutexGuard<'_, DirSearch> {
+        self.0.0.lock().unwrap()
+    }
+
+    /// The answer to `ask` known now, if any. One not known yet, or older than `LOOK_AGAIN`, is
+    /// asked for on a thread of its own unless a thread is on it already. Those a thread is
+    /// answering and the caller has no answer for go into `asked`, for
+    /// [`MediaDirs::wait_for`]; with `fresh`, those it has only an old answer for too.
+    fn look(&self, ask: &Ask, asked: &mut Vec<Ask>, fresh: bool) -> Option<Answer> {
+        let mut s = self.state();
+        let known = s.answers.get(ask).cloned();
+        let old = known
+            .as_ref()
+            .is_none_or(|(_, at)| at.elapsed() > LOOK_AGAIN);
+        if old && s.asking.insert(ask.clone()) {
+            let (shared, question) = (self.0.clone(), ask.clone());
+            let spawned = std::thread::Builder::new().spawn(move || answer(&shared, question));
+            if spawned.is_err() {
+                s.asking.remove(ask);
+            }
+        }
+        if s.asking.contains(ask) && (known.is_none() || (fresh && old)) {
+            asked.push(ask.clone());
+        }
+        known.map(|(answer, _)| answer)
+    }
+
+    /// Waits up to `wait` for the answers to `asks`, and says whether any came.
+    fn wait_for(&self, asks: Vec<Ask>, wait: std::time::Duration) -> bool {
+        if asks.is_empty() {
+            return false;
+        }
+        let deadline = std::time::Instant::now() + wait;
+        let mut s = self.state();
+        s.waiting.extend(asks.iter().cloned());
+        while asks.iter().any(|a| s.asking.contains(a)) {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            if left.is_zero() {
+                break;
+            }
+            s = self.0.1.wait_timeout(s, left).unwrap().0;
+        }
+        for a in &asks {
+            s.waiting.remove(a);
+        }
+        asks.iter().any(|a| !s.asking.contains(a))
+    }
+
+    /// What is at `path`, if known yet; see [`MediaDirs::look`].
+    fn found(&self, path: &Path, asked: &mut Vec<Ask>) -> Option<Found> {
+        match self.look(&Ask::Kind(path.to_owned()), asked, false)? {
+            Answer::Kind(found) => Some(found),
+            _ => None,
+        }
+    }
+
+    /// The answer to `ask`: the last one, or if there is none yet (or, as `patience` says, only
+    /// an old one), the one that comes within its wait, else the old one.
+    fn answer_within(&self, ask: &Ask, patience: Patience) -> Option<Answer> {
+        let mut asked = Vec::new();
+        let known = self.look(ask, &mut asked, patience.fresh);
+        if self.wait_for(asked, patience.wait) {
+            return self.state().answers.get(ask).map(|(a, _)| a.clone());
+        }
+        known
+    }
+
+    /// `dir`'s listing; see [`MediaDirs::answer_within`].
+    fn listing(&self, dir: &Path, patience: Patience) -> Option<(Named, Named)> {
+        let ask = Ask::List(dir.to_owned(), SHOW_HIDDEN.load(Relaxed));
+        match self.answer_within(&ask, patience)? {
+            Answer::List(dirs, files) => Some((dirs, files)),
+            _ => None,
+        }
+    }
+
+    /// When each of `paths` was last modified; see [`MediaDirs::answer_within`].
+    fn times(&self, paths: &[PathBuf], patience: Patience) -> Option<Vec<Option<SystemTime>>> {
+        if paths.is_empty() {
+            return Some(Vec::new());
+        }
+        match self.answer_within(&Ask::Times(paths.to_vec()), patience)? {
+            Answer::Times(times) => Some(times),
+            _ => None,
+        }
+    }
+
     /// The subfolders of `dirs` to list. Those not searched yet are kept; they and those with an
     /// old answer are queued, in place of what an earlier listing queued.
     fn keep(&self, dirs: Named) -> Named {
-        let mut s = self.0.lock().unwrap();
+        let mut s = self.state();
         s.queue.clear();
         let kept: Named = dirs
             .into_iter()
@@ -1516,34 +1832,45 @@ impl MediaDirs {
             .collect();
         if !s.queue.is_empty() && !s.running {
             s.running = true;
-            let state = self.0.clone();
-            std::thread::spawn(move || search_dirs(&state));
+            let shared = self.0.clone();
+            std::thread::spawn(move || search_dirs(&shared.0));
         }
         kept
     }
 
     /// Whether a search changed its answer for a listed folder since the last call.
     fn take_changed(&self) -> bool {
-        std::mem::take(&mut self.0.lock().unwrap().changed)
+        std::mem::take(&mut self.state().changed)
     }
 
     fn forget(&self) {
-        self.0.lock().unwrap().known.clear();
+        let mut s = self.state();
+        s.known.clear();
+        s.answers.clear();
     }
 
     /// Makes every answer old enough to be searched again.
     #[cfg(test)]
     fn age(&self) {
         let then = std::time::Instant::now() - 2 * MEDIA_RECHECK;
-        for (_, at) in self.0.lock().unwrap().known.values_mut() {
+        for (_, at) in self.state().known.values_mut() {
             *at = then;
         }
     }
 
-    /// Waits for the queued searches.
+    /// Makes the pages' answers old, as though they were found a while ago.
+    #[cfg(test)]
+    fn age_answers(&self) {
+        let then = std::time::Instant::now() - 2 * LOOK_AGAIN;
+        for (_, at) in self.state().answers.values_mut() {
+            *at = then;
+        }
+    }
+
+    /// Waits for the queued searches and the asks being answered.
     #[cfg(test)]
     fn settle(&self) {
-        while self.0.lock().unwrap().running {
+        while self.state().running || !self.state().asking.is_empty() {
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
     }
@@ -1559,13 +1886,44 @@ fn search_dirs(state: &Mutex<DirSearch>) {
             };
             dir
         };
-        let has = has_media(&dir, MEDIA_SEARCH_DEPTH);
+        // Only a folder known to hold no media goes from the listing.
+        let has = has_media(&dir, MEDIA_SEARCH_DEPTH) != Some(false);
         let mut s = state.lock().unwrap();
         // A folder listed before its first answer only changes the listing if it goes.
         let was = s.known.get(&dir).is_none_or(|&(had, _)| had);
         s.known.insert(dir, (has, std::time::Instant::now()));
         s.changed |= has != was;
     }
+}
+
+/// Answers `ask`, on a thread of its own (see [`MediaDirs::look`]).
+fn answer(shared: &(Mutex<DirSearch>, Condvar), ask: Ask) {
+    let new = match &ask {
+        Ask::List(dir, hidden) => {
+            let (dirs, files) = list_dir_as(dir, *hidden);
+            Answer::List(dirs, files)
+        }
+        Ask::Kind(path) => Answer::Kind(found_at(path)),
+        Ask::Times(paths) => Answer::Times(paths.iter().map(|p| modified_at(p)).collect()),
+    };
+    let mut s = shared.0.lock().unwrap();
+    s.asking.remove(&ask);
+    // A caller waiting shows this answer itself. A page shown before it came shows the answer
+    // before, or none: a folder still loading, or a path taken to be there. A page may show
+    // the answer before even when another caller (a play queue) waited for this one.
+    let old = s.answers.get(&ask);
+    let differs = old.is_none_or(|(old, _)| *old != new);
+    s.changed |= differs && (old.is_some() || !s.waiting.contains(&ask));
+    s.answers.insert(ask, (new, std::time::Instant::now()));
+    if s.answers.len() > MAX_ANSWERS {
+        let oldest = (s.answers.iter())
+            .min_by_key(|(_, (_, at))| *at)
+            .map(|(ask, _)| ask.clone());
+        if let Some(oldest) = oldest {
+            s.answers.remove(&oldest);
+        }
+    }
+    shared.1.notify_all();
 }
 
 /// Every audio file under the Music folders `roots`, each once.
@@ -1583,15 +1941,37 @@ pub fn music_files(roots: &[PathBuf]) -> Vec<PathBuf> {
     out
 }
 
-/// Whether `dir` or its subfolders, `depth` levels in all, hold any media file.
-fn has_media(dir: &Path, depth: usize) -> bool {
-    fn search(dir: &Path, depth: usize, folders: &mut Folders) -> bool {
+/// Whether `dir` or its subfolders, `depth` levels in all, hold any media file. None when the
+/// search stopped before it could tell: subfolders deeper than `depth`, or more folders than a
+/// walk lists, are left unsearched, and the media may be in them.
+fn has_media(dir: &Path, depth: usize) -> Option<bool> {
+    fn search(dir: &Path, depth: usize, folders: &mut Folders) -> Option<bool> {
+        if folders.full() {
+            return None;
+        }
         if !folders.first_visit(dir) {
-            return false;
+            // Searched already, by another path to it.
+            return Some(false);
         }
         let (dirs, files) = list_dir(dir);
-        files.iter().any(|(_, p)| media_kind(p).is_some())
-            || depth > 1 && dirs.iter().any(|(_, d)| search(d, depth - 1, folders))
+        if files.iter().any(|(_, p)| media_kind(p).is_some()) {
+            return Some(true);
+        }
+        if dirs.is_empty() {
+            return Some(false);
+        }
+        if depth <= 1 {
+            return None;
+        }
+        let mut unknown = false;
+        for (_, d) in &dirs {
+            match search(d, depth - 1, folders) {
+                Some(true) => return Some(true),
+                Some(false) => {}
+                None => unknown = true,
+            }
+        }
+        (!unknown).then_some(false)
     }
     search(dir, depth, &mut Folders::default())
 }
@@ -1609,7 +1989,12 @@ impl Folders {
     /// Whether to go into `dir`: not seen before, by where it really is, and under the cap.
     fn first_visit(&mut self, dir: &Path) -> bool {
         let real = fs::canonicalize(dir).unwrap_or_else(|_| dir.to_owned());
-        self.0.len() < Self::MAX && self.0.insert(real)
+        !self.full() && self.0.insert(real)
+    }
+
+    /// Whether the walk has listed as many folders as it may.
+    fn full(&self) -> bool {
+        self.0.len() >= Self::MAX
     }
 }
 
@@ -1630,7 +2015,7 @@ fn walk(dir: &Path, depth: usize, folders: &mut Folders, found: &mut impl FnMut(
 }
 
 /// Case-insensitive order with digit runs compared as numbers, so "E2" sorts before "E10".
-fn natural_cmp(a: &str, b: &str) -> Ordering {
+pub fn natural_cmp(a: &str, b: &str) -> Ordering {
     let (mut x, mut y) = (a.chars().peekable(), b.chars().peekable());
     let digits = |it: &mut std::iter::Peekable<std::str::Chars>| {
         let mut s = String::new();
@@ -1696,6 +2081,16 @@ mod tests {
         }
     }
 
+    /// Folders whose file system calls wait, as those on a share that doesn't answer do, until
+    /// the test that put them here takes them out.
+    static STALLED: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
+    pub(super) fn stall(path: &Path) {
+        while STALLED.lock().unwrap().iter().any(|p| path.starts_with(p)) {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
     /// The entries' labels joined by "|", which keeps the expected lists on one line.
     fn labels(entries: &[Entry]) -> String {
         entries
@@ -1740,6 +2135,7 @@ mod tests {
             "Shows/.hidden/x.mp4",
             "Shows/Deep/a/b/c/d.mp3",
             "Shows/TooDeep/a/b/c/d/e.mp3",
+            "Shows/Bare/a/b/c/notes.txt",
         ] {
             tmp.touch(f);
         }
@@ -1748,9 +2144,11 @@ mod tests {
 
         let place = Place::Folder(Section::Videos, shows.clone());
         // Subfolders list at once, and those without media drop out once the search is done.
+        // One whose media may be deeper than the search goes stays, since it isn't known to be
+        // empty.
         assert_eq!(
             labels(&lib.entries(&place)),
-            "Deep|Empty|season 1|Season 2|Season 10|TooDeep|e1.mkv|E2.mp4|E10.mp4"
+            "Bare|Deep|Empty|season 1|Season 2|Season 10|TooDeep|e1.mkv|E2.mp4|E10.mp4"
         );
         lib.media_dirs.settle();
         assert!(lib.media_folders_changed());
@@ -1758,7 +2156,7 @@ mod tests {
         let entries = lib.entries(&place);
         assert_eq!(
             labels(&entries),
-            "Deep|season 1|Season 2|Season 10|e1.mkv|E2.mp4|E10.mp4"
+            "Deep|season 1|Season 2|Season 10|TooDeep|e1.mkv|E2.mp4|E10.mp4"
         );
         // A video added to an empty folder shows once its answer is old and the folder is
         // listed again.
@@ -1786,6 +2184,99 @@ mod tests {
         let page = lib.entries(&Place::Videos);
         assert_eq!(page[0], action("Add", Action::AddFolder(Section::Videos)));
         assert_eq!(page[1], folder("Shows", place));
+    }
+
+    /// A play queue is made from the folder as it is now: a file that came since a page last
+    /// listed it joins, rather than the queue being that old listing, which nothing redoes.
+    #[test]
+    fn a_queue_lists_the_folder_as_it_is_now() {
+        let tmp = TempDir::new();
+        let show = tmp.0.join("Show");
+        tmp.touch("Show/E01.mkv");
+        let lib = Library::open(&tmp.0.join("state"), false);
+        let place = Place::Folder(Section::Videos, show.clone());
+        assert_eq!(lib.media_in(&place), [show.join("E01.mkv")]);
+        tmp.touch("Show/E02.mkv");
+        lib.media_dirs.age_answers();
+        lib.media_dirs.settle();
+        _ = lib.media_folders_changed();
+        assert_eq!(
+            lib.media_in(&place),
+            [show.join("E01.mkv"), show.join("E02.mkv")]
+        );
+        // The page that showed the old listing is redone too.
+        assert!(
+            lib.media_folders_changed(),
+            "the page keeps the old listing"
+        );
+    }
+
+    /// A folder listing and Home's checks for what is still there wait for the file system off
+    /// the caller's thread, so a share that doesn't answer can't freeze the window.
+    #[test]
+    fn a_share_that_does_not_answer_holds_up_no_page() {
+        let tmp = TempDir::new();
+        let share = tmp.0.join("Share");
+        let film = tmp.touch("Share/film.mkv");
+        tmp.touch("Share/Sub/x.mp4");
+        let mut lib = Library::open(&tmp.0.join("state"), false);
+        lib.add_root(Section::Videos, share.clone());
+        lib.record_position(&film, 50.0, 100.0);
+        lib.set_favorite(&share.join("Sub"), true);
+        lib.visit_folder(&share);
+        let place = Place::Folder(Section::Videos, share.clone());
+
+        STALLED.lock().unwrap().push(share.clone());
+        let shown = std::thread::scope(|s| {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let (lib, place) = (&lib, &place);
+            s.spawn(move || _ = tx.send((lib.entries(place), lib.entries(&Place::Home))));
+            // Each page waits up to LOOKUP_WAIT before showing what it has.
+            let shown = rx.recv_timeout(std::time::Duration::from_secs(10));
+            STALLED.lock().unwrap().retain(|p| *p != share);
+            shown
+        });
+        let (listing, home) = shown.expect("the pages waited for the share");
+        assert_eq!(labels(&listing), "Loading...");
+        // Home shows what it couldn't check yet.
+        assert_eq!(
+            labels(&home),
+            "Favorites|Sub|Continue Watching|film.mkv|Frequently Visited Folders|Share"
+        );
+
+        // Once the share answers, the pages are redone with what is there.
+        lib.media_dirs.settle();
+        assert!(lib.media_folders_changed());
+        assert_eq!(labels(&lib.entries(&place)), "Sub|film.mkv");
+    }
+
+    /// The date sorts' modification times are read off the caller's thread too.
+    #[test]
+    fn modification_times_wait_for_no_share() {
+        let tmp = TempDir::new();
+        let share = tmp.0.join("Share");
+        let film = tmp.touch("Share/film.mkv");
+        let gone = share.join("gone.mkv");
+        let lib = Library::open(&tmp.0.join("state"), false);
+        let paths = [film.clone(), gone];
+
+        STALLED.lock().unwrap().push(share.clone());
+        let shown = std::thread::scope(|s| {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let (lib, paths) = (&lib, &paths);
+            s.spawn(move || _ = tx.send(lib.modified_times(paths)));
+            let shown = rx.recv_timeout(std::time::Duration::from_secs(10));
+            STALLED.lock().unwrap().retain(|p| *p != share);
+            shown
+        });
+        assert_eq!(shown.expect("the sort waited for the share"), None);
+
+        // Once the share answers, the page is redone with the times.
+        lib.media_dirs.settle();
+        assert!(lib.media_folders_changed());
+        let modified = fs::metadata(&film).unwrap().modified().ok();
+        assert_eq!(lib.modified_times(&paths), Some(vec![modified, None]));
+        assert_eq!(lib.modified_times(&[]), Some(Vec::new()));
     }
 
     #[test]
@@ -1832,6 +2323,7 @@ mod tests {
         a.visit_folder(&videos);
         a.record_playlist_play("Road Trip");
         a.save().unwrap();
+        finish_writes();
 
         // Damage the file the way a crash or a hand edit might.
         let state = tmp.0.join(STATE_FILE);
@@ -1954,6 +2446,41 @@ mod tests {
         assert_eq!(recent, [PathBuf::from(r"C:\Videos\ok.mp4")]);
     }
 
+    /// Saving hands the file to a background writer, since the flush to disk can stall the
+    /// render loop, and dropping the library waits for that write.
+    #[cfg(unix)]
+    #[test]
+    fn saving_does_not_wait_for_the_disk() {
+        let tmp = TempDir::new();
+        let mut lib = Library::open(&tmp.0, false);
+        lib.record_position(Path::new("/v/a.mp4"), 5.0, 60.0);
+        // A pipe where the temporary file goes: writing into it waits until something reads.
+        let pipe = tmp.0.join(format!("{STATE_FILE}.tmp"));
+        let c = std::ffi::CString::new(pipe.as_os_str().as_encoded_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        let (done, saved) = std::sync::mpsc::channel();
+        let lib = std::thread::spawn(move || {
+            lib.save().unwrap();
+            _ = done.send(());
+            lib
+        });
+        let returned = saved.recv_timeout(std::time::Duration::from_secs(2));
+        // Read what went into the pipe, which lets the write finish either way.
+        let written = fs::read_to_string(&pipe).unwrap();
+        let mut lib = lib.join().unwrap();
+        assert!(returned.is_ok(), "save waited for the write");
+        assert!(written.contains("recent\t/v/a.mp4\t5\t60\n"), "{written:?}");
+
+        // The pipe may have been renamed to state.txt; the next save replaces it either way.
+        finish_writes();
+        _ = fs::remove_file(&pipe);
+        lib.record_position(Path::new("/v/b.mp4"), 6.0, 60.0);
+        lib.save().unwrap();
+        drop(lib);
+        let state = fs::read_to_string(tmp.0.join(STATE_FILE)).unwrap();
+        assert!(state.contains("recent\t/v/b.mp4\t6\t60\n"), "{state:?}");
+    }
+
     #[test]
     fn an_unreadable_library_is_not_overwritten() {
         let tmp = TempDir::new();
@@ -2000,6 +2527,7 @@ mod tests {
 
         // Thumbnails and favourites survive a save, and a damaged record is skipped.
         lib.save().unwrap();
+        finish_writes();
         let state = tmp.0.join(STATE_FILE);
         let mut text = fs::read_to_string(&state).unwrap();
         text.push_str("thumb\tbad/name\tC:\\x.png\nthumb\tOther\t\nfavorite\t\nfavorite\n");
@@ -2016,6 +2544,93 @@ mod tests {
             lib.delete_playlist("road trip").unwrap_err().kind(),
             ErrorKind::NotFound
         );
+    }
+
+    #[test]
+    fn track_choices_follow_a_renamed_playlist_and_go_with_a_deleted_one() {
+        let tmp = TempDir::new();
+        let mut lib = Library::open(&tmp.0, false);
+        lib.create_playlist("Anime").unwrap();
+        lib.set_track_pref(&playlist_scope("Anime"), true, Some("jpn".into()));
+        lib.rename_playlist("Anime", "Shows").unwrap();
+        assert_eq!(
+            lib.track_prefs(&playlist_scope("Shows")).audio.as_deref(),
+            Some("jpn")
+        );
+        assert_eq!(
+            lib.track_prefs(&playlist_scope("Anime")),
+            TrackPrefs::default()
+        );
+
+        // A new playlist with a deleted one's name starts with no choices.
+        lib.delete_playlist("Shows").unwrap();
+        lib.create_playlist("Shows").unwrap();
+        assert_eq!(
+            lib.track_prefs(&playlist_scope("Shows")),
+            TrackPrefs::default()
+        );
+    }
+
+    /// A library on a case-sensitive volume can hold "Mix" and "mix" both; renaming one to the
+    /// other's name is refused like any taken name, not taken for a change of case.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_rename_never_replaces_a_playlist_differing_only_in_case() {
+        /// A small case-sensitive APFS volume, mounted out of Finder's sight, and detached when
+        /// dropped.
+        struct Volume(PathBuf);
+        impl Drop for Volume {
+            fn drop(&mut self) {
+                _ = std::process::Command::new("/usr/bin/hdiutil")
+                    .args(["detach", "-quiet", "-force"])
+                    .arg(&self.0)
+                    .status();
+            }
+        }
+        let tmp = TempDir::new();
+        let image = tmp.0.join("cs.dmg");
+        let hdiutil = |args: &[&std::ffi::OsStr]| {
+            let status = std::process::Command::new("/usr/bin/hdiutil")
+                .args(args)
+                .status()
+                .unwrap();
+            assert!(status.success(), "hdiutil {args:?} failed");
+        };
+        let os = std::ffi::OsStr::new;
+        let size = [os("-size"), os("2m"), os("-fs"), os("Case-sensitive APFS")];
+        hdiutil(
+            &[
+                &[os("create"), os("-quiet")],
+                &size[..],
+                &[image.as_os_str()],
+            ]
+            .concat(),
+        );
+        let at = tmp.0.join("mnt");
+        fs::create_dir_all(&at).unwrap();
+        let quietly = [
+            os("-quiet"),
+            os("-nobrowse"),
+            os("-noautoopen"),
+            os("-noverify"),
+        ];
+        let mount = [os("-mountpoint"), at.as_os_str(), image.as_os_str()];
+        hdiutil(&[&[os("attach")], &quietly[..], &mount[..]].concat());
+        let volume = Volume(at);
+
+        let mut lib = Library::open(&volume.0, false);
+        lib.add_to_playlist("Mix", Path::new("/a.mp3")).unwrap();
+        lib.add_to_playlist("mix", Path::new("/b.mp3")).unwrap();
+        assert_eq!(lib.playlists(), ["Mix", "mix"]);
+        let taken = lib.rename_playlist("mix", "Mix").unwrap_err();
+        assert_eq!(taken.kind(), ErrorKind::AlreadyExists);
+        assert_eq!(lib.playlist_items("Mix"), [PathBuf::from("/a.mp3")]);
+        assert_eq!(lib.playlist_items("mix"), [PathBuf::from("/b.mp3")]);
+        // A change of case alone still goes through.
+        lib.delete_playlist("Mix").unwrap();
+        lib.rename_playlist("mix", "MIX").unwrap();
+        assert_eq!(lib.playlists(), ["MIX"]);
+        drop(lib);
     }
 
     #[test]
@@ -2037,6 +2652,43 @@ mod tests {
         let err = lib.remove_from_playlist("P", 1).unwrap_err();
         assert_eq!(err.kind(), ErrorKind::InvalidInput);
         assert!(lib.remove_from_playlist("Nope", 0).is_err());
+    }
+
+    /// A playlist saved by another program in Latin-1 (or with Windows line ends) can still be
+    /// added to and taken from, and its other lines stay byte for byte as they were.
+    #[test]
+    fn playlists_that_are_not_utf8_are_edited_as_they_are() {
+        let tmp = TempDir::new();
+        let mut lib = Library::open(&tmp.0, false);
+        lib.create_playlist("P").unwrap();
+        let file = lib.playlist_file("P").unwrap();
+        fs::write(&file, b"#EXTM3U\r\n/M\xfasica/a.mp3\r\n/b.mp3\n/c\xe9.mp3").unwrap();
+
+        lib.add_to_playlist("P", Path::new("C:\\d.mp3")).unwrap();
+        let added = b"#EXTM3U\r\n/M\xfasica/a.mp3\r\n/b.mp3\n/c\xe9.mp3\nC:\\d.mp3\n";
+        assert_eq!(fs::read(&file).unwrap(), added);
+        lib.remove_from_playlist("P", 1).unwrap();
+        let removed = b"#EXTM3U\r\n/M\xfasica/a.mp3\r\n/c\xe9.mp3\nC:\\d.mp3\n";
+        assert_eq!(fs::read(&file).unwrap(), removed);
+        assert_eq!(lib.playlist_items("P")[2], PathBuf::from("C:\\d.mp3"));
+    }
+
+    /// Lines the list leaves out (other protocols, broken addresses) don't count toward the
+    /// index removal takes, so the item shown is the one that goes.
+    #[test]
+    fn remove_from_playlist_counts_as_the_list_does() {
+        let tmp = TempDir::new();
+        let mut lib = Library::open(&tmp.0, false);
+        lib.create_playlist("P").unwrap();
+        let text = "#EXTM3U\nfile:///x.mp3\n/a.mp4\nrtmp://h/live\n/b.mp4\n";
+        fs::write(lib.playlist_file("P").unwrap(), text).unwrap();
+        let shown = [tmp.0.join("/a.mp4"), tmp.0.join("/b.mp4")];
+        assert_eq!(lib.playlist_items("P"), shown);
+        lib.remove_from_playlist("P", 1).unwrap();
+        assert_eq!(lib.playlist_items("P"), [tmp.0.join("/a.mp4")]);
+        // The hidden lines stay as they were.
+        let left = fs::read_to_string(lib.playlist_file("P").unwrap()).unwrap();
+        assert_eq!(left, "#EXTM3U\nfile:///x.mp3\n/a.mp4\nrtmp://h/live\n");
     }
 
     #[test]
@@ -2223,6 +2875,67 @@ mod tests {
         assert!(abs(Path::new("clip.mp4")).is_absolute());
     }
 
+    /// After a symlink, `..` is the parent of the link's target, not of the link: there it stays,
+    /// so the path still names the file the system opens.
+    #[cfg(unix)]
+    #[test]
+    fn dots_after_a_symlink_stay() {
+        let tmp = TempDir::new();
+        let film = tmp.touch("2026/film.mkv");
+        fs::create_dir_all(tmp.0.join("2026/Show")).unwrap();
+        std::os::unix::fs::symlink(tmp.0.join("2026/Show"), tmp.0.join("latest")).unwrap();
+        let through = tmp.0.join("latest/../film.mkv");
+        let kept = abs(&through);
+        assert_eq!(kept, through);
+        assert_eq!(
+            fs::canonicalize(&kept).unwrap(),
+            fs::canonicalize(film).unwrap()
+        );
+        // And `..` after a kept one stays too.
+        let further = tmp.0.join("latest/../../x");
+        assert_eq!(abs(&further), further);
+    }
+
+    /// A file opened as `../film.mkv` from a subfolder is the same file as `film.mkv` opened
+    /// from its own folder, so it resumes and lists once.
+    #[test]
+    fn dots_in_a_path_name_the_same_file() {
+        assert_eq!(
+            abs(Path::new("/x/sub/../film.mkv")),
+            std::path::absolute("/x/film.mkv").unwrap().as_path()
+        );
+        assert_eq!(
+            abs(Path::new("/x/./a/b/../../c")),
+            std::path::absolute("/x/c").unwrap().as_path()
+        );
+        assert_eq!(
+            abs(Path::new("/../film.mkv")),
+            std::path::absolute("/film.mkv").unwrap().as_path()
+        );
+        let cwd = env::current_dir().unwrap();
+        assert_eq!(
+            abs(Path::new("../film.mkv")),
+            cwd.parent().unwrap().join("film.mkv")
+        );
+
+        let tmp = TempDir::new();
+        let mut lib = Library::open(&tmp.0, false);
+        lib.record_position(Path::new("/x/sub/../film.mkv"), 50.0, 100.0);
+        lib.record_position(
+            std::path::absolute("/x/film.mkv").unwrap().as_path(),
+            60.0,
+            100.0,
+        );
+        assert_eq!(
+            lib.media_in(&Place::Recent),
+            [std::path::absolute("/x/film.mkv").unwrap()]
+        );
+        assert_eq!(
+            lib.resume_position(Path::new("/x/sub/../film.mkv")),
+            Some(60.0)
+        );
+    }
+
     #[test]
     fn home_sections_from_recent_data() {
         let tmp = TempDir::new();
@@ -2372,7 +3085,7 @@ mod tests {
             assert!(made.status.success(), "mklink /J failed");
         }
         assert_eq!(music_files(std::slice::from_ref(&m)), [song]);
-        assert!(has_media(&m, MEDIA_SEARCH_DEPTH));
+        assert_eq!(has_media(&m, MEDIA_SEARCH_DEPTH), Some(true));
     }
 
     #[test]

@@ -138,7 +138,7 @@ fn write_image(
     let bgr: Vec<u8> = (bgra.as_chunks::<4>().0.iter())
         .flat_map(|&[b, g, r, _]| [b, g, r])
         .collect();
-    unsafe {
+    let written = (|| unsafe {
         let wic: IWICImagingFactory =
             CoCreateInstance(&CLSID_WICImagingFactory, None, CLSCTX_INPROC_SERVER)?;
         let stream = wic.CreateStream()?;
@@ -157,13 +157,29 @@ fn write_image(
         }
         frame.WritePixels(*h, *w * 3, &bgr)?;
         frame.Commit()?;
-        encoder.Commit()
+        encoder.Commit()?;
+        stream.Commit(windows::Win32::System::Com::STGC_DEFAULT)
+    })();
+    if written.is_err() {
+        _ = std::fs::remove_file(path);
     }
+    written
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn failed_snapshot_leaves_no_partial_file() {
+        unsafe { CoInitializeEx(None, COINIT_MULTITHREADED).ok().unwrap() };
+        let dir = std::env::temp_dir().join(format!("wushang-invalid-snap-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("invalid.png");
+        assert!(write_image(&path, &(0, 0, Vec::new()), &GUID_ContainerFormatPng).is_err());
+        assert!(!path.exists());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn names_follow_the_file_and_time() {

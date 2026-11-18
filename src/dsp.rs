@@ -187,12 +187,14 @@ impl Effects {
         );
     }
 
-    /// Custom bands in dB (clamped to -20..20, VLC's range) and preamp on VLC's scale.
+    /// Custom bands in dB (clamped to -20..20, VLC's range) and preamp on VLC's scale, clamped
+    /// to 20 dB either side of unity, the range the panel shows around 0. VLC's own slider runs
+    /// -20..20 on that scale, which stops 8 dB above unity.
     pub fn set_eq_bands(&self, bands: [f32; 10], preamp: f32) {
         self.update_eq(|eq| {
             eq.enabled = true;
             eq.preset = None;
-            eq.preamp = preamp.clamp(-20.0, 20.0);
+            eq.preamp = preamp.clamp(PREAMP_UNITY_DB - 20.0, PREAMP_UNITY_DB + 20.0);
             eq.bands = bands.map(|b| b.clamp(-20.0, 20.0));
         });
     }
@@ -232,13 +234,14 @@ impl Chain {
     }
 
     /// Runs stereo mode, equalizer and speed over `samples` (modified in place), which start at
-    /// media time `pts`. Returns the output and the media time range it covers.
-    pub fn process(
-        &mut self,
+    /// media time `pts`. Returns the output and the media time range it covers; at normal speed
+    /// the output is `samples` itself.
+    pub fn process<'a>(
+        &'a mut self,
         effects: &Effects,
-        samples: &mut [f32],
+        samples: &'a mut [f32],
         pts: f64,
-    ) -> (&[f32], f64, f64) {
+    ) -> (&'a [f32], f64, f64) {
         let version = effects.eq_version.load(Relaxed);
         if self.eq_version != Some(version) {
             self.eq_version = Some(version);
@@ -246,10 +249,12 @@ impl Chain {
         }
         apply_stereo(effects.stereo(), samples, self.channels);
         self.eq.process(samples);
+        let speed = effects.speed();
+        if let Some((start, end)) = self.stretch.pass(samples, pts, speed) {
+            return (samples, start, end);
+        }
         self.out.clear();
-        let (start, end) = self
-            .stretch
-            .process(samples, pts, effects.speed(), &mut self.out);
+        let (start, end) = self.stretch.process(samples, pts, speed, &mut self.out);
         (&self.out, start, end)
     }
 
@@ -332,17 +337,19 @@ pub fn spectrum(samples: &[f32], rate: u32, bands: usize) -> Vec<f32> {
         return vec![0.0; bands];
     }
     let (lo, hi) = (50.0f32, 16_000.0f32.min(rate as f32 / 2.0));
+    // The samples through a Hann window, once for every band.
+    let windowed: Vec<f32> = (samples.iter().enumerate())
+        .map(|(i, s)| s * (0.5 - 0.5 * (std::f32::consts::TAU * i as f32 / (n - 1) as f32).cos()))
+        .collect();
     (0..bands)
         .map(|b| {
             let f = lo * (hi / lo).powf((b as f32 + 0.5) / bands as f32);
             let w = std::f32::consts::TAU * f / rate as f32;
             let (mut re, mut im) = (0.0f32, 0.0f32);
-            for (i, s) in samples.iter().enumerate() {
-                // Hann window.
-                let hann = 0.5 - 0.5 * (std::f32::consts::TAU * i as f32 / (n - 1) as f32).cos();
+            for (i, s) in windowed.iter().enumerate() {
                 let (sin, cos) = (w * i as f32).sin_cos();
-                re += s * hann * cos;
-                im += s * hann * sin;
+                re += s * cos;
+                im += s * sin;
             }
             // A full-scale sine reads about n / 4 through the window.
             let level = (re * re + im * im).sqrt() / (n as f32 / 4.0);
@@ -544,6 +551,18 @@ impl Stretcher {
         self.stretching = false;
     }
 
+    /// At normal speed with nothing held back, `input` (starting at media time `pts`) plays as
+    /// it is: counts it and returns the media time range it covers. None while stretching.
+    fn pass(&mut self, input: &[f32], pts: f64, speed: f32) -> Option<(f64, f64)> {
+        if speed != 1.0 || self.stretching {
+            return None;
+        }
+        let frames = (input.len() / self.channels) as u64;
+        self.end += frames;
+        self.first = self.end;
+        Some((pts, pts + frames as f64 / self.rate))
+    }
+
     /// Appends the stretched `input` (starting at media time `pts`) to `out` and returns the
     /// media time range of what it appended. The stretcher holds back about `window + search`
     /// frames, which come out with the next call or `drain`.
@@ -554,13 +573,11 @@ impl Stretcher {
         speed: f32,
         out: &mut Vec<f32>,
     ) -> (f64, f64) {
-        let frames = (input.len() / self.channels) as u64;
-        if speed == 1.0 && !self.stretching {
+        if let Some(times) = self.pass(input, pts, speed) {
             out.extend_from_slice(input);
-            self.end += frames;
-            self.first = self.end;
-            return (pts, pts + frames as f64 / self.rate);
+            return times;
         }
+        let frames = (input.len() / self.channels) as u64;
         self.anchors.push_back((self.end, pts));
         self.input.extend_from_slice(input);
         self.end += frames;
@@ -916,6 +933,25 @@ mod tests {
         }
     }
 
+    /// At normal speed the stretcher passes the samples through, so the chain hands back the
+    /// processed block itself rather than a copy, and its times still run on.
+    #[test]
+    fn normal_speed_passes_the_block_through() {
+        let effects = Effects::new();
+        let mut chain = Chain::new(RATE, 2);
+        let mut block = sine(1000.0, 0.1, 2);
+        let frames = (block.len() / 2) as f64;
+        let ptr = block.as_ptr();
+        let (out, start, end) = chain.process(&effects, &mut block, 1.0);
+        assert_eq!(out.as_ptr(), ptr);
+        assert_eq!((start, end), (1.0, 1.0 + frames / f64::from(RATE)));
+        // Faster, what comes out is the stretcher's own.
+        effects.set_speed(2.0);
+        let mut fast = sine(1000.0, 0.5, 2);
+        let (out, ..) = chain.process(&effects, &mut fast, 2.0);
+        assert_ne!(out.as_ptr(), fast.as_ptr());
+    }
+
     #[test]
     fn band_boost_hits_its_band_only() {
         let gain_db = |freq: f64| {
@@ -940,6 +976,23 @@ mod tests {
         let mut out = vec![1.0f32; 16];
         eq.process(&mut out);
         assert!((out[0] - 10f32.powf(-6.0 / 20.0)).abs() < 1e-6);
+    }
+
+    /// The panel's preamp runs 20 dB either side of unity, all of which reaches the equalizer;
+    /// past that it stops.
+    #[test]
+    fn preamp_takes_the_panels_whole_range() {
+        let effects = Effects::new();
+        for (asked, set) in [
+            (20.0, 20.0),
+            (-20.0, -20.0),
+            (9.5, 9.5),
+            (25.0, 20.0),
+            (-30.0, -20.0),
+        ] {
+            effects.set_eq_bands([0.0; 10], PREAMP_UNITY_DB + asked);
+            assert_eq!(effects.eq().preamp, PREAMP_UNITY_DB + set, "{asked} dB");
+        }
     }
 
     #[test]
